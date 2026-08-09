@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 from unicodedata import normalize as unicodedata_normalize
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -182,6 +183,14 @@ def parse_github_slug(url: str):
     plausible-looking slug naming a repo that does not exist, or worse, one
     that does and belongs to somebody else.
 
+    The host is anchored, not just the tail: the old unanchored regex matched
+    `github.com` as a substring anywhere, so `https://notgithub.com/acme/widget.git`
+    and `https://gitlab.com/github.com/acme/widget.git` both read as GitHub
+    origins. A scheme URL is parsed with urlsplit and trusted only when the
+    hostname is exactly `github.com`; the scp-like `user@github.com:owner/repo`
+    shape (which urlsplit cannot parse a host out of) gets its own regex
+    requiring `github.com` to immediately follow `@` and precede `:`.
+
     `git remote get-url` output keeps its trailing newline, and the old
     `([^/.]+)` name class happily matched it -- producing a repo id ending in
     `\\n` that made every later API path fail with "invalid control character
@@ -190,7 +199,18 @@ def parse_github_slug(url: str):
     # rstrip the slash before matching: a `.../owner/name/` origin otherwise
     # carries it into the name and 404s every path built from the id, which
     # is the same silent-drop this function exists to fix.
-    m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", url.strip().rstrip("/"))
+    s = url.strip().rstrip("/")
+    if "://" in s:
+        parts = urlsplit(s)
+        if parts.hostname != "github.com":
+            return None
+        path = parts.path
+    else:
+        m = re.fullmatch(r"[^@]+@github\.com:([^/]+)/(.+?)(?:\.git)?", s)
+        if not m:
+            return None
+        return f"{m.group(1)}/{m.group(2)}"
+    m = re.fullmatch(r"/([^/]+)/(.+?)(?:\.git)?", path)
     return f"{m.group(1)}/{m.group(2)}" if m else None
 
 

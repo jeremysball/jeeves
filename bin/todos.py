@@ -208,7 +208,12 @@ def _default_branch(repo) -> str:
     neither does — callers must degrade to UNKNOWN rather than guess a base."""
     head = _capture(["git", "-C", str(repo), "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).strip()
     if head:
-        return head.removeprefix("refs/remotes/")
+        # symbolic-ref only reads what the symref points at; it does not check
+        # the target exists. A dangling origin/HEAD (branch deleted upstream)
+        # must not win over a resolved origin/main, so verify before trusting.
+        branch = head.removeprefix("refs/remotes/")
+        if _runs(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"]) == 0:
+            return branch
     has_origin = _runs(["git", "-C", str(repo), "remote", "get-url", "origin"]) == 0
     candidates = ("origin/main", "origin/master") if has_origin else (
         "origin/main", "origin/master", "main", "master")
@@ -286,7 +291,12 @@ def _classify_commit(sha: str, repo) -> str:
     slug = _repo_slug(repo)
     if not slug:
         # No GitHub remote to ask, so ancestry was the whole of the available
-        # truth and it said no.
+        # truth and it said no. That is only the whole truth when there is no
+        # origin remote at all: a fetched origin that just is not GitHub could
+        # still have squash-merged the work, and there is no way to ask it
+        # further, so that case is UNKNOWN rather than a confident OUTSTANDING.
+        if _runs(["git", "-C", str(repo), "remote", "get-url", "origin"]) == 0:
+            return UNKNOWN
         return OUTSTANDING
     carried = _merged_pr_carries(sha, slug)
     if carried is None:
@@ -349,6 +359,11 @@ def classify_evidence(evidence: str, repo) -> str:
         elif kind == "issue":
             verdicts.append(_classify_issue(value, repo))
         else:
+            if not Path(repo).is_dir():
+                # The repo directory itself does not exist, so nothing could
+                # be checked at all -- UNKNOWN, not a confident OUTSTANDING.
+                verdicts.append(UNKNOWN)
+                continue
             target = (Path(repo) / value).resolve()
             in_repo = target.is_relative_to(Path(repo).resolve())
             verdicts.append(LANDED if in_repo and target.exists() else OUTSTANDING)

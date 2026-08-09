@@ -262,6 +262,24 @@ def test_commit_unknown_when_no_base_branch_resolves(tmp_path):
     assert td.classify_evidence(f"commit {h[:10]}", str(repo)) == td.UNKNOWN
 
 
+def test_branch_commit_unknown_when_origin_is_not_github(tmp_path):
+    # A fetched origin that just isn't GitHub: ancestry alone cannot rule out
+    # a squash-merge on that host, and there is no way to ask it further, so
+    # the honest verdict is UNKNOWN -- not a confident OUTSTANDING. (A repo
+    # with no origin remote at all stays OUTSTANDING: there ancestry is the
+    # whole of the available truth.)
+    origin = _bare_origin(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _commit(repo, "f.txt", "x", "init")
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
+    side = _side_commit(repo)
+    assert td._repo_slug(repo) == ""  # filesystem origin, not GitHub
+    assert td.classify_evidence(f"commit {side[:10]}", str(repo)) == td.UNKNOWN
+
+
 def test_commit_landed_via_origin_head(tmp_path):
     origin = _bare_origin(tmp_path)
     repo = tmp_path / "repo"
@@ -273,7 +291,10 @@ def test_commit_landed_via_origin_head(tmp_path):
     subprocess.run(["git", "-C", str(repo), "remote", "set-head", "origin", "main"], check=True)
     side = _side_commit(repo)
     assert td.classify_evidence(f"commit {h[:10]}", str(repo)) == td.LANDED
-    assert td.classify_evidence(f"commit {side[:10]}", str(repo)) == td.OUTSTANDING
+    # The origin is a local bare repo, not GitHub: ancestry alone cannot rule
+    # out a squash-merge on that host, so the branch commit is UNKNOWN, not
+    # OUTSTANDING.
+    assert td.classify_evidence(f"commit {side[:10]}", str(repo)) == td.UNKNOWN
 
 
 def test_base_branch_prefers_origin_head_over_origin_main(tmp_path):
@@ -292,7 +313,26 @@ def test_base_branch_prefers_origin_head_over_origin_main(tmp_path):
     h_main2 = _commit(repo, "h.txt", "z", "main work after trunk")
     subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
     assert td.classify_evidence(f"commit {h_trunk[:10]}", str(repo)) == td.LANDED
-    assert td.classify_evidence(f"commit {h_main2[:10]}", str(repo)) == td.OUTSTANDING
+    # Non-GitHub origin: the trunk commit is not in origin/main's ancestry,
+    # but a squash-merge on that host cannot be ruled out, so UNKNOWN.
+    assert td.classify_evidence(f"commit {h_main2[:10]}", str(repo)) == td.UNKNOWN
+
+
+def test_default_branch_ignores_dangling_origin_head(tmp_path):
+    # symbolic-ref only reads what the symref points at; it does not check the
+    # target exists. A dangling origin/HEAD (branch deleted upstream) must not
+    # win over a perfectly good origin/main.
+    origin = _bare_origin(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _commit(repo, "f.txt", "x", "init")
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main:master"], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "set-head", "origin", "master"], check=True)
+    subprocess.run(["git", "-C", str(repo), "update-ref", "-d", "refs/remotes/origin/master"], check=True)
+    assert td._default_branch(repo) == "origin/main"
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +399,13 @@ def test_none_evidence_is_unknown_not_a_crash(tmp_path):
     assert td.verify_evidence(None, str(repo)) is False
 
 
+def test_file_evidence_unknown_when_repo_dir_missing():
+    # Path.resolve() does not require the path to exist, so a nonexistent repo
+    # directory used to report OUTSTANDING -- "confirmed this file is absent"
+    # -- when the truth is that nothing could be checked at all.
+    assert td.classify_evidence("file missing.txt", "/no/such/repo") == td.UNKNOWN
+
+
 def test_file_evidence_is_whole_string_and_absorbs_trailing_refs(tmp_path):
     # Per spec: `file <path>` yields exactly one file ref "and nothing else",
     # and a path may contain spaces. So everything after `file ` is the path --
@@ -389,6 +436,32 @@ def test_file_evidence_dotdot_traversal_does_not_escape_repo(tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("x")
     assert td.classify_evidence(f"file ../{outside.name}", str(repo)) == td.OUTSTANDING
+
+
+# ---------------------------------------------------------------------------
+# Part 2: parse_github_slug() — host anchoring
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "https://notgithub.com/acme/widget.git",
+    "https://gitlab.com/github.com/acme/widget.git",
+    "https://evil.example/github.com/acme/widget.git",
+])
+def test_parse_github_slug_rejects_github_com_as_substring(url):
+    # The old unanchored regex matched `github.com` anywhere in the URL, so a
+    # path segment on a non-GitHub host read as a GitHub origin and produced a
+    # plausible-looking slug for a repo that does not exist there.
+    assert jl.parse_github_slug(url) is None
+
+
+@pytest.mark.parametrize("url,slug", [
+    ("https://github.com/o/r.git", "o/r"),
+    ("https://github.com/o/r", "o/r"),
+    ("git@github.com:o/r.git", "o/r"),
+    ("ssh://git@github.com/o/r.git", "o/r"),
+])
+def test_parse_github_slug_accepts_real_github_origins(url, slug):
+    assert jl.parse_github_slug(url) == slug
 
 
 # ---------------------------------------------------------------------------
