@@ -224,3 +224,17 @@ def test_ferry_happy_path(monkeypatch):
     assert out["ok"] is True
     assert out["task_id"] == "oc_abc123_def456"
     assert "Status: DONE" in out["message"]
+
+
+def test_normalize_strips_stacked_provenance_suffixes():
+    """Suffixes stack on a dismissed line. A single $-anchored sub() pass only
+    removed the outermost, so the same item quoted with and without its tags
+    hashed differently and --dismiss could not find a line plainly in the file."""
+    stacked = "- [ ] dead thing (jeeves: loose-end, x, 2026-08-09) (dismissed 2026-08-09)"
+    assert jl.normalize(stacked) == "dead thing"
+    assert jl.normalize(stacked) == jl.normalize("dead thing")
+    assert jl.line_hash(stacked) == jl.line_hash("dead thing")
+
+
+def test_normalize_leaves_ordinary_parentheses_alone():
+    assert jl.normalize("- [ ] fix parse(x) handling") == "fix parse(x) handling"
