@@ -125,12 +125,18 @@ FILE_RE = re.compile(r"^file (.+)$", re.I)
 # These scan for every ref in the string instead of demanding exactly one.
 SHA_SCAN_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.I)
 PR_SCAN_RE = re.compile(r"#(\d+)\b")
-# `issue #391` is a real evidence shape the synthesis ferry emits. Scanned
-# separately because `gh-axi pr view` fails on an issue number, so classifying
-# every `#N` as a pr would leave issue-backed evidence permanently unknown.
-# `\s*` (not `\s+`): the ferry also glues the form as `issue#391`, and a space
-# requirement misclassifies that as a pr and strands it in pending forever.
-ISSUE_SCAN_RE = re.compile(r"\bissues?\s*#(\d+)\b", re.I)
+# `issue #391` is a real evidence shape the synthesis ferry emits, but
+# GitHub's own auto-close keywords (close/closes/closed, fix/fixes/fixed,
+# resolve/resolves/resolved) are a far more common phrasing to quote from a
+# commit or PR body -- without them, "resolves #391" fell through to the
+# keyword-less PR_SCAN_RE and misclassified as a PR. Scanned separately
+# because `gh-axi pr view` fails on an issue number, so classifying every
+# `#N` as a pr would leave issue-backed evidence permanently unknown.
+# `\s*` (not `\s+`): the ferry also glues the form as `issue#391`/`fixes#391`,
+# and a space requirement misclassifies that as a pr and strands it in pending
+# forever.
+ISSUE_SCAN_RE = re.compile(
+    r"\b(?:issues?|close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*#(\d+)\b", re.I)
 
 
 def _extract_refs(evidence: str) -> list:

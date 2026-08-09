@@ -162,6 +162,26 @@ def test_extract_refs_bare_hex_without_keyword():
         ("commit", "062563c"), ("commit", "e0056ed")]
 
 
+@pytest.mark.parametrize("keyword", [
+    "close", "closes", "closed", "fix", "fixes", "fixed",
+    "resolve", "resolves", "resolved",
+])
+def test_extract_refs_github_closing_keywords_are_issues(keyword):
+    # GitHub's own auto-close keywords are a far more common phrasing than
+    # "issue #N" for a synthesis ferry to quote from a commit/PR body.
+    # ISSUE_SCAN_RE only matched the literal word "issue(s)", so these fell
+    # through to the keyword-less PR_SCAN_RE and misclassified as a PR.
+    assert td._extract_refs(f"{keyword} #391") == [("issue", "391")]
+
+
+def test_extract_refs_pr_and_closing_keyword_issue_together():
+    # The trickiest interaction: a PR ref and a keyword-only issue ref in the
+    # same string must both extract, in position order, with the PR hit not
+    # swallowed by the issue's `taken` de-dupe (they're at different positions).
+    assert td._extract_refs("PR #114 fixes #391") == [
+        ("pr", "114"), ("issue", "391")]
+
+
 def test_extract_refs_file_form():
     assert td._extract_refs("file f.txt") == [("file", "f.txt")]
     assert td._extract_refs("file docs/notes with spaces.md") == [("file", "docs/notes with spaces.md")]
