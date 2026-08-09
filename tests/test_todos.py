@@ -548,3 +548,27 @@ def test_classify_evidence_survives_malformed_memo_file(tmp_path, monkeypatch):
     _stub_gh_axi(monkeypatch, calls)
     assert td.classify_evidence("PR #424247", "/repo") == td.LANDED
     assert len(calls) == 1
+
+
+# Regression pair: `_MEMO` is a lazy-once-per-process module global with no
+# per-test reset, so without project-wide isolation, whichever test runs
+# first populates it and every later test in the same pytest process reuses
+# that in-memory dict -- silently serving a stale verdict instead of hitting
+# its own fakes. Reproduced live: `test_open_issue_is_outstanding` passed in
+# isolation but failed on a second full-suite run because a prior test had
+# already cached "issue #391 filed" as LANDED, and this pair's real disk
+# write additionally leaked into ~/.local/state/jeeves/evidence_memo.json.
+def test_memo_first_pass_writes_landed(monkeypatch):
+    monkeypatch.setattr(td, "_repo_slug", lambda repo: "o/r")
+    monkeypatch.setattr(td, "_capture", lambda args: "  state: merged\n")
+    monkeypatch.setattr(td, "_PR_CACHE", {})
+    assert td.classify_evidence("PR #900001", "/repo") == td.LANDED
+
+
+def test_memo_second_pass_is_not_polluted_by_the_first(monkeypatch):
+    calls = []
+    monkeypatch.setattr(td, "_repo_slug", lambda repo: "o/r")
+    monkeypatch.setattr(td, "_capture", lambda args: calls.append(args) or "  state: open\n")
+    monkeypatch.setattr(td, "_PR_CACHE", {})
+    assert td.classify_evidence("PR #900001", "/repo") == td.OUTSTANDING
+    assert calls, "served from a memo the first test populated, not this test's fake"
