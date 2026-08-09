@@ -203,12 +203,16 @@ UNKNOWN = "unknown"      # could not determine; never treated as landed
 
 def _default_branch(repo) -> str:
     """The base branch to measure "merged" against. origin/HEAD when set,
-    else the first of main/master that resolves. Empty when neither does —
-    callers must degrade to UNKNOWN rather than guess a base."""
+    else the first resolved origin/main or origin/master. A local main/master
+    fallback is used only when no origin remote is configured. Empty when
+    neither does — callers must degrade to UNKNOWN rather than guess a base."""
     head = _capture(["git", "-C", str(repo), "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).strip()
     if head:
         return head.removeprefix("refs/remotes/")
-    for cand in ("origin/main", "origin/master", "main", "master"):
+    has_origin = _runs(["git", "-C", str(repo), "remote", "get-url", "origin"]) == 0
+    candidates = ("origin/main", "origin/master") if has_origin else (
+        "origin/main", "origin/master", "main", "master")
+    for cand in candidates:
         if _runs(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}"]) == 0:
             return cand
     return ""

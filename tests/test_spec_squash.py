@@ -30,9 +30,13 @@ def _repo_with_unmerged_branch(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
-    _commit(repo, "f.txt", "x", "init")
+    main_sha = _commit(repo, "f.txt", "x", "init")
     subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
                     "https://github.com/o/r.git"], check=True)
+    # Simulate a real fetch without a reachable remote: origin/main matches
+    # local main, giving `_default_branch` a real base to measure against.
+    subprocess.run(["git", "-C", str(repo), "update-ref",
+                    "refs/remotes/origin/main", main_sha], check=True)
     subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "feature"], check=True)
     branch_sha = _commit(repo, "g.txt", "y", "branch work")
     subprocess.run(["git", "-C", str(repo), "checkout", "-q", "main"], check=True)
@@ -94,6 +98,23 @@ def test_commit_no_pull_request_carries_is_outstanding(tmp_path, monkeypatch):
     assert td.classify_evidence(f"commit {sha}", repo) == td.OUTSTANDING
 
 
+def test_origin_without_resolved_base_does_not_trust_local_main(tmp_path, monkeypatch):
+    """An unfetched origin makes a local-only commit's merge status unknown."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _commit(repo, "f.txt", "x", "init")
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                    "https://github.com/o/r.git"], check=True)
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "feature"], check=True)
+    sha = _commit(repo, "g.txt", "y", "local-only work")
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "main"], check=True)
+    calls = []
+    _stub_gh(monkeypatch, MERGED, calls=calls)
+    assert td.classify_evidence(f"commit {sha}", repo) == td.UNKNOWN
+    assert calls == []
+
+
 def test_unreachable_github_is_unknown_never_outstanding(tmp_path, monkeypatch):
     """Could-not-ask and confirmed-not-merged are different answers.
 
@@ -130,7 +151,7 @@ def test_repeated_classification_asks_github_once(tmp_path, monkeypatch):
     assert len(calls) == 1, f"expected one gh-axi call, got {len(calls)}"
 
 
-def test_non_github_origin_asks_nobody_and_stays_outstanding(tmp_path, monkeypatch):
+def test_non_github_origin_asks_nobody_and_is_unknown(tmp_path, monkeypatch):
     """A filesystem origin is not a GitHub repo, so there is nothing to ask.
 
     The slug regex matched the tail of any URL-shaped string, so a local origin
@@ -150,7 +171,7 @@ def test_non_github_origin_asks_nobody_and_stays_outstanding(tmp_path, monkeypat
     calls = []
     _stub_gh(monkeypatch, MERGED, calls=calls)
     assert td._repo_slug(repo) == ""
-    assert td.classify_evidence(f"commit {sha}", repo) == td.OUTSTANDING
+    assert td.classify_evidence(f"commit {sha}", repo) == td.UNKNOWN
     assert calls == []
 
 
