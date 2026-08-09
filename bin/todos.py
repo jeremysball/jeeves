@@ -137,8 +137,14 @@ def verify_evidence(evidence: str, repo) -> bool:
                 return False
             # Run inside the repo rather than passing -R: that flag takes
             # OWNER/REPO, so handing it a local path returns NOT_FOUND for
-            # every PR that exists.
-            return _runs(["gh-axi", kind, "view", m.group(1)], cwd=str(repo)) == 0
+            # every PR that exists. The ferry is asked for a local path but
+            # sometimes writes `owner/repo`; that shape is what -R wants, so
+            # take it either way rather than failing a verifiable ref.
+            if Path(repo).is_dir():
+                return _runs(["gh-axi", kind, "view", m.group(1)], cwd=str(repo)) == 0
+            if re.fullmatch(r"[\w.-]+/[\w.-]+", str(repo)):
+                return _runs(["gh-axi", kind, "view", m.group(1), "-R", str(repo)]) == 0
+            return False
     m = FILE_RE.match(evidence)
     if m:
         if not repo:

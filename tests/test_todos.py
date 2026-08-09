@@ -242,9 +242,9 @@ def test_verify_pr_accepts_trailing_prose_and_runs_in_repo(tmp_path, monkeypatch
         return 0
 
     monkeypatch.setattr(td, "_runs", fake_runs)
-    assert td.verify_evidence("PR #419 merged", "/repo/path") is True
+    assert td.verify_evidence("PR #419 merged", str(tmp_path)) is True
     assert seen["args"] == ["gh-axi", "pr", "view", "419"]
-    assert seen["cwd"] == "/repo/path"  # -R takes OWNER/REPO, not a path
+    assert seen["cwd"] == str(tmp_path)  # -R takes OWNER/REPO, not a path
 
 
 def test_verify_issue_kind_supported(tmp_path, monkeypatch):
@@ -255,10 +255,29 @@ def test_verify_issue_kind_supported(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(td, "_runs", fake_runs)
-    assert td.verify_evidence("issue #391 filed", "/repo/path") is True
+    assert td.verify_evidence("issue #391 filed", str(tmp_path)) is True
     assert seen["args"] == ["gh-axi", "issue", "view", "391"]
 
 
 def test_verify_pr_missing_is_false(tmp_path, monkeypatch):
     monkeypatch.setattr(td, "_runs", lambda args, cwd=None: 1)
-    assert td.verify_evidence("PR #99999", "/repo/path") is False
+    assert td.verify_evidence("PR #99999", str(tmp_path)) is False
+
+
+def test_verify_pr_accepts_an_owner_repo_value_too(monkeypatch):
+    # the ferry is asked for a local path but sometimes writes owner/repo
+    seen = {}
+
+    def fake_runs(args, cwd=None):
+        seen["args"], seen["cwd"] = args, cwd
+        return 0
+
+    monkeypatch.setattr(td, "_runs", fake_runs)
+    assert td.verify_evidence("PR #419", "jeremysball/taskferry") is True
+    assert seen["args"] == ["gh-axi", "pr", "view", "419", "-R", "jeremysball/taskferry"]
+    assert seen["cwd"] is None
+
+
+def test_verify_pr_rejects_a_nonexistent_local_path(monkeypatch):
+    monkeypatch.setattr(td, "_runs", lambda args, cwd=None: 0)
+    assert td.verify_evidence("PR #419", "/no/such/dir/anywhere") is False

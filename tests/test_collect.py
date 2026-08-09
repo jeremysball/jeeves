@@ -286,3 +286,56 @@ def test_missing_session_block_holds_offset_for_retry(tmp_path, monkeypatch):
     assert counts["extracted"] == 1 and counts["failed"] == 1
     held = [k for k in cc.offsets_load()]
     assert not any("ses2" in k for k in held)  # ses2 retries next run
+
+
+def test_flag_refs_does_not_match_inside_a_longer_sibling_name(monkeypatch):
+    # `\b` sits between a word char and `-`, so a plain \bcatbow\b would
+    # match inside `catbow-tools` and judge it against catbow's numbering
+    monkeypatch.setattr(cc, "_repo_index", lambda: {"catbow": "o/catbow"})
+    monkeypatch.setattr(cc, "_ref_ceiling", lambda full: 9)
+    text = "- catbow-tools: shipped (`PR #9001`)\n"
+    out, flagged = cc._flag_unverified_refs(text)
+    assert flagged == [] and out == text
+    # the real catbow still resolves
+    _, flagged2 = cc._flag_unverified_refs("- catbow: shipped (`PR #9001`)\n")
+    assert flagged2 == ["9001"]
+
+
+def test_repo_origins_is_memoized_per_state_dir(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch)
+    cc._ORIGINS.clear()
+    (tmp_path / "state" / "project-dirs.txt").write_text("/nope/a\n/nope/b\n")
+    calls = []
+    real = cc.subprocess.run
+    monkeypatch.setattr(cc.subprocess, "run",
+                        lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    cc._repo_origins()
+    first = len(calls)
+    cc._repo_origins()
+    assert len(calls) == first  # second call served from cache
+
+
+def test_ref_ceiling_retries_once_before_caching_a_failure(monkeypatch):
+    cc._CEILINGS.clear()
+    attempts = []
+
+    def flaky(args, timeout=45):
+        attempts.append(args)
+        return None if len(attempts) == 1 else [{"number": 42}]
+
+    monkeypatch.setattr(cc, "_gh_json", flaky)
+    assert cc._ref_ceiling("o/r") == 42
+    assert len(attempts) == 2  # transient failure did not stick
+
+
+def test_add_mutation_citing_an_impossible_ref_is_dropped(monkeypatch):
+    monkeypatch.setattr(cc, "_repo_origins", lambda: [("/repo", "o/r")])
+    monkeypatch.setattr(cc, "_ref_ceiling", lambda full: 500)
+    bogus = {"op": "add", "line": "chase PR #9001 review", "repo": "/repo"}
+    real = {"op": "add", "line": "chase PR #413 review", "repo": "/repo"}
+    unresolvable = {"op": "add", "line": "chase PR #9001", "repo": None}
+    check = {"op": "check", "line": "x", "evidence": "PR #9001", "repo": "/repo"}
+    assert cc._add_is_disproved(bogus) is True
+    assert cc._add_is_disproved(real) is False
+    assert cc._add_is_disproved(unresolvable) is False
+    assert cc._add_is_disproved(check) is False  # checks are verify_evidence's job

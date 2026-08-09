@@ -94,13 +94,26 @@ def _parse_origin(url: str):
     `\\n` that made every later API path fail with "invalid control character
     in URL". Strip first, and let the name carry dots so `foo.bar` survives.
     """
-    m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", url.strip())
+    # rstrip the slash before matching: a `.../owner/name/` origin otherwise
+    # carries it into the name and 404s every path built from the id, which
+    # is the same silent-drop this function exists to fix.
+    m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", url.strip().rstrip("/"))
     return f"{m.group(1)}/{m.group(2)}" if m else None
 
 
+_ORIGINS: dict = {}
+
+
 def _repo_origins() -> list:
-    """(local dir, owner/name) for each project dir with a GitHub origin."""
+    """(local dir, owner/name) for each project dir with a GitHub origin.
+
+    Memoized per state dir: this shells out `git remote get-url` once per
+    project dir, and both callers (`gh_review` and `_flag_unverified_refs`)
+    want the same answer in the same run — 132 dirs meant 264 spawns a run
+    to compute one list twice."""
     dirs_file = jl.state_dir() / "project-dirs.txt"
+    if str(dirs_file) in _ORIGINS:
+        return _ORIGINS[str(dirs_file)]
     if not dirs_file.exists():
         return []
     out, seen = [], set()
@@ -118,6 +131,7 @@ def _repo_origins() -> list:
         if full and full not in seen:
             seen.add(full)
             out.append((d, full))
+    _ORIGINS[str(dirs_file)] = out
     return out
 
 
@@ -301,10 +315,36 @@ def _ref_ceiling(full: str):
     below the ceiling from transferred or deleted issues stay unflagged on
     purpose: a false accusation on a real ref costs more than a missed one."""
     if full not in _CEILINGS:
-        got = _gh_json(["api", f"repos/{full}/issues?state=all&per_page=1"])
+        got = None
+        # Retry once: caching the None from a transient `gh` failure would
+        # silently abstain on that repo for the rest of the run.
+        for _ in range(2):
+            got = _gh_json(["api", f"repos/{full}/issues?state=all&per_page=1"])
+            if got is not None:
+                break
         _CEILINGS[full] = (got[0].get("number")
                            if isinstance(got, list) and got else None)
     return _CEILINGS[full]
+
+
+def _add_is_disproved(mut: dict) -> bool:
+    """Does an `add` mutation cite a ref its own repo cannot have?
+
+    `check` ops get a real per-ref lookup from todos.verify_evidence, but
+    `add` ops carry no evidence field to verify — they'd otherwise reach the
+    ledger with no ref check at all, so a fabricated number becomes a real
+    obligation. Same disproof standard as the digest: only an out-of-range
+    ref in a resolvable repo counts."""
+    repo = mut.get("repo")
+    if mut.get("op") != "add" or not repo:
+        return False
+    full = next((f for d, f in _repo_origins() if d == str(repo)), None)
+    if not full:
+        return False
+    ceiling = _ref_ceiling(full)
+    if ceiling is None:
+        return False
+    return any(int(n) > ceiling for n in REF_RE.findall(mut.get("line") or ""))
 
 
 def _flag_unverified_refs(text: str) -> tuple:
@@ -328,7 +368,12 @@ def _flag_unverified_refs(text: str) -> tuple:
         return c is not None and int(num) > c
 
     for line in text.splitlines(keepends=True):
-        named = {idx[k] for k in idx if re.search(rf"\b{re.escape(k)}\b", line, re.I)}
+        # `\b` sits between a word char and a hyphen, so a `\bcatbow\b` key
+        # matches inside `catbow-tools` and would judge that sibling's refs
+        # against the wrong repo's numbering. Require a non-name character
+        # on both sides instead.
+        named = {idx[k] for k in idx
+                 if re.search(rf"(?<![\w-]){re.escape(k)}(?![\w-])", line, re.I)}
         # Bare refs only resolve when the line points at exactly one repo.
         # Guessing between two would risk judging a ref against the wrong
         # numbering — the same false-accusation failure this rewrite exists
@@ -476,8 +521,14 @@ def run_once() -> dict:
                 # old filter dropped every `check` citing a merged PR — the
                 # only kind that ever closes a todo — so the ledger could
                 # only grow. todos.verify_evidence gates each check with a
-                # real per-ref lookup, which is the gate that was wanted.
-                applied = td.apply_mutations(muts)
+                # real per-ref lookup; `add` has no evidence field to check,
+                # so it gets the same disproof test the digest uses.
+                keep, disproved = [], []
+                for mut in muts:
+                    (disproved if _add_is_disproved(mut) else keep).append(mut)
+                if disproved:
+                    jl.log(f"todo adds dropped — ref cannot exist: {disproved}")
+                applied = td.apply_mutations(keep)
                 counts["digest"] = 1
                 jl.log(f"digest written; mutations: {applied}")
     return counts
