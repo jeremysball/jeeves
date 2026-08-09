@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections import defaultdict
@@ -255,6 +256,97 @@ def extract_prompt(group) -> str:
     return template.replace("{slices_block}", "\n\n---\n\n".join(blocks))
 
 
+def staging_root() -> Path:
+    d = jl.state_dir() / "staging"
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o700)
+    return d
+
+
+def prune_staging(keep_h: int = 6) -> int:
+    """Staged slices are verbatim transcript copies. Never leave them lying
+    around past the run that needed them."""
+    cutoff = time.time() - keep_h * 3600
+    n = 0
+    for d in staging_root().iterdir():
+        if d.is_dir() and d.stat().st_mtime < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+            n += 1
+    return n
+
+
+# Staging widens what reaches the model from denoised prose to the whole
+# delta, tool results included — and a tool result is where a secret actually
+# shows up (an `env` dump, a curl with a bearer token, a cat of a .env). Prose
+# rarely carries one; command output does. Redact before anything leaves the
+# host, not after.
+SECRET_RES = [
+    re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,})"),
+    re.compile(r"\b(github_pat_[A-Za-z0-9_]{20,})"),
+    re.compile(r"\b(sk-[A-Za-z0-9_-]{16,})"),
+    re.compile(r"\b(xox[abprs]-[A-Za-z0-9-]{10,})"),
+    re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),
+    re.compile(r"\b(AIza[0-9A-Za-z_-]{30,})"),
+    re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]{20,}={0,2}"),
+    # No `\b` in front: `_` is a word character, so a boundary would never
+    # match the `API_KEY` inside `OPENAI_API_KEY`, which is exactly the shape
+    # these turn up in.
+    re.compile(r"(?i)(?<![A-Za-z0-9])((?:api[_-]?key|secret|token|password|passwd)"
+               r"[\"']?\s*[:=]\s*[\"']?)([^\s\"',]{8,})"),
+]
+
+
+def redact(text: str) -> str:
+    """Mask credential-shaped strings in staged transcript content."""
+    for rx in SECRET_RES:
+        text = rx.sub(lambda m: m.group(1) + "[REDACTED]"
+                      if rx.groups > 1 else "[REDACTED]", text)
+    return text
+
+
+def stage_slice(staging: Path, s: dict) -> Path:
+    """Write a session's raw delta lines for the ferry to read directly.
+
+    Otherwise unfiltered on purpose: the whole point is that tool calls, tool
+    results, and sidechain entries reach the model, and `denoise` drops all
+    three."""
+    f = staging / f"{s['slug']}--{s['sid']}.jsonl"
+    f.write_text(redact("\n".join(s["raw"])) + "\n")
+    f.chmod(0o600)
+    return f
+
+
+def extract_tools_prompt(group, staging: Path) -> str:
+    template = (PROMPTS / "extract-tools.md").read_text()
+    rows = []
+    for s in group:
+        f = f"{s['slug']}--{s['sid']}.jsonl"
+        rows.append(f"- session `{s['sid']}` (project {Path(s['dir']).name}): "
+                    f"`{f}` — write findings to `summary-{s['sid']}.json`")
+    return template.replace("{files_block}", "\n".join(rows))
+
+
+def read_staged_summaries(staging: Path, group) -> dict:
+    """Collect per-session summary files the ferry wrote. A file that never
+    appeared is absent from the result, never a stub — the caller decides
+    whether to hold the offset for a retry."""
+    out = {}
+    for s in group:
+        f = staging / f"summary-{s['sid']}.json"
+        if not f.exists():
+            continue
+        try:
+            payload = json.loads(f.read_text())
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            jl.log(f"staged summary unreadable for {s['sid']}: {e}")
+            continue
+        if isinstance(payload, list):  # a one-entry array is close enough
+            payload = payload[0] if len(payload) == 1 else None
+        if isinstance(payload, dict):
+            out[s["sid"]] = {**payload, "session": s["sid"]}
+    return out
+
+
 def write_summary(date, slug, sid, n, payload: dict) -> None:
     d = jl.state_dir() / "summaries" / date
     d.mkdir(parents=True, exist_ok=True)
@@ -439,27 +531,51 @@ def run_once() -> dict:
             continue
         slices.append({"path": key, "dir": str(path.parent), "slug": path.parent.name,
                        "sid": session_id_of(path), "new_off": new_off,
-                       "entries": entries, "rendered": jl.render_slice(entries)})
+                       "entries": entries, "raw": lines,
+                       "rendered": jl.render_slice(entries)})
 
-    for group in group_slices(slices, cfg["batch_under"], cfg["batch_max"]):
-        res = jl.ferry(extract_prompt(group), cfg["model"])
-        if not res["ok"]:
-            counts["failed"] += len(group)
-            jl.log(f"extraction failed ({res['error']}); offsets held for retry: "
-                   f"{[s['sid'] for s in group]}")
-            continue  # offsets NOT advanced — retry next run
-        payload = jl.parse_fenced_json(res["message"])
-        if not isinstance(payload, list):
-            counts["failed"] += len(group)
-            jl.log(f"extraction output unparseable (task {res['task_id']}); "
-                   f"offsets held; first 300 chars: {res['message'][:300]!r}")
-            continue
-        by_session = {p.get("session"): p for p in payload if isinstance(p, dict)}
-        # Lenient fallback: with exactly one slice and one returned entry, a
-        # mislabeled session key is still obviously the answer.
-        if len(group) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
-                and group[0]["sid"] not in by_session:
-            by_session[group[0]["sid"]] = {**payload[0], "session": group[0]["sid"]}
+    prune_staging()
+    for gi, group in enumerate(group_slices(slices, cfg["batch_under"], cfg["batch_max"])):
+        by_session, res = {}, None
+        # Staged path: hand the ferry the raw transcript and let it read the
+        # tool calls, tool results, and sidechain entries `denoise` throws
+        # away — 98% of the bytes, and where every real evidence ref lives.
+        staging = staging_root() / f"{date}--{jl.now_et().strftime('%H%M%S')}--{gi}"
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            for s in group:
+                stage_slice(staging, s)
+            res = jl.ferry(extract_tools_prompt(group, staging), cfg["model"],
+                           directory=str(staging))
+            if res["ok"]:
+                by_session = read_staged_summaries(staging, group)
+        except OSError as e:
+            jl.log(f"staging failed ({e}); falling back to the rendered-prose path")
+
+        # Fallback: the pre-staging dispatch, which passes a denoised prose
+        # blob and reads the answer out of the final message.
+        if not by_session:
+            if res is not None and res["ok"]:
+                jl.log(f"staged run wrote no summary files (task {res['task_id']}); "
+                       f"retrying on the rendered-prose path")
+            res = jl.ferry(extract_prompt(group), cfg["model"])
+            if not res["ok"]:
+                counts["failed"] += len(group)
+                jl.log(f"extraction failed ({res['error']}); offsets held for retry: "
+                       f"{[s['sid'] for s in group]}")
+                continue  # offsets NOT advanced — retry next run
+            payload = jl.parse_fenced_json(res["message"])
+            if not isinstance(payload, list):
+                counts["failed"] += len(group)
+                jl.log(f"extraction output unparseable (task {res['task_id']}); "
+                       f"offsets held; first 300 chars: {res['message'][:300]!r}")
+                continue
+            by_session = {p.get("session"): p for p in payload if isinstance(p, dict)}
+            # Lenient fallback: with exactly one slice and one returned entry,
+            # a mislabeled session key is still obviously the answer.
+            if len(group) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
+                    and group[0]["sid"] not in by_session:
+                by_session[group[0]["sid"]] = {**payload[0], "session": group[0]["sid"]}
         for s in group:
             item = by_session.get(s["sid"])
             if item is None:

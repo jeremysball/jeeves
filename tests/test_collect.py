@@ -26,6 +26,28 @@ def _mk_session(root, slug, sid, texts):
     return p
 
 
+def _staging_ferry(monkeypatch, *sids):
+    """Stand in for a ferry that reads its staged slices and writes one
+    summary file per session, which is the real contract."""
+    captured = {"text": "", "dir": None}
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if not directory:  # the rendered-prose fallback path
+            return {"ok": True, "task_id": "oc_fb", "error": "",
+                    "message": '```json\n[]\n```'}
+        d = Path(directory)
+        captured["dir"] = d
+        captured["text"] += "".join(f.read_text() for f in d.glob("*.jsonl"))
+        for sid in sids:
+            (d / f"summary-{sid}.json").write_text(json.dumps(
+                {"session": sid, "shipped": [], "oversaw": [], "loose_ends": [],
+                 "tangents": [], "overlooked": [], "failures": [], "shape": "s"}))
+        return {"ok": True, "task_id": "oc_st", "error": "", "message": "Status: DONE"}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    return captured
+
+
 def test_offsets_roundtrip(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     offs = {"/a.jsonl": {"offset": 42, "size": 42}}
@@ -53,7 +75,7 @@ def test_run_once_happy_path(tmp_path, monkeypatch):
               "message": '```markdown\n# jeeves digest — D\n**Shipped**\n- thing\n```\n```json\n[{"op": "add", "line": "edge trim", "kind": "loose-end", "source": "proj1", "repo": null}]\n```\nStatus: DONE'}
     calls = []
 
-    def fake_ferry(prompt, model, wait_s=420):
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
         calls.append(prompt)
         return extracted if len(calls) == 1 else digest
 
@@ -243,16 +265,10 @@ def test_trivial_slice_holds_offset_and_accumulates(tmp_path, monkeypatch):
         for i in range(5):
             fh.write(json.dumps({"timestamp": f"t{i}",
                                  "message": {"role": "user", "content": f"more {i}"}}) + "\n")
-    seen = []
-
-    def fake_ferry(prompt, model, wait_s=420):
-        seen.append(prompt)
-        return {"ok": True, "task_id": "oc_1", "error": "",
-                "message": '```json\n[{"session": "ses1", "shipped": [], "oversaw": [], "loose_ends": [], "tangents": [], "overlooked": [], "shape": "s"}]\n```'}
-
-    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    staged = _staging_ferry(monkeypatch, "ses1")
     cc.run_once()
-    assert "one line" in seen[0]  # the originally-skipped line survived
+    # the ferry read the lines off disk, and the originally-skipped one is there
+    assert "one line" in staged["text"]
 
 
 def test_trivial_slice_on_a_dead_session_is_extracted_not_dropped(tmp_path, monkeypatch):
@@ -260,17 +276,10 @@ def test_trivial_slice_on_a_dead_session_is_extracted_not_dropped(tmp_path, monk
     root = tmp_path / "projects"
     p = _mk_session(root, "-home-x-proj1", "ses1", ["last words"])
     _age(p, 48)
-    seen = []
-
-    def fake_ferry(prompt, model, wait_s=420):
-        seen.append(prompt)
-        return {"ok": True, "task_id": "oc_2", "error": "",
-                "message": '```json\n[{"session": "ses1", "shipped": [], "oversaw": [], "loose_ends": [], "tangents": [], "overlooked": [], "shape": "s"}]\n```'}
-
-    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    staged = _staging_ferry(monkeypatch, "ses1")
     counts = cc.run_once()
     assert counts["extracted"] == 1
-    assert "last words" in seen[0]
+    assert "last words" in staged["text"]
 
 
 def test_missing_session_block_holds_offset_for_retry(tmp_path, monkeypatch):
@@ -339,3 +348,107 @@ def test_add_mutation_citing_an_impossible_ref_is_dropped(monkeypatch):
     assert cc._add_is_disproved(real) is False
     assert cc._add_is_disproved(unresolvable) is False
     assert cc._add_is_disproved(check) is False  # checks are verify_evidence's job
+
+
+def test_staged_slice_is_raw_not_denoised(tmp_path, monkeypatch):
+    """The whole point: tool calls and sidechains reach the model. denoise
+    drops both, so the staged file must be the unfiltered delta."""
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    root = tmp_path / "projects"
+    d = root / "-home-x-proj1"
+    d.mkdir(parents=True)
+    (d / "ses1.jsonl").write_text("\n".join([
+        json.dumps({"timestamp": "t0", "message": {"role": "user", "content": "go"}}),
+        json.dumps({"timestamp": "t1", "isSidechain": True,
+                    "message": {"role": "assistant", "content": "subagent work"}}),
+        json.dumps({"timestamp": "t2", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "git commit"}}]}}),
+        json.dumps({"toolUseResult": {"stdout": "[main abc1234] shipped it"}}),
+    ]) + "\n")
+    staged = _staging_ferry(monkeypatch, "ses1")
+    cc.run_once()
+    text = staged["text"]
+    assert "subagent work" in text      # isSidechain survives
+    assert "tool_use" in text           # tool calls survive
+    assert "abc1234" in text            # the evidence ref survives
+    assert len(jl.denoise(text.splitlines(), 800)) < 4  # denoise would have cut it
+
+
+def test_staged_summary_file_beats_the_final_message(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["a", "b"])
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:
+            (Path(directory) / "summary-ses1.json").write_text(json.dumps(
+                {"session": "ses1", "shape": "from the file"}))
+        return {"ok": True, "task_id": "oc_1", "error": "",
+                "message": '```json\n[{"session": "ses1", "shape": "from the message"}]\n```'}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    counts = cc.run_once()
+    assert counts["extracted"] == 1
+    summary = next((tmp_path / "state" / "summaries").rglob("*--ses1--*.md")).read_text()
+    assert "from the file" in summary and "from the message" not in summary
+
+
+def test_falls_back_to_prose_when_no_summary_file_appears(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["a", "b"])
+    seen = []
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        seen.append(bool(directory))
+        return {"ok": True, "task_id": "oc_1", "error": "",
+                "message": '```json\n[{"session": "ses1", "shape": "from the message"}]\n```'}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    counts = cc.run_once()
+    assert seen[:2] == [True, False]  # staged first, then the prose fallback
+    assert counts["extracted"] == 1
+    summary = next((tmp_path / "state" / "summaries").rglob("*--ses1--*.md")).read_text()
+    assert "from the message" in summary
+
+
+def test_staging_is_pruned_transcript_copies_do_not_linger(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch)
+    old = cc.staging_root() / "2026-08-01--000000--0"
+    old.mkdir(parents=True)
+    (old / "x.jsonl").write_text("secrets\n")
+    _age(old, 48)
+    fresh = cc.staging_root() / "2026-08-09--120000--0"
+    fresh.mkdir(parents=True)
+    assert cc.prune_staging() == 1
+    assert not old.exists() and fresh.exists()
+
+
+def test_staged_content_is_redacted_before_it_leaves_the_host():
+    cases = [
+        ("ghp_abcdefghijklmnopqrstuvwxyz01", "ghp_"),
+        ("github_pat_11ABCDEFG0abcdefghijklmno", "github_pat_"),
+        ("sk-proj-abcdefghijklmnopqrstuvwx", "sk-"),
+        ("AKIAIOSFODNN7EXAMPLE", "AKIA"),
+        ("xoxb-1234567890-abcdefghij", "xoxb-"),
+        ("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "eyJhbG"),
+        ('OPENAI_API_KEY="hunter2hunter2"', "hunter2"),
+        ("password: correct-horse-battery", "correct-horse"),
+    ]
+    for raw, leaked in cases:
+        out = cc.redact(raw)
+        assert leaked not in out, f"leaked {leaked!r} from {raw!r} -> {out!r}"
+        assert "[REDACTED]" in out, f"no redaction marker for {raw!r} -> {out!r}"
+    # ordinary transcript content survives untouched
+    keep = 'commit abc1234 shipped it; ran `npm test`, 1138 passed'
+    assert cc.redact(keep) == keep
+
+
+def test_stage_slice_redacts_and_locks_down_permissions(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch)
+    staging = cc.staging_root() / "run"
+    staging.mkdir(parents=True)
+    s = {"slug": "proj", "sid": "ses1",
+         "raw": [json.dumps({"toolUseResult": {"stdout": "GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz01"}})]}
+    f = cc.stage_slice(staging, s)
+    body = f.read_text()
+    assert "ghp_abcdefghijklmnopqrstuvwxyz01" not in body and "[REDACTED]" in body
+    assert oct(f.stat().st_mode)[-3:] == "600"
