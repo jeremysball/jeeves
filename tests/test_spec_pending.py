@@ -1,6 +1,5 @@
 import json
 
-
 import jeeves_lib as jl
 import todos as td
 
