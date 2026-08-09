@@ -423,13 +423,17 @@ def _ferry_once(prompt: str, model: str, wait_s: int = 420) -> dict:
     if msg is None:
         return fail("could not read message from result output", tid)
     if not msg.strip():
-        # `incomplete: true` means the model hit its output-token ceiling before
-        # emitting a final message. Distinct from a crash and from a genuinely
-        # empty answer, and the only one of the three that says "ask for less
-        # output" rather than "the route is down" — so name it.
+        # `incomplete: true` is taskferry's flag for "the final message was
+        # empty, or didn't match the task's finalMarker" — see
+        # evaluateOutputCompleteness in taskferry's src/tasks.js. It says
+        # nothing about token budgets. The usual cause is a worker that spent
+        # its whole turn on tool calls and reasoning without ever emitting a
+        # text block (`taskferry tail` shows textTotalChars: 0), which is a
+        # different problem from a crash and from a genuinely empty answer.
         if re.search(r"^incomplete: true", out, re.M):
-            return fail(f"task hit its output-token limit before emitting a message "
-                        f"(incomplete); the prompt is asking for too much output", tid)
+            return fail("task settled with no final message (taskferry: incomplete); "
+                        "the worker likely never emitted a text block — check "
+                        "`taskferry tail <id>` for textTotalChars", tid)
         return fail(f"task reported {status or 'unknown status'} but produced an empty message", tid)
     if msg.startswith("**Delta:**") or "summaryOf:" in out:
         # daemon replaced a large result with a summary wrapper — rebuild
