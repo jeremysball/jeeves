@@ -478,9 +478,28 @@ def test_parse_github_slug_rejects_github_com_as_substring(url):
     ("https://github.com/o/r", "o/r"),
     ("git@github.com:o/r.git", "o/r"),
     ("ssh://git@github.com/o/r.git", "o/r"),
+    # No user@ prefix: git's scp-like syntax makes it optional, and the old
+    # (pre-host-anchoring) regex accepted this form -- the anchoring fix must
+    # not silently drop it.
+    ("github.com:o/r.git", "o/r"),
 ])
 def test_parse_github_slug_accepts_real_github_origins(url, slug):
     assert jl.parse_github_slug(url) == slug
+
+
+@pytest.mark.parametrize("url", [
+    # Unbalanced "[" makes urlsplit treat this as a malformed IPv6 host and
+    # raise ValueError -- but git itself accepts this as a remote URL with no
+    # validation, so a repo can genuinely have this as its origin.
+    "https://[bad/o/r.git",
+    "ssh://[bad/o/r",
+])
+def test_parse_github_slug_never_raises_on_a_malformed_url(url):
+    # A malformed-but-git-accepted origin is not a GitHub origin -- return
+    # None, the same answer as any other non-GitHub URL, rather than crashing
+    # every caller (todos.classify_evidence, collect._repo_origins) that has
+    # no reason to expect this function can raise.
+    assert jl.parse_github_slug(url) is None
 
 
 # ---------------------------------------------------------------------------

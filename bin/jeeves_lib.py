@@ -187,9 +187,18 @@ def parse_github_slug(url: str):
     `github.com` as a substring anywhere, so `https://notgithub.com/acme/widget.git`
     and `https://gitlab.com/github.com/acme/widget.git` both read as GitHub
     origins. A scheme URL is parsed with urlsplit and trusted only when the
-    hostname is exactly `github.com`; the scp-like `user@github.com:owner/repo`
+    hostname is exactly `github.com`; the scp-like `[user@]github.com:owner/repo`
     shape (which urlsplit cannot parse a host out of) gets its own regex
-    requiring `github.com` to immediately follow `@` and precede `:`.
+    requiring `github.com` to immediately precede `:` -- the `user@` prefix is
+    optional there too, matching git's own scp-like syntax, where a bare
+    `github.com:owner/repo.git` (no explicit user) is valid.
+
+    `urlsplit` raises `ValueError` on some malformed-but-git-accepted URLs
+    (e.g. an unbalanced `[` reads as an invalid IPv6 host) -- git itself does
+    not validate a remote URL before accepting it, so a repo can genuinely
+    have one of these as its origin. That is not a GitHub origin either way,
+    so it degrades to the same `None` any other non-GitHub URL gets, rather
+    than raising out of every caller.
 
     `git remote get-url` output keeps its trailing newline, and the old
     `([^/.]+)` name class happily matched it -- producing a repo id ending in
@@ -201,12 +210,15 @@ def parse_github_slug(url: str):
     # is the same silent-drop this function exists to fix.
     s = url.strip().rstrip("/")
     if "://" in s:
-        parts = urlsplit(s)
+        try:
+            parts = urlsplit(s)
+        except ValueError:
+            return None
         if parts.hostname != "github.com":
             return None
         path = parts.path
     else:
-        m = re.fullmatch(r"[^@]+@github\.com:([^/]+)/(.+?)(?:\.git)?", s)
+        m = re.fullmatch(r"(?:[^@]+@)?github\.com:([^/]+)/(.+?)(?:\.git)?", s)
         if not m:
             return None
         return f"{m.group(1)}/{m.group(2)}"
