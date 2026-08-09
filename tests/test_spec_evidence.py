@@ -335,6 +335,25 @@ def test_default_branch_ignores_dangling_origin_head(tmp_path):
     assert td._default_branch(repo) == "origin/main"
 
 
+def test_default_branch_memoized_per_repo(tmp_path, monkeypatch):
+    """_default_branch runs symbolic-ref plus up to two rev-parse calls every
+    time; classifying many evidence rows for one repo must not re-run them."""
+    repo, _ = _git_repo(tmp_path)
+    calls = []
+    real_capture = td._capture
+
+    def fake_capture(args):
+        calls.append(args)
+        return real_capture(args)
+
+    monkeypatch.setattr(td, "_capture", fake_capture)
+    if hasattr(td, "_DEFAULT_BRANCH_CACHE"):
+        monkeypatch.setattr(td, "_DEFAULT_BRANCH_CACHE", {})
+    assert td._default_branch(repo) == "main"
+    assert td._default_branch(repo) == "main"
+    assert len(calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # Part 2: classify_evidence() — combination rules
 # ---------------------------------------------------------------------------

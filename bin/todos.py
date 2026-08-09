@@ -2,11 +2,13 @@
 """Todo ledger mutations. Code owns all writes: normalized unique-match only,
 never deletes, everything provenance-tagged."""
 import argparse
+import atexit
 import hashlib
 import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import jeeves_lib as jl
@@ -201,11 +203,19 @@ OUTSTANDING = "outstanding"  # the ref is real but not merged: still live work
 UNKNOWN = "unknown"      # could not determine; never treated as landed
 
 
+# The base branch is a property of the repo, not of any one evidence row, and
+# resolving it costs up to three git calls; memoize per repo path.
+_DEFAULT_BRANCH_CACHE = {}
+
+
 def _default_branch(repo) -> str:
     """The base branch to measure "merged" against. origin/HEAD when set,
     else the first resolved origin/main or origin/master. A local main/master
     fallback is used only when no origin remote is configured. Empty when
     neither does — callers must degrade to UNKNOWN rather than guess a base."""
+    key = str(repo)
+    if key in _DEFAULT_BRANCH_CACHE:
+        return _DEFAULT_BRANCH_CACHE[key]
     head = _capture(["git", "-C", str(repo), "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).strip()
     if head:
         # symbolic-ref only reads what the symref points at; it does not check
@@ -213,13 +223,16 @@ def _default_branch(repo) -> str:
         # must not win over a resolved origin/main, so verify before trusting.
         branch = head.removeprefix("refs/remotes/")
         if _runs(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}"]) == 0:
+            _DEFAULT_BRANCH_CACHE[key] = branch
             return branch
     has_origin = _runs(["git", "-C", str(repo), "remote", "get-url", "origin"]) == 0
     candidates = ("origin/main", "origin/master") if has_origin else (
         "origin/main", "origin/master", "main", "master")
     for cand in candidates:
         if _runs(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}"]) == 0:
+            _DEFAULT_BRANCH_CACHE[key] = cand
             return cand
+    _DEFAULT_BRANCH_CACHE[key] = ""
     return ""
 
 
@@ -242,6 +255,10 @@ def _repo_slug(repo) -> str:
 # and --pending classifies them all again for listing, so without this a queue of
 # N rows spends N network round trips rediscovering one unchanging fact.
 _PULLS_CACHE = {}
+# Same shape for pr/issue views: a ledger full of rows citing the same PR or
+# issue would otherwise spend one gh-axi round trip per row.
+_PR_CACHE = {}
+_ISSUE_CACHE = {}
 
 
 def _merged_pr_carries(sha: str, slug: str):
@@ -257,14 +274,15 @@ def _merged_pr_carries(sha: str, slug: str):
         out = _capture(["gh-axi", "api", f"/repos/{slug}/commits/{sha}/pulls"])
         # gh-axi exits nonzero on a sha GitHub does not know, so _capture returns
         # "" for a failed lookup and "[]" for a real answer of "no pulls".
-        if not out:
-            _PULLS_CACHE[key] = None
-        else:
+        # A failed lookup is not an answer, so it is never cached: None means
+        # "could not ask", and the next call for this key must retry, not reuse
+        # a stale failure.
+        if out:
             # In gh-axi's TOON output a merged pull carries a quoted timestamp
             # and an open one carries a bare `null`, so the quote is the
             # discriminator, not the presence of the key.
             _PULLS_CACHE[key] = bool(re.search(r'^\s*merged_at:\s*"', out, re.M))
-    return _PULLS_CACHE[key]
+    return _PULLS_CACHE.get(key)
 
 
 def _classify_commit(sha: str, repo) -> str:
@@ -279,10 +297,9 @@ def _classify_commit(sha: str, repo) -> str:
     confirmed against jeeves PR #1, whose four commits all came back unmatched.
 
     So ancestry runs first because it is free and offline, and GitHub is asked
-    only when it misses.
+    only when it misses. The caller (classify_evidence) has already verified the
+    sha resolves via cat-file -e, so this function does not re-check it.
     """
-    if _runs(["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"]) != 0:
-        return UNKNOWN
     base = _default_branch(repo)
     if not base:
         return UNKNOWN
@@ -308,14 +325,17 @@ def _classify_pr(num: str, repo) -> str:
     slug = _repo_slug(repo)
     if not slug:
         return UNKNOWN
-    out = _capture(["gh-axi", "pr", "view", num, "-R", slug])
-    if not out:
-        return UNKNOWN
-    # gh-axi prints a YAML-ish block; the state line is `  state: merged`.
-    m = re.search(r"^\s*state:\s*\"?(\w+)", out, re.M)
-    if not m:
-        return UNKNOWN
-    return LANDED if m.group(1).lower() == "merged" else OUTSTANDING
+    key = (slug, num)
+    if key not in _PR_CACHE:
+        out = _capture(["gh-axi", "pr", "view", num, "-R", slug])
+        # A failed lookup is not an answer, so it is never cached: the next
+        # call for this key retries instead of reusing a stale failure.
+        if out:
+            # gh-axi prints a YAML-ish block; the state line is `  state: merged`.
+            m = re.search(r"^\s*state:\s*\"?(\w+)", out, re.M)
+            if m:
+                _PR_CACHE[key] = LANDED if m.group(1).lower() == "merged" else OUTSTANDING
+    return _PR_CACHE.get(key, UNKNOWN)
 
 
 def _classify_issue(num: str, repo) -> str:
@@ -324,16 +344,51 @@ def _classify_issue(num: str, repo) -> str:
     slug = _repo_slug(repo)
     if not slug:
         return UNKNOWN
-    out = _capture(["gh-axi", "issue", "view", num, "-R", slug])
-    if not out:
-        return UNKNOWN
-    m = re.search(r"^\s*state:\s*\"?(\w+)", out, re.M)
-    if not m:
-        return UNKNOWN
-    return LANDED if m.group(1).lower() == "closed" else OUTSTANDING
+    key = (slug, num)
+    if key not in _ISSUE_CACHE:
+        out = _capture(["gh-axi", "issue", "view", num, "-R", slug])
+        # A failed lookup is not an answer, so it is never cached: the next
+        # call for this key retries instead of reusing a stale failure.
+        if out:
+            m = re.search(r"^\s*state:\s*\"?(\w+)", out, re.M)
+            if m:
+                _ISSUE_CACHE[key] = LANDED if m.group(1).lower() == "closed" else OUTSTANDING
+    return _ISSUE_CACHE.get(key, UNKNOWN)
 
 
-def classify_evidence(evidence: str, repo) -> str:
+# Disk-backed verdict memo, keyed by f"{repo}\x1f{evidence}". The in-process
+# caches above die with the process, but SKILL.md's --prune-pending step is
+# immediately followed by a separate --pending invocation over the same rows,
+# seconds apart; without this, the second process redoes every gh-axi round
+# trip the first already paid for. A short TTL bounds the reuse to exactly
+# that "run it again a few seconds later" case, never masking a real state
+# change for long. Loaded once per process, saved once per process.
+_MEMO_TTL = 300
+_MEMO_PATH = "evidence_memo.json"
+_MEMO = None
+
+
+def _load_memo() -> dict:
+    """The memo file is disposable: a missing, unreadable, or malformed file
+    just means starting from an empty cache, never a wrong answer."""
+    try:
+        return json.loads((jl.state_dir() / _MEMO_PATH).read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_memo() -> None:
+    """Best-effort: a failed write (disk full, permissions) must never crash
+    the CLI over a cache write."""
+    if _MEMO is None:
+        return
+    try:
+        (jl.state_dir() / _MEMO_PATH).write_text(json.dumps(_MEMO))
+    except OSError:
+        pass
+
+
+def _classify_evidence_uncached(evidence: str, repo) -> str:
     """Classify evidence as LANDED / OUTSTANDING / UNKNOWN.
 
     A commit that exists but is not in the base branch's ancestry is a branch
@@ -372,6 +427,23 @@ def classify_evidence(evidence: str, repo) -> str:
     if OUTSTANDING in verdicts:
         return OUTSTANDING
     return LANDED if all(v == LANDED for v in verdicts) else UNKNOWN
+
+
+def classify_evidence(evidence: str, repo) -> str:
+    """Memoized entry point: same verdict as _classify_evidence_uncached, with
+    a short-TTL disk cache so consecutive processes over the same rows do not
+    redo each other's gh-axi round trips."""
+    global _MEMO
+    if _MEMO is None:
+        _MEMO = _load_memo()
+        atexit.register(_save_memo)
+    key = f"{repo}\x1f{evidence}"
+    hit = _MEMO.get(key)
+    if hit is not None and time.time() - hit["t"] < _MEMO_TTL:
+        return hit["verdict"]
+    verdict = _classify_evidence_uncached(evidence, repo)
+    _MEMO[key] = {"verdict": verdict, "t": time.time()}
+    return verdict
 
 
 def verify_evidence(evidence: str, repo) -> bool:

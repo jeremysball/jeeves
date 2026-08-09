@@ -262,6 +262,23 @@ def test_missing_commit_is_unknown_not_outstanding(tmp_path):
     assert td.classify_evidence("commit deadbeef00", str(repo)) == td.UNKNOWN
 
 
+def test_commit_existence_checked_once_per_ref(tmp_path, monkeypatch):
+    """classify_evidence's own cat-file -e gate already filters out shas that
+    do not resolve, so _classify_commit must not re-run the identical check."""
+    repo, h = _git_repo(tmp_path)
+    calls = []
+    real_runs = td._runs
+
+    def fake_runs(args, cwd=None):
+        calls.append(args)
+        return real_runs(args, cwd=cwd)
+
+    monkeypatch.setattr(td, "_runs", fake_runs)
+    assert td.classify_evidence(f"commit {h[:10]}", str(repo)) == td.LANDED
+    cat_files = [a for a in calls if a[:5] == ["git", "-C", str(repo), "cat-file", "-e"]]
+    assert len(cat_files) == 1, f"expected one cat-file -e, got {len(cat_files)}"
+
+
 def test_repo_slug_parses_ssh_and_https_remotes(tmp_path):
     import subprocess
     repo, _ = _git_repo(tmp_path)
@@ -394,6 +411,7 @@ def test_issue_evidence_is_classified_as_an_issue_not_a_pr(monkeypatch):
 
     monkeypatch.setattr(td, "_repo_slug", lambda repo: "o/r")
     monkeypatch.setattr(td, "_capture", fake_capture)
+    monkeypatch.setattr(td, "_ISSUE_CACHE", {})
     assert td.classify_evidence("issue #391 filed", "/repo") == td.LANDED
     assert ["gh-axi", "issue", "view", "391", "-R", "o/r"] in calls
 
@@ -401,13 +419,49 @@ def test_issue_evidence_is_classified_as_an_issue_not_a_pr(monkeypatch):
 def test_open_issue_is_outstanding(monkeypatch):
     monkeypatch.setattr(td, "_repo_slug", lambda repo: "o/r")
     monkeypatch.setattr(td, "_capture", lambda args: "  state: open\n")
+    monkeypatch.setattr(td, "_ISSUE_CACHE", {})
     assert td.classify_evidence("issue #391", "/repo") == td.OUTSTANDING
 
 
 def test_bare_hash_ref_is_still_read_as_a_pr(monkeypatch):
     monkeypatch.setattr(td, "_repo_slug", lambda repo: "o/r")
     monkeypatch.setattr(td, "_capture", lambda args: "  state: merged\n")
+    monkeypatch.setattr(td, "_PR_CACHE", {})
     assert td.classify_evidence("PR #419 merged", "/repo") == td.LANDED
+
+
+def test_classify_pr_memoized_per_repo_and_number(monkeypatch):
+    """Repeated evidence citing the same PR must not re-hit gh-axi."""
+    calls = []
+
+    def fake_capture(args):
+        calls.append(args)
+        return "  state: merged\n"
+
+    monkeypatch.setattr(td, "_repo_slug", lambda repo: "o/r")
+    monkeypatch.setattr(td, "_capture", fake_capture)
+    if hasattr(td, "_PR_CACHE"):
+        monkeypatch.setattr(td, "_PR_CACHE", {})
+    assert td._classify_pr("424242", "/repo") == td.LANDED
+    assert td._classify_pr("424242", "/repo") == td.LANDED
+    assert len(calls) == 1
+
+
+def test_classify_issue_memoized_per_repo_and_number(monkeypatch):
+    """Repeated evidence citing the same issue must not re-hit gh-axi."""
+    calls = []
+
+    def fake_capture(args):
+        calls.append(args)
+        return "  state: closed\n"
+
+    monkeypatch.setattr(td, "_repo_slug", lambda repo: "o/r")
+    monkeypatch.setattr(td, "_capture", fake_capture)
+    if hasattr(td, "_ISSUE_CACHE"):
+        monkeypatch.setattr(td, "_ISSUE_CACHE", {})
+    assert td._classify_issue("424243", "/repo") == td.LANDED
+    assert td._classify_issue("424243", "/repo") == td.LANDED
+    assert len(calls) == 1
 
 
 def test_repo_slug_accepts_an_owner_repo_value(tmp_path):
@@ -422,3 +476,75 @@ def test_repo_slug_still_prefers_a_real_checkout(tmp_path):
     subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
                     "https://github.com/o/r.git"], check=True)
     assert td._repo_slug(str(repo)) == "o/r"
+
+
+def _memo_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("JEEVES_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(td, "_MEMO", None)
+
+
+def _stub_gh_axi(monkeypatch, calls):
+    monkeypatch.setattr(td, "_repo_slug", lambda repo: "o/r")
+    monkeypatch.setattr(td, "_capture", lambda args: calls.append(args) or "  state: merged\n")
+    monkeypatch.setattr(td, "_PR_CACHE", {})
+
+
+def test_classify_evidence_memoized_in_process(tmp_path, monkeypatch):
+    """Two calls with the same (evidence, repo) in one process: the second is
+    served from the in-memory memo, not a second gh-axi round trip."""
+    _memo_env(tmp_path, monkeypatch)
+    calls = []
+    _stub_gh_axi(monkeypatch, calls)
+    assert td.classify_evidence("PR #424244", "/repo") == td.LANDED
+    assert td.classify_evidence("PR #424244", "/repo") == td.LANDED
+    assert len(calls) == 1
+
+
+def test_classify_evidence_memo_shared_across_processes(tmp_path, monkeypatch):
+    """A fresh process must be served by the disk memo, not re-ask gh-axi."""
+    import os
+    import subprocess
+    import sys
+    _memo_env(tmp_path, monkeypatch)
+    calls = []
+    _stub_gh_axi(monkeypatch, calls)
+    assert td.classify_evidence("PR #424245", "/repo") == td.LANDED
+    assert len(calls) == 1
+    td._save_memo()
+    code = (
+        "import sys; sys.path.insert(0, %r); import todos as td; "
+        "calls = []; "
+        "td._repo_slug = lambda repo: 'o/r'; "
+        "td._capture = lambda args: calls.append(args) or '  state: merged\\n'; "
+        "td._PR_CACHE = {}; "
+        "v = td.classify_evidence('PR #424245', '/repo'); "
+        "print(v, len(calls))"
+    ) % (str(Path(__file__).parent.parent / "bin"),)
+    env = dict(os.environ, JEEVES_STATE_DIR=str(tmp_path / "state"))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    verdict, n_calls = r.stdout.strip().split()
+    assert verdict == td.LANDED
+    assert n_calls == "0"
+
+
+def test_classify_evidence_stale_memo_entry_is_recomputed(tmp_path, monkeypatch):
+    """An entry older than the TTL is treated as absent and recomputed."""
+    import time
+    _memo_env(tmp_path, monkeypatch)
+    stale = {"/repo\x1fPR #424246": {"verdict": td.LANDED, "t": time.time() - 400}}
+    (jl.state_dir() / "evidence_memo.json").write_text(json.dumps(stale))
+    calls = []
+    _stub_gh_axi(monkeypatch, calls)
+    assert td.classify_evidence("PR #424246", "/repo") == td.LANDED
+    assert len(calls) == 1
+
+
+def test_classify_evidence_survives_malformed_memo_file(tmp_path, monkeypatch):
+    """Garbage in the memo file is not an error: fall back to computing fresh."""
+    _memo_env(tmp_path, monkeypatch)
+    (jl.state_dir() / "evidence_memo.json").write_text("{not json!!")
+    calls = []
+    _stub_gh_axi(monkeypatch, calls)
+    assert td.classify_evidence("PR #424247", "/repo") == td.LANDED
+    assert len(calls) == 1

@@ -182,3 +182,21 @@ def test_pull_lookup_targets_the_commit_and_repo_slug(tmp_path, monkeypatch):
     td.classify_evidence(f"commit {sha}", repo)
     assert calls, "no gh-axi call was made"
     assert calls[0] == ["gh-axi", "api", f"/repos/o/r/commits/{sha}/pulls"]
+
+
+def test_failed_pull_lookup_is_not_cached(monkeypatch):
+    """A dropped network call must not poison later lookups for the same
+    (slug, sha): None means "could not ask", not "no merged PR carries it",
+    so it is never memoized and the next call retries."""
+    calls = []
+
+    def fake_capture(args):
+        calls.append(args)
+        return "" if len(calls) == 1 else MERGED
+
+    monkeypatch.setattr(td, "_capture", fake_capture)
+    monkeypatch.setattr(td, "_PULLS_CACHE", {})
+    sha = "a" * 40
+    assert td._merged_pr_carries(sha, "o/r") is None
+    assert td._merged_pr_carries(sha, "o/r") is True
+    assert len(calls) == 2
