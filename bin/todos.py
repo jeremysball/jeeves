@@ -339,7 +339,9 @@ def classify_evidence(evidence: str, repo) -> str:
         elif kind == "issue":
             verdicts.append(_classify_issue(value, repo))
         else:
-            verdicts.append(LANDED if (Path(repo) / value).exists() else OUTSTANDING)
+            target = (Path(repo) / value).resolve()
+            in_repo = target.is_relative_to(Path(repo).resolve())
+            verdicts.append(LANDED if in_repo and target.exists() else OUTSTANDING)
     if not verdicts:
         return UNKNOWN
     if OUTSTANDING in verdicts:

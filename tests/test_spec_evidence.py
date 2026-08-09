@@ -7,6 +7,7 @@ pass.
 """
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -352,6 +353,22 @@ def test_file_evidence_is_whole_string_and_absorbs_trailing_refs(tmp_path):
 def test_missing_file_with_landed_commit_is_outstanding(tmp_path):
     repo, h = _git_repo(tmp_path)
     assert td.classify_evidence(f"file nope.txt, commit {h[:10]}", str(repo)) == td.OUTSTANDING
+
+
+def test_file_evidence_absolute_path_does_not_escape_repo(tmp_path):
+    # Path(repo) / value discards `repo` entirely when `value` is absolute
+    # (pathlib behavior), so `file /etc/passwd` used to resolve to a real
+    # host file and report LANDED regardless of the repo's own contents.
+    repo, _ = _git_repo(tmp_path)
+    assert Path("/etc/passwd").exists()  # the escape only matters if this is real
+    assert td.classify_evidence("file /etc/passwd", str(repo)) == td.OUTSTANDING
+
+
+def test_file_evidence_dotdot_traversal_does_not_escape_repo(tmp_path):
+    repo, _ = _git_repo(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+    assert td.classify_evidence(f"file ../{outside.name}", str(repo)) == td.OUTSTANDING
 
 
 # ---------------------------------------------------------------------------
