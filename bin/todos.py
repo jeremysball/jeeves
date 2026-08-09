@@ -370,11 +370,15 @@ _MEMO = None
 
 def _load_memo() -> dict:
     """The memo file is disposable: a missing, unreadable, or malformed file
-    just means starting from an empty cache, never a wrong answer."""
+    just means starting from an empty cache, never a wrong answer. "Malformed"
+    covers both invalid JSON and syntactically valid JSON of the wrong shape
+    (null, a list, a scalar) -- json.loads happily returns those without
+    raising, so the shape is checked explicitly rather than trusted."""
     try:
-        return json.loads((jl.state_dir() / _MEMO_PATH).read_text())
+        data = json.loads((jl.state_dir() / _MEMO_PATH).read_text())
     except (json.JSONDecodeError, OSError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _save_memo() -> None:
@@ -432,17 +436,33 @@ def _classify_evidence_uncached(evidence: str, repo) -> str:
 def classify_evidence(evidence: str, repo) -> str:
     """Memoized entry point: same verdict as _classify_evidence_uncached, with
     a short-TTL disk cache so consecutive processes over the same rows do not
-    redo each other's gh-axi round trips."""
+    redo each other's gh-axi round trips.
+
+    UNKNOWN is never cached, the same rule the inner caches (_PULLS_CACHE,
+    _PR_CACHE, _ISSUE_CACHE) already apply to a failed lookup: it means
+    "could not determine" rather than a real answer, and caching it would let
+    a transient gh-axi outage outlive itself for up to _MEMO_TTL seconds --
+    exactly the "run --prune-pending then --pending seconds apart" workflow
+    this memo exists to speed up would then see a stale UNKNOWN instead of a
+    retry. A malformed entry (missing "t"/"verdict", e.g. from schema drift)
+    is treated as a cache miss rather than trusted.
+    """
     global _MEMO
     if _MEMO is None:
         _MEMO = _load_memo()
         atexit.register(_save_memo)
     key = f"{repo}\x1f{evidence}"
     hit = _MEMO.get(key)
-    if hit is not None and time.time() - hit["t"] < _MEMO_TTL:
+    if (
+        isinstance(hit, dict)
+        and "t" in hit
+        and "verdict" in hit
+        and time.time() - hit["t"] < _MEMO_TTL
+    ):
         return hit["verdict"]
     verdict = _classify_evidence_uncached(evidence, repo)
-    _MEMO[key] = {"verdict": verdict, "t": time.time()}
+    if verdict != UNKNOWN:
+        _MEMO[key] = {"verdict": verdict, "t": time.time()}
     return verdict
 
 

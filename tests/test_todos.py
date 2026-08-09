@@ -572,3 +572,60 @@ def test_memo_second_pass_is_not_polluted_by_the_first(monkeypatch):
     monkeypatch.setattr(td, "_PR_CACHE", {})
     assert td.classify_evidence("PR #900001", "/repo") == td.OUTSTANDING
     assert calls, "served from a memo the first test populated, not this test's fake"
+
+
+# Round-2 review findings on the memo itself (fixed in this same PR, verified
+# by ferrying-code-review before merge): the disk memo unconditionally cached
+# UNKNOWN from a transient/undeterminable lookup, contradicting the inner
+# caches' own "never cache a failure" rule, and a valid-but-wrong-shape memo
+# file crashed classify_evidence instead of degrading to an empty cache.
+
+def test_memo_never_caches_unknown(tmp_path, monkeypatch):
+    """A transient failure (gh-axi unreachable) must not poison a later,
+    successful call within the same TTL window the way a real answer would."""
+    _memo_env(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(td, "_repo_slug", lambda repo: "o/r")
+
+    def fake_capture(args):
+        calls.append(args)
+        return "" if len(calls) == 1 else "  state: merged\n"
+
+    monkeypatch.setattr(td, "_capture", fake_capture)
+    monkeypatch.setattr(td, "_PR_CACHE", {})
+    assert td.classify_evidence("PR #900002", "/repo") == td.UNKNOWN
+    assert td.classify_evidence("PR #900002", "/repo") == td.LANDED
+    assert len(calls) == 2, "second call was served from the memo instead of retrying"
+
+
+def test_memo_survives_wrong_shape_json(tmp_path, monkeypatch):
+    """Syntactically valid JSON that is the wrong shape (not a dict of
+    entries) must degrade to an empty cache, not crash classify_evidence."""
+    _memo_env(tmp_path, monkeypatch)
+    (jl.state_dir() / "evidence_memo.json").write_text("null")
+    calls = []
+    _stub_gh_axi(monkeypatch, calls)
+    assert td.classify_evidence("PR #900003", "/repo") == td.LANDED
+    assert len(calls) == 1
+
+
+def test_memo_survives_a_list_instead_of_a_dict(tmp_path, monkeypatch):
+    _memo_env(tmp_path, monkeypatch)
+    (jl.state_dir() / "evidence_memo.json").write_text("[1, 2, 3]")
+    calls = []
+    _stub_gh_axi(monkeypatch, calls)
+    assert td.classify_evidence("PR #900004", "/repo") == td.LANDED
+    assert len(calls) == 1
+
+
+def test_memo_survives_an_entry_missing_required_keys(tmp_path, monkeypatch):
+    """A single malformed entry (e.g. schema drift, a hand edit) must not
+    crash the lookup for that key -- it degrades to a cache miss."""
+    _memo_env(tmp_path, monkeypatch)
+    (jl.state_dir() / "evidence_memo.json").write_text(
+        json.dumps({"/repo\x1fPR #900005": {"verdict": td.LANDED}})  # missing "t"
+    )
+    calls = []
+    _stub_gh_axi(monkeypatch, calls)
+    assert td.classify_evidence("PR #900005", "/repo") == td.LANDED
+    assert len(calls) == 1
