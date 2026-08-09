@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
@@ -44,6 +45,16 @@ def session_id_of(path: Path) -> str:
     return path.stem
 
 
+def _is_dead(path: Path, cfg: dict) -> bool:
+    """Has this transcript stopped growing? Held-back content is only worth
+    waiting on while the session might still add to it."""
+    try:
+        age_h = (time.time() - path.stat().st_mtime) / 3600
+    except OSError:
+        return True
+    return age_h >= cfg["carry_max_h"]
+
+
 def group_slices(slices, batch_under, batch_max):
     solo, small = [], defaultdict(list)
     for s in slices:
@@ -75,34 +86,58 @@ GH_SIGNAL_REASONS = {"review-requested", "mention", "team-mention", "comment",
                      "assign", "author"}
 
 
-def _github_repos() -> list:
-    """Distinct GitHub owner/name pairs behind the project dirs, in order."""
+def _parse_origin(url: str):
+    """owner/name from a git origin URL, or None if it isn't GitHub.
+
+    `git remote get-url` output keeps its trailing newline, and the old
+    `([^/.]+)` name class happily matched it — producing a repo id ending in
+    `\\n` that made every later API path fail with "invalid control character
+    in URL". Strip first, and let the name carry dots so `foo.bar` survives.
+    """
+    # rstrip the slash before matching: a `.../owner/name/` origin otherwise
+    # carries it into the name and 404s every path built from the id, which
+    # is the same silent-drop this function exists to fix.
+    m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", url.strip().rstrip("/"))
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
+_ORIGINS: dict = {}
+
+
+def _repo_origins() -> list:
+    """(local dir, owner/name) for each project dir with a GitHub origin.
+
+    Memoized per state dir: this shells out `git remote get-url` once per
+    project dir, and both callers (`gh_review` and `_flag_unverified_refs`)
+    want the same answer in the same run — 132 dirs meant 264 spawns a run
+    to compute one list twice."""
     dirs_file = jl.state_dir() / "project-dirs.txt"
+    if str(dirs_file) in _ORIGINS:
+        return _ORIGINS[str(dirs_file)]
     if not dirs_file.exists():
         return []
-    repos, seen = [], set()
+    out, seen = [], set()
     for d in dirs_file.read_text().splitlines():
         if not d.strip():
             continue
         try:
-            top = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
-                                 capture_output=True, text=True, timeout=10)
             url = subprocess.run(["git", "-C", d, "remote", "get-url", "origin"],
                                  capture_output=True, text=True, timeout=10)
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             continue
-        if top.returncode != 0 or url.returncode != 0:
+        if url.returncode != 0:
             continue
-        m = re.search(r"github\.com[:/]([^/]+)/([^/.]+)", url.stdout)
-        if not m:
-            continue
-        full = f"{m.group(1)}/{m.group(2)}"
-        if full not in seen:
+        full = _parse_origin(url.stdout)
+        if full and full not in seen:
             seen.add(full)
-            repos.append(full)
-        if len(repos) >= 12:
-            break
-    return repos
+            out.append((d, full))
+    _ORIGINS[str(dirs_file)] = out
+    return out
+
+
+def _github_repos() -> list:
+    """Distinct GitHub owner/name pairs behind the project dirs, in order."""
+    return [full for _, full in _repo_origins()][:12]
 
 
 def gh_review() -> str:
@@ -245,37 +280,118 @@ def synthesis_prompt(date, github_block, git_state_block) -> str:
 
 
 REF_RE = re.compile(r"#(\d+)\b")
+# The ferry attaches a repo to a ref two ways, and neither is a tidy bullet
+# prefix: `taskferry#417` glued together, or the repo named once in the line
+# ("taskferry PR #421 (3.2.0), #401, #407"). Both are handled; a line naming
+# no repo, or more than one, is left alone.
+ATTACHED_REF_RE = re.compile(r"([A-Za-z0-9._-]+)#(\d+)\b")
 
 
-def _valid_refs(*sources) -> set:
-    """Issue/PR numbers that genuinely appear in raw, unsynthesized source
-    data (the GitHub API feed, git log), for cross-checking the synthesis
-    ferry's claims against ground truth."""
-    refs = set()
-    for s in sources:
-        refs.update(REF_RE.findall(s or ""))
-    return refs
+def _repo_index() -> dict:
+    """Short name -> owner/name, for resolving a digest bullet's repo prefix.
+
+    Bullets are written `- taskferry: ...`, so index both the GitHub name and
+    the directory basename: the ferry uses whichever the user says out loud,
+    and those differ (`token-burn` for
+    `token-burn-dashboard-model-faceoff`)."""
+    idx = {}
+    for d, full in _repo_origins():
+        for key in (full.split("/")[-1], Path(d).name):
+            idx.setdefault(key.lower(), full)
+    return idx
 
 
-def _flag_unverified_refs(text: str, valid: set) -> tuple:
-    """Mark any #NNN citation the synthesis ferry wrote that doesn't appear
-    in the raw feed it was given — rather than trusting it silently. The
-    ferry once invented a PR #238 / author "anakette" wholesale (2026-07-30
-    digest); a plausible-looking wrong number is worse than a flagged one."""
-    flagged = []
-
-    def repl(m):
-        num = m.group(1)
-        if num not in valid:
-            flagged.append(num)
-            return f"#{num} [UNVERIFIED — not in raw GitHub/git feed, confirm before trusting]"
-        return m.group(0)
-
-    return REF_RE.sub(repl, text), flagged
+_CEILINGS: dict = {}
 
 
-def _mutation_refs_valid(mut: dict, valid: set) -> bool:
-    return all(n in valid for n in REF_RE.findall(json.dumps(mut)))
+def _ref_ceiling(full: str):
+    """Highest issue/PR number in a repo, or None if it can't be read.
+
+    GitHub numbers issues and pull requests from one sequence, so a single
+    ceiling bounds both. This catches a number invented out of range; it does
+    NOT catch a real number attached to an invented claim (the 2026-07-30
+    "PR #238 by anakette" failure was that second kind, and no existence check
+    would have caught it — only verify_evidence's per-ref lookup does). Gaps
+    below the ceiling from transferred or deleted issues stay unflagged on
+    purpose: a false accusation on a real ref costs more than a missed one."""
+    if full not in _CEILINGS:
+        got = None
+        # Retry once: caching the None from a transient `gh` failure would
+        # silently abstain on that repo for the rest of the run.
+        for _ in range(2):
+            got = _gh_json(["api", f"repos/{full}/issues?state=all&per_page=1"])
+            if got is not None:
+                break
+        _CEILINGS[full] = (got[0].get("number")
+                           if isinstance(got, list) and got else None)
+    return _CEILINGS[full]
+
+
+def _add_is_disproved(mut: dict) -> bool:
+    """Does an `add` mutation cite a ref its own repo cannot have?
+
+    `check` ops get a real per-ref lookup from todos.verify_evidence, but
+    `add` ops carry no evidence field to verify — they'd otherwise reach the
+    ledger with no ref check at all, so a fabricated number becomes a real
+    obligation. Same disproof standard as the digest: only an out-of-range
+    ref in a resolvable repo counts."""
+    repo = mut.get("repo")
+    if mut.get("op") != "add" or not repo:
+        return False
+    full = next((f for d, f in _repo_origins() if d == str(repo)), None)
+    if not full:
+        return False
+    ceiling = _ref_ceiling(full)
+    if ceiling is None:
+        return False
+    return any(int(n) > ceiling for n in REF_RE.findall(mut.get("line") or ""))
+
+
+def _flag_unverified_refs(text: str) -> tuple:
+    """Mark a #NNN citation only when its repo is known AND the host proves
+    the number cannot exist.
+
+    The previous gate allowlisted refs appearing in the live GitHub feed
+    (open PRs only) and a one-day git scan, so every *merged* PR — precisely
+    the ones a Shipped bullet cites — got flagged. Twenty-odd false positives
+    per digest, injected inside backticked evidence tags. Unknown now means
+    unremarked, not guilty."""
+    idx = _repo_index()
+    flagged, out = [], []
+
+    def mark(num):
+        flagged.append(num)
+        return f"#{num} [UNVERIFIED — no such issue or PR in this repo]"
+
+    def over_ceiling(full, num):
+        c = _ref_ceiling(full)
+        return c is not None and int(num) > c
+
+    for line in text.splitlines(keepends=True):
+        # `\b` sits between a word char and a hyphen, so a `\bcatbow\b` key
+        # matches inside `catbow-tools` and would judge that sibling's refs
+        # against the wrong repo's numbering. Require a non-name character
+        # on both sides instead.
+        named = {idx[k] for k in idx
+                 if re.search(rf"(?<![\w-]){re.escape(k)}(?![\w-])", line, re.I)}
+        # Bare refs only resolve when the line points at exactly one repo.
+        # Guessing between two would risk judging a ref against the wrong
+        # numbering — the same false-accusation failure this rewrite exists
+        # to end.
+        sole = next(iter(named)) if len(named) == 1 else None
+
+        def repl(mm):
+            whole, name = mm.group(0), mm.group(1)
+            num = mm.group(2) if name is not None else mm.group(3)
+            if name is not None:  # `taskferry#417`
+                full = idx.get(name.lower())
+                return f"{name}{mark(num)}" if full and over_ceiling(full, num) else whole
+            if sole and over_ceiling(sole, num):
+                return mark(num)
+            return whole
+
+        out.append(re.sub(rf"{ATTACHED_REF_RE.pattern}|{REF_RE.pattern}", repl, line))
+    return "".join(out), flagged
 
 
 def collect_cwds(lines) -> set:
@@ -312,9 +428,14 @@ def run_once() -> dict:
         if new_off == off and not entries:
             continue
         counts["sessions"] += 1
-        if len(entries) < cfg["trivial_min"]:
+        # A sub-threshold slice used to advance the offset, which discarded
+        # the content outright — a session dribbling out three prose entries
+        # an hour was never summarized at all. Hold the offset instead so the
+        # lines accumulate until they're worth a dispatch. Once the session
+        # stops growing there is nothing left to wait for, so extract the
+        # little there is rather than sitting on it forever.
+        if len(entries) < cfg["trivial_min"] and not _is_dead(path, cfg):
             counts["skipped"] += 1
-            pending_offsets[key] = {"offset": new_off, "size": path.stat().st_size}
             continue
         slices.append({"path": key, "dir": str(path.parent), "slug": path.parent.name,
                        "sid": session_id_of(path), "new_off": new_off,
@@ -340,7 +461,18 @@ def run_once() -> dict:
                 and group[0]["sid"] not in by_session:
             by_session[group[0]["sid"]] = {**payload[0], "session": group[0]["sid"]}
         for s in group:
-            item = by_session.get(s["sid"], {"session": s["sid"], "note": "no block for session"})
+            item = by_session.get(s["sid"])
+            if item is None:
+                # The ferry read the batch but said nothing about this
+                # session. Advancing anyway wrote a "no block" stub over
+                # content nobody ever looked at; hold for a retry instead,
+                # unless the session is done growing and never will produce
+                # more than what a stub records.
+                if not _is_dead(Path(s["path"]), cfg):
+                    counts["failed"] += 1
+                    jl.log(f"no block returned for {s['sid']}; offset held for retry")
+                    continue
+                item = {"session": s["sid"], "note": "no block for session"}
             n = len(list((jl.state_dir() / "summaries" / date).glob(f"*--{s['sid']}--*.md"))) + 1
             write_summary(date, s["slug"], s["sid"], n, item)
             pending_offsets[s["path"]] = {"offset": s["new_off"],
@@ -359,7 +491,6 @@ def run_once() -> dict:
         td.reconcile()
         github_block = gh_review()
         git_state_block = git_state()
-        valid_refs = _valid_refs(github_block, git_state_block)
         res = jl.ferry(synthesis_prompt(date, github_block, git_state_block),
                         cfg["model"], wait_s=600)
         if not res["ok"]:
@@ -380,19 +511,24 @@ def run_once() -> dict:
             if digest_md is None or not isinstance(muts, list):
                 jl.log("synthesis output malformed; digest not refreshed")
             else:
-                digest_md, flagged = _flag_unverified_refs(digest_md, valid_refs)
+                digest_md, flagged = _flag_unverified_refs(digest_md)
                 if flagged:
                     jl.log(f"digest: flagged unverified refs {sorted(set(flagged))}")
-                safe_muts, dropped = [], []
-                for mut in muts:
-                    (safe_muts if _mutation_refs_valid(mut, valid_refs)
-                     else dropped).append(mut)
-                if dropped:
-                    jl.log(f"todo mutations skipped — unverified refs: {dropped}")
                 d = jl.state_dir() / "digests"
                 d.mkdir(parents=True, exist_ok=True)
                 (d / f"{date}.md").write_text(digest_md)
-                applied = td.apply_mutations(safe_muts)
+                # Mutations are no longer pre-filtered on ref strings. The
+                # old filter dropped every `check` citing a merged PR — the
+                # only kind that ever closes a todo — so the ledger could
+                # only grow. todos.verify_evidence gates each check with a
+                # real per-ref lookup; `add` has no evidence field to check,
+                # so it gets the same disproof test the digest uses.
+                keep, disproved = [], []
+                for mut in muts:
+                    (disproved if _add_is_disproved(mut) else keep).append(mut)
+                if disproved:
+                    jl.log(f"todo adds dropped — ref cannot exist: {disproved}")
+                applied = td.apply_mutations(keep)
                 counts["digest"] = 1
                 jl.log(f"digest written; mutations: {applied}")
     return counts

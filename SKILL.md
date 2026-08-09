@@ -137,6 +137,12 @@ abandoned). Spot-check each pending todo's evidence ref against current
 "Doctor issue body still pre-draft" todo pointing at a now-closed #249
 is dead evidence, not a real pending item.
 
+Rows queued before 2026-08-09 deserve extra suspicion: until then
+`verify_evidence` ran `gh-axi pr view -R <local path>`, which returns
+NOT_FOUND for every PR that exists, so *no* PR-backed check could pass.
+A pre-2026-08-09 pending row citing a PR is far more likely that bug
+than a real unverified claim — resolve it against the PR itself.
+
 The cron also persists a cross-repo git-state snapshot at
 `~/.local/state/jeeves/git-state.md` (a read-only `scan-active.sh` rollup:
 per-repo branches with push/merge classification, dirty trees, recent
@@ -186,14 +192,18 @@ single-project briefing including session recall.
   is in `origin/main`. Trust the snapshot's classification: `potentially
   outstanding` means not proven merged, never "active work".
 - Treating the digest as ground truth — it isn't. The synthesis model
-  abbreviates, hedges with `[UNVERIFIED]`, and drops detail on purpose.
-  Git log per active repo is the actual record; the digest is a
+  abbreviates and drops detail on purpose. Git log per active repo is
+  the actual record; the digest is a
   cross-check. When cron is broken (silent failure mode seen 2026-08-01:
   argv-overflow + fence-omission parser, both unnoticed for ~2 days),
   the digest goes stale and the card will be thin even when real work
   landed. Detect cron health: `tail ~/.local/state/jeeves/collect.log`
   for "synthesis failed" / "extraction output unparseable" / "digest not
   refreshed" patterns. If present, lead with the failure and go to git.
+- Reading an `[UNVERIFIED]` tag as a hedge — it is a disproof. It means
+  the repo's issue/PR numbering does not reach that number, so the ref
+  cannot exist. The absence of a tag is not confirmation: a line naming
+  no known repo, or two, is left unadjudicated rather than guessed at.
 - Listing pending todos without checking their evidence refs — a todo
   queued before its evidence went stale (issue closed, branch merged,
   PR landed) is dead weight, not a real loose end. Spot-check before
