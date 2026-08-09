@@ -22,6 +22,9 @@ CONFIG_DEFAULTS = {
     # route after 1-2 attempts and switch routes.
     "fallback_model": "minimax/MiniMax-M3",
     "trivial_min": 4,
+    # Hours a transcript may sit untouched before jeeves stops waiting
+    # for it to grow and extracts whatever it already holds.
+    "carry_max_h": 24,
     "batch_max": 4,
     "batch_under": 10,
     "truncate": 800,

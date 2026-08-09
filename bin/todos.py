@@ -106,15 +106,21 @@ def apply_dismiss(query: str) -> str:
     return dismissed
 
 
-HEX_RE = re.compile(r"^commit ([0-9a-f]{7,40})$", re.I)
-PR_RE = re.compile(r"^PR #(\d+)$", re.I)
+# Trailing prose is the norm, not the exception: the synthesis ferry writes
+# "commit 3c33869 reset" and "PR #419 merged", never a bare ref. Anchoring
+# these on $ meant every real PR check fell through to False and queued in
+# pending.json forever.
+HEX_RE = re.compile(r"^commit ([0-9a-f]{7,40})\b", re.I)
+PR_RE = re.compile(r"^PR #(\d+)\b", re.I)
+ISSUE_RE = re.compile(r"^issue #(\d+)\b", re.I)
 FILE_RE = re.compile(r"^file (.+)$", re.I)
 
 
-def _runs(args) -> int:
+def _runs(args, cwd=None) -> int:
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=15).returncode
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return subprocess.run(args, capture_output=True, text=True,
+                              timeout=15, cwd=cwd).returncode
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, NotADirectoryError):
         return 1
 
 
@@ -124,11 +130,15 @@ def verify_evidence(evidence: str, repo) -> bool:
         if not repo:
             return False
         return _runs(["git", "-C", str(repo), "cat-file", "-e", f"{m.group(1)}^{{commit}}"]) == 0
-    m = PR_RE.match(evidence)
-    if m:
-        if not repo:
-            return False
-        return _runs(["gh-axi", "pr", "view", m.group(1), "-R", str(repo)]) == 0
+    for pattern, kind in ((PR_RE, "pr"), (ISSUE_RE, "issue")):
+        m = pattern.match(evidence)
+        if m:
+            if not repo:
+                return False
+            # Run inside the repo rather than passing -R: that flag takes
+            # OWNER/REPO, so handing it a local path returns NOT_FOUND for
+            # every PR that exists.
+            return _runs(["gh-axi", kind, "view", m.group(1)], cwd=str(repo)) == 0
     m = FILE_RE.match(evidence)
     if m:
         if not repo:

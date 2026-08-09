@@ -226,3 +226,39 @@ def test_ingest_content_hash_gates_reingest(tmp_path, monkeypatch):
     res = td.ingest_repo_todos([str(repo)])
     assert res["ingested"] == 1  # only the new item
     assert (tmp_path / "todo.md").read_text().count("one thing") == 1
+
+
+def test_verify_commit_accepts_trailing_prose(tmp_path):
+    repo, h = _git_repo(tmp_path)
+    # the synthesis ferry writes "commit 3c33869 reset", never a bare ref
+    assert td.verify_evidence(f"commit {h[:10]} reset", str(repo)) is True
+
+
+def test_verify_pr_accepts_trailing_prose_and_runs_in_repo(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_runs(args, cwd=None):
+        seen["args"], seen["cwd"] = args, cwd
+        return 0
+
+    monkeypatch.setattr(td, "_runs", fake_runs)
+    assert td.verify_evidence("PR #419 merged", "/repo/path") is True
+    assert seen["args"] == ["gh-axi", "pr", "view", "419"]
+    assert seen["cwd"] == "/repo/path"  # -R takes OWNER/REPO, not a path
+
+
+def test_verify_issue_kind_supported(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_runs(args, cwd=None):
+        seen["args"] = args
+        return 0
+
+    monkeypatch.setattr(td, "_runs", fake_runs)
+    assert td.verify_evidence("issue #391 filed", "/repo/path") is True
+    assert seen["args"] == ["gh-axi", "issue", "view", "391"]
+
+
+def test_verify_pr_missing_is_false(tmp_path, monkeypatch):
+    monkeypatch.setattr(td, "_runs", lambda args, cwd=None: 1)
+    assert td.verify_evidence("PR #99999", "/repo/path") is False
