@@ -100,12 +100,14 @@ git-state snapshot, render:
   short SHA + conventional-commit subject.
 - **Prove merged before calling anything shipped.** Never infer merge
   state from a commit appearing in `git log --all`, from a PR number
-  existing, or from a confident-sounding subject line. Run
-  `git merge-base --is-ancestor <sha> origin/main` per commit and read
-  `state:` from `gh-axi pr view <n>` per PR — or call
-  `todos.py`'s `classify_evidence`, which does exactly this and returns
-  `landed` / `outstanding` / `unknown`. Anything not proven `landed`
-  belongs under **Unmerged work**, never under **Shipped**.
+  existing, or from a confident-sounding subject line. Ancestry is not
+  proof either: a squash or rebase merge rewrites the branch into a new
+  commit, so `git merge-base --is-ancestor` reports shipped work as
+  unmerged, and this repo squash-merges its own PRs. Call `todos.py`'s
+  `classify_evidence`, which tries ancestry first and then asks GitHub
+  which pull requests carry the commit, returning `landed` /
+  `outstanding` / `unknown`. Anything not proven `landed` belongs under
+  **Unmerged work**, never under **Shipped**.
 - **Label every item's state inline**, so the two are never
   ambiguous at a glance: `#413 merged` vs `b8f57f0 unmerged
   (feat/ro-rw-dirs, PR #401 open)`. A bare SHA next to a bare PR number
@@ -154,6 +156,11 @@ drops the ones whose ledger line has since been checked or dismissed
 still outstanding. `todos.py --pending` then annotates each survivor
 with a `state` field, so a row pointing at a merged PR is visibly
 distinct from one pointing at an unmerged branch commit.
+
+Both commands reach the network. Classifying a commit that is not an
+ancestor of the base branch costs one GitHub lookup, memoized per repo
+and sha for the run, so a queue of rows citing the same commit pays for
+it once. A lookup that fails reports `unknown`, never `outstanding`.
 
 Only rows that survive the prune belong on the card, and each should
 carry its state. A row whose evidence reads `unknown` is not the same

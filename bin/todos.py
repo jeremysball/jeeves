@@ -27,7 +27,7 @@ def ledger_path() -> Path:
 
 
 def parse_ledger(text: str) -> dict:
-    sections: dict[str, list[str]] = {s: [] for s in SECTIONS}
+    sections = {s: [] for s in SECTIONS}
     current = None
     for line in text.splitlines():
         if line.startswith("## "):
@@ -106,20 +106,31 @@ def apply_dismiss(query: str) -> str:
     return dismissed
 
 
+# Trailing prose is the norm, not the exception: the synthesis ferry writes
+# "commit 3c33869 reset" and "PR #419 merged", never a bare ref. Anchoring
+# these on $ meant every real PR check fell through to False and queued in
+# pending.json forever.
+HEX_RE = re.compile(r"^commit ([0-9a-f]{7,40})\b", re.I)
+PR_RE = re.compile(r"^PR #(\d+)\b", re.I)
+ISSUE_RE = re.compile(r"^issue #(\d+)\b", re.I)
 FILE_RE = re.compile(r"^file (.+)$", re.I)
 
-# The old anchored single-ref forms (`^commit <sha>$`, `^PR #N$`) read every
-# multi-ref evidence string as unparseable -- the extraction ferry routinely
-# emits several refs in one string instead:
+# The single-ref anchored forms above are what the extraction ferry is *asked*
+# to emit, but it routinely emits several refs in one string instead:
 #   "commit 062563c, commit e0056ed"
 #   "commit dcfcab4 + 01442dd (PR #114, PR #115)"
 #   "commit e0056ed (#364), 062563c (#360)"
+# Anchored single-ref matching read every one of those as unparseable, so real
+# and fully verifiable evidence demoted to pending and stayed there forever.
 # These scan for every ref in the string instead of demanding exactly one.
-# `issue #N` is matched and carved out first so PR_SCAN_RE's bare `#N` doesn't
-# also claim the same digits as a pr candidate.
 SHA_SCAN_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.I)
-ISSUE_SCAN_RE = re.compile(r"\bissue\s*#(\d+)\b", re.I)
 PR_SCAN_RE = re.compile(r"#(\d+)\b")
+# `issue #391` is a real evidence shape the synthesis ferry emits. Scanned
+# separately because `gh-axi pr view` fails on an issue number, so classifying
+# every `#N` as a pr would leave issue-backed evidence permanently unknown.
+# `\s*` (not `\s+`): the ferry also glues the form as `issue#391`, and a space
+# requirement misclassifies that as a pr and strands it in pending forever.
+ISSUE_SCAN_RE = re.compile(r"\bissues?\s*#(\d+)\b", re.I)
 
 
 def _extract_refs(evidence: str) -> list:
@@ -136,19 +147,25 @@ def _extract_refs(evidence: str) -> list:
     ones that resolve to no object, so a false positive costs a cheap cat-file
     and nothing else.
     """
+    # A ferry mutation can carry `evidence: null` (JSON-null survives parsing as
+    # a present-but-None value) or a non-string. `.strip()` would crash on those,
+    # so treat anything that isn't a string as having no refs -> UNKNOWN, rather
+    # than letting a single bad evidence field crash the whole run.
+    if not isinstance(evidence, str):
+        return []
     m = FILE_RE.match(evidence.strip())
     if m:
         return [("file", m.group(1).strip())]
-    issue_hits = [(m.start(), m.end(), m.group(1)) for m in ISSUE_SCAN_RE.finditer(evidence)]
-    issue_spans = [(s, e) for s, e, _ in issue_hits]
     # Sorted by match position, not concatenated per kind: "in order" is what
     # the contract promises, and scanning each pattern separately grouped every
     # commit ahead of every pr, so "e0056ed (#364), 062563c (#360)" came back
     # with both prs trailing both commits and lost which pr went with which.
+    issues = [(m.start(1), "issue", m.group(1)) for m in ISSUE_SCAN_RE.finditer(evidence)]
+    taken = {pos for pos, _, _ in issues}
     hits = ([(m.start(), "commit", m.group(1)) for m in SHA_SCAN_RE.finditer(evidence)]
-            + [(m.start(), "pr", m.group(1)) for m in PR_SCAN_RE.finditer(evidence)
-               if not any(s <= m.start() < e for s, e in issue_spans)]
-            + [(s, "issue", v) for s, e, v in issue_hits])
+            + [(m.start(1), "pr", m.group(1)) for m in PR_SCAN_RE.finditer(evidence)
+               if m.start(1) not in taken]
+            + issues)
     return [(kind, value) for _, kind, value in sorted(hits, key=lambda h: h[0])]
 
 
@@ -160,11 +177,11 @@ def _runs(args, cwd=None) -> int:
         return 1
 
 
-def _capture(args, cwd=None) -> str:
+def _capture(args) -> str:
     """stdout of a successful run, or "" on any failure. Never raises."""
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=15, cwd=cwd)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, NotADirectoryError):
+        p = subprocess.run(args, capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return ""
     return p.stdout if p.returncode == 0 else ""
 
@@ -180,7 +197,7 @@ UNKNOWN = "unknown"      # could not determine; never treated as landed
 
 def _default_branch(repo) -> str:
     """The base branch to measure "merged" against. origin/HEAD when set,
-    else the first of main/master that resolves. Empty when neither does --
+    else the first of main/master that resolves. Empty when neither does —
     callers must degrade to UNKNOWN rather than guess a base."""
     head = _capture(["git", "-C", str(repo), "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).strip()
     if head:
@@ -191,47 +208,109 @@ def _default_branch(repo) -> str:
     return ""
 
 
+def _repo_slug(repo) -> str:
+    """owner/repo for gh-axi's -R flag, read from origin's URL. gh-axi rejects
+    a filesystem path there (exit 1), which an earlier version of this function
+    passed -- so every PR-evidenced check failed and demoted to pending forever."""
+    # The synthesis ferry is asked for a local path but sometimes writes
+    # `owner/repo` instead. That is already the shape -R wants, so take it
+    # rather than failing a ref that is perfectly verifiable.
+    if not Path(repo).is_dir() and re.fullmatch(r"[\w.-]+/[\w.-]+", str(repo)):
+        return str(repo)
+    url = _capture(["git", "-C", str(repo), "remote", "get-url", "origin"]).strip()
+    if not url:
+        return ""
+    return jl.parse_github_slug(url) or ""
+
+
+# Answers per (slug, sha) for the run. prune_pending classifies every queued row
+# and --pending classifies them all again for listing, so without this a queue of
+# N rows spends N network round trips rediscovering one unchanging fact.
+_PULLS_CACHE = {}
+
+
+def _merged_pr_carries(sha: str, slug: str):
+    """True when a merged PR carries this commit, False when none does, None
+    when GitHub could not be asked at all.
+
+    The three-way return matters: "no merged PR carries it" and "the lookup
+    failed" are different answers, and collapsing them would report live work
+    on the strength of a dropped network call.
+    """
+    key = (slug, sha)
+    if key not in _PULLS_CACHE:
+        out = _capture(["gh-axi", "api", f"/repos/{slug}/commits/{sha}/pulls"])
+        # gh-axi exits nonzero on a sha GitHub does not know, so _capture returns
+        # "" for a failed lookup and "[]" for a real answer of "no pulls".
+        if not out:
+            _PULLS_CACHE[key] = None
+        else:
+            # In gh-axi's TOON output a merged pull carries a quoted timestamp
+            # and an open one carries a bare `null`, so the quote is the
+            # discriminator, not the presence of the key.
+            _PULLS_CACHE[key] = bool(re.search(r'^\s*merged_at:\s*"', out, re.M))
+    return _PULLS_CACHE[key]
+
+
 def _classify_commit(sha: str, repo) -> str:
+    """LANDED once the work is in the base branch, however it got there.
+
+    Ancestry alone cannot answer this. A squash or rebase merge rewrites the
+    branch into a new commit, so the sha the ferry cited as evidence stays
+    reachable from nothing and `merge-base --is-ancestor` reports it unmerged
+    for work that shipped -- and this repo squash-merges its own PRs, so that is
+    the ordinary case. Patch-id matching (`git cherry`) does not rescue it
+    either: a squash of several commits into one matches no single patch-id,
+    confirmed against jeeves PR #1, whose four commits all came back unmatched.
+
+    So ancestry runs first because it is free and offline, and GitHub is asked
+    only when it misses.
+    """
     if _runs(["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"]) != 0:
         return UNKNOWN
     base = _default_branch(repo)
     if not base:
         return UNKNOWN
-    return LANDED if _runs(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, base]) == 0 else OUTSTANDING
-
-
-def _classify_gh_ref(kind: str, num: str, repo, landed_state: str) -> str:
-    """LANDED when gh-axi reports `landed_state` ("merged" for a pr, "closed"
-    for an issue -- closing is the closest proxy an issue offers for "the work
-    behind this is done"), OUTSTANDING for any other real state, UNKNOWN when
-    the ref can't be resolved at all.
-
-    Runs inside the repo rather than passing -R when repo is a real directory:
-    that flag takes OWNER/REPO, so handing it a local path returns NOT_FOUND
-    for every ref that exists. The ferry is asked for a local path but
-    sometimes writes `owner/repo`; that shape is exactly what -R wants, so
-    take it either way rather than failing a verifiable ref."""
-    if Path(repo).is_dir():
-        out = _capture(["gh-axi", kind, "view", num], cwd=str(repo))
-    elif re.fullmatch(r"[\w.-]+/[\w.-]+", str(repo)):
-        out = _capture(["gh-axi", kind, "view", num, "-R", str(repo)])
-    else:
+    if _runs(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, base]) == 0:
+        return LANDED
+    slug = _repo_slug(repo)
+    if not slug:
+        # No GitHub remote to ask, so ancestry was the whole of the available
+        # truth and it said no.
+        return OUTSTANDING
+    carried = _merged_pr_carries(sha, slug)
+    if carried is None:
         return UNKNOWN
+    return LANDED if carried else OUTSTANDING
+
+
+def _classify_pr(num: str, repo) -> str:
+    slug = _repo_slug(repo)
+    if not slug:
+        return UNKNOWN
+    out = _capture(["gh-axi", "pr", "view", num, "-R", slug])
     if not out:
         return UNKNOWN
     # gh-axi prints a YAML-ish block; the state line is `  state: merged`.
     m = re.search(r"^\s*state:\s*\"?(\w+)", out, re.M)
     if not m:
         return UNKNOWN
-    return LANDED if m.group(1).lower() == landed_state else OUTSTANDING
-
-
-def _classify_pr(num: str, repo) -> str:
-    return _classify_gh_ref("pr", num, repo, "merged")
+    return LANDED if m.group(1).lower() == "merged" else OUTSTANDING
 
 
 def _classify_issue(num: str, repo) -> str:
-    return _classify_gh_ref("issue", num, repo, "closed")
+    """An issue is landed when it is closed. `state: closed` covers both
+    completed and not-planned; the ledger only needs "no longer open"."""
+    slug = _repo_slug(repo)
+    if not slug:
+        return UNKNOWN
+    out = _capture(["gh-axi", "issue", "view", num, "-R", slug])
+    if not out:
+        return UNKNOWN
+    m = re.search(r"^\s*state:\s*\"?(\w+)", out, re.M)
+    if not m:
+        return UNKNOWN
+    return LANDED if m.group(1).lower() == "closed" else OUTSTANDING
 
 
 def classify_evidence(evidence: str, repo) -> str:
@@ -246,17 +325,8 @@ def classify_evidence(evidence: str, repo) -> str:
     change being merged is not the change being merged. A single OUTSTANDING ref
     dominates, since that is the part still needing action; UNKNOWN otherwise.
     """
-    # Guard before _extract_refs, not after: a ferry mutation with an explicit
-    # "evidence": null survives JSON parsing as a present-but-None value, and
-    # `mut.get("evidence", "")` (the default-arg form used at every call site)
-    # does not catch that -- the default only fires when the key is absent.
-    # _extract_refs then calls evidence.strip() and raises AttributeError,
-    # crashing the whole --pending/--prune-pending invocation over one
-    # malformed row instead of demoting it.
-    if not evidence or not repo:
-        return UNKNOWN
     refs = _extract_refs(evidence)
-    if not refs:
+    if not refs or not repo:
         return UNKNOWN
     verdicts = []
     for kind, value in refs:
@@ -408,19 +478,7 @@ def prune_pending() -> dict:
         if open_hit is None:
             # Distinguish "resolved since" from "never existed" so a genuinely
             # lost line is visible rather than silently swallowed as handled.
-            done_hit = _match(sections, line, "done")
-            dismissed_hit = _match(sections, line, "dismissed")
-            if done_hit is AMBIGUOUS or dismissed_hit is AMBIGUOUS:
-                # A duplicate in done/dismissed is just as ambiguous as one in
-                # open -- `known = a or b` treated this sentinel as truthy and
-                # dropped the row as "moot", which is exactly the silent drop
-                # the open-branch AMBIGUOUS case above exists to prevent. Keep
-                # it here too.
-                kept.append(row)
-                counts["kept"] += 1
-                jl.log(f"prune-pending: kept (ambiguous ledger match): {line}")
-                continue
-            known = done_hit or dismissed_hit
+            known = _match(sections, line, "done") or _match(sections, line, "dismissed")
             counts["moot" if known else "stale"] += 1
             jl.log(f"prune-pending: dropped ({'moot' if known else 'stale'}): {line}")
             continue
@@ -439,6 +497,7 @@ def prune_pending() -> dict:
             counts["kept"] += 1
     seen.save()
     save_pending(kept)
+    jl.log(f"prune-pending: {counts}")
     return counts
 
 
@@ -497,7 +556,7 @@ def _open_items(text: str) -> list:
     """Parse a loose checklist file into open items, joining wrapped
     continuation lines onto whichever item they physically follow — a
     continuation of a `[x]` (done) item is not a separate open item."""
-    items: list[str] = []
+    items = []
     cur_text = None
     cur_checked = None
 

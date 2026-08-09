@@ -173,6 +173,27 @@ def line_hash(s: str) -> str:
     return hashlib.sha256(normalize(s).encode("utf-8")).hexdigest()
 
 
+def parse_github_slug(url: str):
+    """owner/name from a git origin URL, or None if it isn't GitHub.
+
+    Requiring the host is what makes this safe to build an API path from. A
+    tail-anchored `owner/repo` match alone accepts anything URL-shaped, so a
+    filesystem origin such as `/tmp/x/origin.git` yields `x/origin` -- a
+    plausible-looking slug naming a repo that does not exist, or worse, one
+    that does and belongs to somebody else.
+
+    `git remote get-url` output keeps its trailing newline, and the old
+    `([^/.]+)` name class happily matched it -- producing a repo id ending in
+    `\\n` that made every later API path fail with "invalid control character
+    in URL". Strip first, and let the name carry dots so `foo.bar` survives.
+    """
+    # rstrip the slash before matching: a `.../owner/name/` origin otherwise
+    # carries it into the name and 404s every path built from the id, which
+    # is the same silent-drop this function exists to fix.
+    m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", url.strip().rstrip("/"))
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
 class SeenStore:
     def __init__(self, path: Path):
         self.path = path
