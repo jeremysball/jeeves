@@ -153,7 +153,18 @@ PROVENANCE_RE = re.compile(r"\s*\(jeeves:[^)]*\)\s*$|\s*\(dismissed[^)]*\)\s*$")
 
 
 def normalize(s: str) -> str:
-    s = PROVENANCE_RE.sub("", s)
+    # Strip provenance repeatedly, not once: suffixes stack, as in
+    # "... (jeeves: loose-end, x, 2026-08-09) (dismissed 2026-08-09)". Both
+    # alternatives in PROVENANCE_RE are $-anchored and re.sub makes a single
+    # left-to-right pass, so one sub() removed only the outermost group and
+    # left the inner one attached -- which meant a dismissed ledger line never
+    # compared equal to the same line quoted without its tags, and --dismiss
+    # reported "no open ledger line matches" for a line plainly in the file.
+    while True:
+        stripped = PROVENANCE_RE.sub("", s)
+        if stripped == s:
+            break
+        s = stripped
     s = s.lstrip("- [x] ").lstrip("- [ ] ").strip()
     s = re.sub(r"\s+", " ", s)
     return unicodedata_normalize("NFKC", s).casefold()

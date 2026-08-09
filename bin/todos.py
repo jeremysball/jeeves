@@ -106,14 +106,50 @@ def apply_dismiss(query: str) -> str:
     return dismissed
 
 
-# Trailing prose is the norm, not the exception: the synthesis ferry writes
-# "commit 3c33869 reset" and "PR #419 merged", never a bare ref. Anchoring
-# these on $ meant every real PR check fell through to False and queued in
-# pending.json forever.
-HEX_RE = re.compile(r"^commit ([0-9a-f]{7,40})\b", re.I)
-PR_RE = re.compile(r"^PR #(\d+)\b", re.I)
-ISSUE_RE = re.compile(r"^issue #(\d+)\b", re.I)
 FILE_RE = re.compile(r"^file (.+)$", re.I)
+
+# The old anchored single-ref forms (`^commit <sha>$`, `^PR #N$`) read every
+# multi-ref evidence string as unparseable -- the extraction ferry routinely
+# emits several refs in one string instead:
+#   "commit 062563c, commit e0056ed"
+#   "commit dcfcab4 + 01442dd (PR #114, PR #115)"
+#   "commit e0056ed (#364), 062563c (#360)"
+# These scan for every ref in the string instead of demanding exactly one.
+# `issue #N` is matched and carved out first so PR_SCAN_RE's bare `#N` doesn't
+# also claim the same digits as a pr candidate.
+SHA_SCAN_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.I)
+ISSUE_SCAN_RE = re.compile(r"\bissue\s*#(\d+)\b", re.I)
+PR_SCAN_RE = re.compile(r"#(\d+)\b")
+
+
+def _extract_refs(evidence: str) -> list:
+    """Every (kind, value) *candidate* ref in an evidence string, in order.
+
+    A `file <path>` evidence is treated as whole-string, since a path has no
+    reliable token boundary to scan for.
+
+    Hex tokens are candidates only -- `[0-9a-f]{7,40}` also matches any 7+ digit
+    number and hex-lettered words like "defaced", and evidence does not reliably
+    say the word "commit" next to its shas. Rather than gate on that keyword
+    (which drops real refs in strings like "062563c and e0056ed shipped"),
+    every candidate is emitted here and git decides: classification drops the
+    ones that resolve to no object, so a false positive costs a cheap cat-file
+    and nothing else.
+    """
+    m = FILE_RE.match(evidence.strip())
+    if m:
+        return [("file", m.group(1).strip())]
+    issue_hits = [(m.start(), m.end(), m.group(1)) for m in ISSUE_SCAN_RE.finditer(evidence)]
+    issue_spans = [(s, e) for s, e, _ in issue_hits]
+    # Sorted by match position, not concatenated per kind: "in order" is what
+    # the contract promises, and scanning each pattern separately grouped every
+    # commit ahead of every pr, so "e0056ed (#364), 062563c (#360)" came back
+    # with both prs trailing both commits and lost which pr went with which.
+    hits = ([(m.start(), "commit", m.group(1)) for m in SHA_SCAN_RE.finditer(evidence)]
+            + [(m.start(), "pr", m.group(1)) for m in PR_SCAN_RE.finditer(evidence)
+               if not any(s <= m.start() < e for s, e in issue_spans)]
+            + [(s, "issue", v) for s, e, v in issue_hits])
+    return [(kind, value) for _, kind, value in sorted(hits, key=lambda h: h[0])]
 
 
 def _runs(args, cwd=None) -> int:
@@ -124,33 +160,126 @@ def _runs(args, cwd=None) -> int:
         return 1
 
 
+def _capture(args, cwd=None) -> str:
+    """stdout of a successful run, or "" on any failure. Never raises."""
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=15, cwd=cwd)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, NotADirectoryError):
+        return ""
+    return p.stdout if p.returncode == 0 else ""
+
+
+# Evidence verdicts. `landed` is the only one that checks a todo off; the split
+# exists because "this ref exists" and "this work is merged" are different
+# questions, and an earlier version of verify_evidence answered the first while
+# the ledger asked the second.
+LANDED = "landed"        # merged into the base branch / present on disk
+OUTSTANDING = "outstanding"  # the ref is real but not merged: still live work
+UNKNOWN = "unknown"      # could not determine; never treated as landed
+
+
+def _default_branch(repo) -> str:
+    """The base branch to measure "merged" against. origin/HEAD when set,
+    else the first of main/master that resolves. Empty when neither does --
+    callers must degrade to UNKNOWN rather than guess a base."""
+    head = _capture(["git", "-C", str(repo), "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).strip()
+    if head:
+        return head.removeprefix("refs/remotes/")
+    for cand in ("origin/main", "origin/master", "main", "master"):
+        if _runs(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}"]) == 0:
+            return cand
+    return ""
+
+
+def _classify_commit(sha: str, repo) -> str:
+    if _runs(["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"]) != 0:
+        return UNKNOWN
+    base = _default_branch(repo)
+    if not base:
+        return UNKNOWN
+    return LANDED if _runs(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, base]) == 0 else OUTSTANDING
+
+
+def _classify_gh_ref(kind: str, num: str, repo, landed_state: str) -> str:
+    """LANDED when gh-axi reports `landed_state` ("merged" for a pr, "closed"
+    for an issue -- closing is the closest proxy an issue offers for "the work
+    behind this is done"), OUTSTANDING for any other real state, UNKNOWN when
+    the ref can't be resolved at all.
+
+    Runs inside the repo rather than passing -R when repo is a real directory:
+    that flag takes OWNER/REPO, so handing it a local path returns NOT_FOUND
+    for every ref that exists. The ferry is asked for a local path but
+    sometimes writes `owner/repo`; that shape is exactly what -R wants, so
+    take it either way rather than failing a verifiable ref."""
+    if Path(repo).is_dir():
+        out = _capture(["gh-axi", kind, "view", num], cwd=str(repo))
+    elif re.fullmatch(r"[\w.-]+/[\w.-]+", str(repo)):
+        out = _capture(["gh-axi", kind, "view", num, "-R", str(repo)])
+    else:
+        return UNKNOWN
+    if not out:
+        return UNKNOWN
+    # gh-axi prints a YAML-ish block; the state line is `  state: merged`.
+    m = re.search(r"^\s*state:\s*\"?(\w+)", out, re.M)
+    if not m:
+        return UNKNOWN
+    return LANDED if m.group(1).lower() == landed_state else OUTSTANDING
+
+
+def _classify_pr(num: str, repo) -> str:
+    return _classify_gh_ref("pr", num, repo, "merged")
+
+
+def _classify_issue(num: str, repo) -> str:
+    return _classify_gh_ref("issue", num, repo, "closed")
+
+
+def classify_evidence(evidence: str, repo) -> str:
+    """Classify evidence as LANDED / OUTSTANDING / UNKNOWN.
+
+    A commit that exists but is not in the base branch's ancestry is a branch
+    commit that still needs merging, not shipped work; a PR that is open is the
+    same. Both report OUTSTANDING so the card can say so instead of silently
+    presenting either as done.
+
+    Evidence citing several refs is LANDED only when every ref landed -- half a
+    change being merged is not the change being merged. A single OUTSTANDING ref
+    dominates, since that is the part still needing action; UNKNOWN otherwise.
+    """
+    # Guard before _extract_refs, not after: a ferry mutation with an explicit
+    # "evidence": null survives JSON parsing as a present-but-None value, and
+    # `mut.get("evidence", "")` (the default-arg form used at every call site)
+    # does not catch that -- the default only fires when the key is absent.
+    # _extract_refs then calls evidence.strip() and raises AttributeError,
+    # crashing the whole --pending/--prune-pending invocation over one
+    # malformed row instead of demoting it.
+    if not evidence or not repo:
+        return UNKNOWN
+    refs = _extract_refs(evidence)
+    if not refs:
+        return UNKNOWN
+    verdicts = []
+    for kind, value in refs:
+        if kind == "commit":
+            if _runs(["git", "-C", str(repo), "cat-file", "-e", f"{value}^{{commit}}"]) != 0:
+                continue  # not a sha at all, just a hex-shaped token -- not evidence
+            verdicts.append(_classify_commit(value, repo))
+        elif kind == "pr":
+            verdicts.append(_classify_pr(value, repo))
+        elif kind == "issue":
+            verdicts.append(_classify_issue(value, repo))
+        else:
+            verdicts.append(LANDED if (Path(repo) / value).exists() else OUTSTANDING)
+    if not verdicts:
+        return UNKNOWN
+    if OUTSTANDING in verdicts:
+        return OUTSTANDING
+    return LANDED if all(v == LANDED for v in verdicts) else UNKNOWN
+
+
 def verify_evidence(evidence: str, repo) -> bool:
-    m = HEX_RE.match(evidence)
-    if m:
-        if not repo:
-            return False
-        return _runs(["git", "-C", str(repo), "cat-file", "-e", f"{m.group(1)}^{{commit}}"]) == 0
-    for pattern, kind in ((PR_RE, "pr"), (ISSUE_RE, "issue")):
-        m = pattern.match(evidence)
-        if m:
-            if not repo:
-                return False
-            # Run inside the repo rather than passing -R: that flag takes
-            # OWNER/REPO, so handing it a local path returns NOT_FOUND for
-            # every PR that exists. The ferry is asked for a local path but
-            # sometimes writes `owner/repo`; that shape is what -R wants, so
-            # take it either way rather than failing a verifiable ref.
-            if Path(repo).is_dir():
-                return _runs(["gh-axi", kind, "view", m.group(1)], cwd=str(repo)) == 0
-            if re.fullmatch(r"[\w.-]+/[\w.-]+", str(repo)):
-                return _runs(["gh-axi", kind, "view", m.group(1), "-R", str(repo)]) == 0
-            return False
-    m = FILE_RE.match(evidence)
-    if m:
-        if not repo:
-            return False
-        return (Path(repo) / m.group(1).strip()).exists()
-    return False
+    """True only when the evidence shows the work actually landed."""
+    return classify_evidence(evidence, repo) == LANDED
 
 
 def pending_path() -> Path:
@@ -222,6 +351,94 @@ def apply_mutations(muts: list) -> dict:
             counts["failed"] += 1
             jl.log(f"unknown op: {mut}")
     seen.save()
+    return counts
+
+
+def prune_pending() -> dict:
+    """Re-run the gates over the pending queue and drain what no longer belongs.
+
+    pending.json is otherwise append-only: _push_pending adds, and before this
+    existed nothing ever removed, so a check queued against a since-merged PR
+    sat in the queue forever and every wake re-reported it as a live loose end.
+
+    Each row resolves one of four ways:
+      applied  - evidence now shows LANDED and the ledger line is still open,
+                 so the check it was demoted from finally goes through
+      moot     - the ledger line is no longer open (checked or dismissed since),
+                 so there is nothing left for this row to do
+      stale    - the line was never in the ledger at all
+      kept     - still genuinely pending; evidence has not landed yet
+    """
+    AMBIGUOUS = object()
+
+    def _match(sections, line, only):
+        """find_match raises on duplicate ledger lines; a duplicated line is a
+        reason to keep the row for a human, never to crash the whole prune.
+
+        Ambiguity returns its own sentinel rather than None. Collapsing it to
+        None read as "not in the open section", which sent the row down the
+        moot/stale path and dropped it from the queue outright -- the one thing
+        the queue exists to prevent, and the opposite of what this docstring
+        promised."""
+        try:
+            return find_match(sections, line, only=only)
+        except AmbiguousMatch:
+            return AMBIGUOUS
+
+    items = load_pending()
+    if not items:
+        return {"applied": 0, "moot": 0, "stale": 0, "kept": 0}
+    seen = jl.SeenStore.load()
+    sections = parse_ledger(ledger_path().read_text())
+    counts = {"applied": 0, "moot": 0, "stale": 0, "kept": 0}
+    kept = []
+    for row in items:
+        line = (row.get("line") or "").strip()
+        if not line:
+            counts["stale"] += 1
+            continue
+        open_hit = _match(sections, line, "open")
+        if open_hit is AMBIGUOUS:
+            # Several open lines match, so there is no safe one to check off and
+            # no basis for calling the row resolved. Keep it for a human.
+            kept.append(row)
+            counts["kept"] += 1
+            jl.log(f"prune-pending: kept (ambiguous ledger match): {line}")
+            continue
+        if open_hit is None:
+            # Distinguish "resolved since" from "never existed" so a genuinely
+            # lost line is visible rather than silently swallowed as handled.
+            done_hit = _match(sections, line, "done")
+            dismissed_hit = _match(sections, line, "dismissed")
+            if done_hit is AMBIGUOUS or dismissed_hit is AMBIGUOUS:
+                # A duplicate in done/dismissed is just as ambiguous as one in
+                # open -- `known = a or b` treated this sentinel as truthy and
+                # dropped the row as "moot", which is exactly the silent drop
+                # the open-branch AMBIGUOUS case above exists to prevent. Keep
+                # it here too.
+                kept.append(row)
+                counts["kept"] += 1
+                jl.log(f"prune-pending: kept (ambiguous ledger match): {line}")
+                continue
+            known = done_hit or dismissed_hit
+            counts["moot" if known else "stale"] += 1
+            jl.log(f"prune-pending: dropped ({'moot' if known else 'stale'}): {line}")
+            continue
+        if not verify_evidence(row.get("evidence", ""), row.get("repo")):
+            kept.append(row)
+            counts["kept"] += 1
+            continue
+        try:
+            apply_check(line, row.get("evidence", "verified"))
+            seen.set_status(jl.line_hash(line), "done")
+            counts["applied"] += 1
+            jl.log(f"prune-pending: applied: {line}")
+            sections = parse_ledger(ledger_path().read_text())
+        except AmbiguousMatch:
+            kept.append(row)
+            counts["kept"] += 1
+    seen.save()
+    save_pending(kept)
     return counts
 
 
@@ -382,6 +599,7 @@ def main() -> None:
     ap.add_argument("--wake", action="store_true")
     ap.add_argument("--delta", action="store_true")
     ap.add_argument("--pending", action="store_true")
+    ap.add_argument("--prune-pending", action="store_true")
     a = ap.parse_args()
     if a.add:
         print(apply_add(a.add, a.kind, a.source))
@@ -396,8 +614,14 @@ def main() -> None:
         wake()
     elif a.delta:
         print(json.dumps(delta_summary(), indent=1))
+    elif a.prune_pending:
+        print(json.dumps(prune_pending(), indent=1))
     elif a.pending:
-        print(json.dumps(load_pending(), indent=1))
+        # Annotate each row with its live evidence state so a caller can tell a
+        # merged PR from an unmerged branch commit without re-deriving it by hand.
+        rows = [{**r, "state": classify_evidence(r.get("evidence", ""), r.get("repo"))}
+                for r in load_pending()]
+        print(json.dumps(rows, indent=1))
     else:
         ap.print_help()
         sys.exit(1)

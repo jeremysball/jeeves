@@ -78,8 +78,11 @@ State dirs: `$JEEVES_STATE_DIR` or `~/.local/state/jeeves/`; ledger at
    recorded for this path in `~/.local/state/jeeves/offsets.tsv` if present.)
 3. `python3 ~/.claude/skills/jeeves/bin/todos.py --delta` — open/done/
    dismissed/pending counts and top recurrences.
-4. If pending > 0: `python3 ~/.claude/skills/jeeves/bin/todos.py --pending`
-   — surface each with its reason for one-line resolution.
+4. If pending > 0: `python3 ~/.claude/skills/jeeves/bin/todos.py --prune-pending`
+   first (drains rows that already resolved), then
+   `python3 ~/.claude/skills/jeeves/bin/todos.py --pending` — surface each
+   survivor with its `reason` and its `state` for one-line resolution.
+   Both are local git/`gh-axi` reads; the speed contract holds.
 5. `python3 ~/.claude/skills/jeeves/bin/todos.py --wake`
 6. Render the card (below).
 
@@ -95,6 +98,20 @@ git-state snapshot, render:
 - **By PR or by commit hash**: PR numbers inline (`#251`) are the
   natural identifier when the work was reviewed and merged; otherwise
   short SHA + conventional-commit subject.
+- **Prove merged before calling anything shipped.** Never infer merge
+  state from a commit appearing in `git log --all`, from a PR number
+  existing, or from a confident-sounding subject line. Run
+  `git merge-base --is-ancestor <sha> origin/main` per commit and read
+  `state:` from `gh-axi pr view <n>` per PR — or call
+  `todos.py`'s `classify_evidence`, which does exactly this and returns
+  `landed` / `outstanding` / `unknown`. Anything not proven `landed`
+  belongs under **Unmerged work**, never under **Shipped**.
+- **Label every item's state inline**, so the two are never
+  ambiguous at a glance: `#413 merged` vs `b8f57f0 unmerged
+  (feat/ro-rw-dirs, PR #401 open)`. A bare SHA next to a bare PR number
+  reads as one undifferentiated pile of "done", which is the single
+  most misleading thing this card can do — the user cannot act on
+  "shipped" and "still needs merging" the same way.
 - **Stat when it matters**: `tasks.js` 7400+/6800- across 53 files says
   more than the subject line. Include `git diff --stat main..branch`
   for unmerged worktrees and `git log --stat` snippets for merged work
@@ -129,19 +146,19 @@ leads with the delta since last wake ("checked 2, added 3, dismissed 1")
 and one oldest-open line. Recurrence counts surface flatly — a loose
 end seen three times is signal, not a nag.
 
-**Sanity-check pending evidence before rendering.** Pending todos whose
-"reason: evidence did not verify" was queued days ago often point at
-work that has since shipped (issue closed, PR merged, branch
-abandoned). Spot-check each pending todo's evidence ref against current
-`gh-axi issue view <n>` / `git log` before listing it as live. A
-"Doctor issue body still pre-draft" todo pointing at a now-closed #249
-is dead evidence, not a real pending item.
+**Drain the pending queue before rendering, don't just eyeball it.**
+Run `todos.py --prune-pending` at step 4. It re-runs the gates over
+every queued row: applies the ones whose evidence now shows `landed`,
+drops the ones whose ledger line has since been checked or dismissed
+(`moot`) or was never there (`stale`), and keeps only what is genuinely
+still outstanding. `todos.py --pending` then annotates each survivor
+with a `state` field, so a row pointing at a merged PR is visibly
+distinct from one pointing at an unmerged branch commit.
 
-Rows queued before 2026-08-09 deserve extra suspicion: until then
-`verify_evidence` ran `gh-axi pr view -R <local path>`, which returns
-NOT_FOUND for every PR that exists, so *no* PR-backed check could pass.
-A pre-2026-08-09 pending row citing a PR is far more likely that bug
-than a real unverified claim — resolve it against the PR itself.
+Only rows that survive the prune belong on the card, and each should
+carry its state. A row whose evidence reads `unknown` is not the same
+as one reading `outstanding` — surface the ambiguity rather than
+picking the flattering interpretation.
 
 The cron also persists a cross-repo git-state snapshot at
 `~/.local/state/jeeves/git-state.md` (a read-only `scan-active.sh` rollup:
@@ -206,8 +223,14 @@ single-project briefing including session recall.
   no known repo, or two, is left unadjudicated rather than guessed at.
 - Listing pending todos without checking their evidence refs — a todo
   queued before its evidence went stale (issue closed, branch merged,
-  PR landed) is dead weight, not a real loose end. Spot-check before
-  rendering.
+  PR landed) is dead weight, not a real loose end. Run
+  `--prune-pending` before rendering.
+- Presenting an unmerged branch commit as shipped work. A commit shows
+  up in `git log --all` whether or not it is in `main`; a PR number
+  resolves whether or not it merged. Both were once reported under
+  **Shipped** on this card — `b8f57f0`, which lived only on an open
+  PR's branch — because the card was built from `git log` output alone.
+  Prove `landed` per the Card format rules, or file it as unmerged.
 - Rendering the card twice with the same shape after the user said
   "this is weak" — if a card lands flat, the answer is to go to ground
   truth (git log) and rebuild, not paraphrase the digest more politely.
