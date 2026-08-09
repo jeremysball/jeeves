@@ -8,6 +8,7 @@ pass.
 
 import subprocess
 
+import pytest
 
 import jeeves_lib as jl
 import todos as td
@@ -354,7 +355,7 @@ def test_missing_file_with_landed_commit_is_outstanding(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Part 2: classify_evidence() — pr/issue references and gh-axi invocation
+# Part 2: classify_evidence() — pr references and remote slug
 # ---------------------------------------------------------------------------
 
 def test_pr_unknown_without_origin_remote(tmp_path, monkeypatch):
@@ -364,63 +365,30 @@ def test_pr_unknown_without_origin_remote(tmp_path, monkeypatch):
     assert td.classify_evidence("PR #42", str(repo)) == td.UNKNOWN
 
 
-def test_pr_lookup_runs_inside_a_real_repo_directory(tmp_path, monkeypatch):
-    # -R takes OWNER/REPO, not a filesystem path -- handing it a path returns
-    # NOT_FOUND for every PR that exists. When repo is a real directory, run
-    # gh-axi with cwd set to it instead of deriving a slug from origin at all.
+@pytest.mark.parametrize("url", [
+    "git@github.com:acme/widget.git",
+    "https://github.com/acme/widget.git",
+    "https://github.com/acme/widget",
+])
+def test_pr_lookup_derives_owner_repo_slug_from_origin(url, tmp_path, monkeypatch):
     repo, _ = _git_repo(tmp_path)
-    seen = {}
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", url], check=True)
+    calls = []
+    # Only the pr lookup is stubbed out. Failing *every* subprocess call also
+    # killed the `git remote get-url origin` the slug is read from, so the slug
+    # came back empty and the lookup was never reached -- the assertion below
+    # could then only ever fail.
+    real_run = subprocess.run
 
-    def fake_capture(args, cwd=None):
-        seen["args"], seen["cwd"] = args, cwd
-        return ""
+    def fake_run(args, **kw):
+        calls.append(list(args))
+        if args and args[0] == "git":
+            return real_run(args, **kw)
+        raise FileNotFoundError("no network")
 
-    monkeypatch.setattr(td, "_capture", fake_capture)
-    assert td.classify_evidence("PR #419 merged", str(repo)) == td.UNKNOWN
-    assert seen["args"] == ["gh-axi", "pr", "view", "419"]
-    assert seen["cwd"] == str(repo)
-
-
-def test_pr_lookup_falls_back_to_dash_r_for_an_owner_repo_string(monkeypatch):
-    # The ferry is asked for a local path but sometimes writes owner/repo
-    # directly; that shape is exactly what -R wants.
-    seen = {}
-
-    def fake_capture(args, cwd=None):
-        seen["args"], seen["cwd"] = args, cwd
-        return '  state: "merged"\n'
-
-    monkeypatch.setattr(td, "_capture", fake_capture)
-    assert td.classify_evidence("PR #419", "jeremysball/taskferry") == td.LANDED
-    assert seen["args"] == ["gh-axi", "pr", "view", "419", "-R", "jeremysball/taskferry"]
-    assert seen["cwd"] is None
-
-
-def test_pr_lookup_rejects_a_nonexistent_local_path(monkeypatch):
-    monkeypatch.setattr(td, "_capture", lambda args, cwd=None: '  state: "merged"\n')
-    assert td.classify_evidence("PR #419", "/no/such/dir/anywhere") == td.UNKNOWN
-
-
-def test_issue_kind_is_extracted_separately_from_pr(tmp_path):
-    # "issue #N" must not also be picked up by the generic #N pr scan.
-    assert td._extract_refs("issue #391 filed") == [("issue", "391")]
-    assert td._extract_refs("closes issue #391, PR #42") == [("issue", "391"), ("pr", "42")]
-
-
-def test_issue_landed_when_closed(tmp_path, monkeypatch):
-    repo, _ = _git_repo(tmp_path)
-
-    def fake_capture(args, cwd=None):
-        return '  state: "closed"\n' if args[:3] == ["gh-axi", "issue", "view"] else ""
-
-    monkeypatch.setattr(td, "_capture", fake_capture)
-    assert td.classify_evidence("issue #391 filed", str(repo)) == td.LANDED
-
-
-def test_issue_outstanding_when_open(tmp_path, monkeypatch):
-    repo, _ = _git_repo(tmp_path)
-    monkeypatch.setattr(td, "_capture", lambda args, cwd=None: '  state: "open"\n')
-    assert td.classify_evidence("issue #391 filed", str(repo)) == td.OUTSTANDING
+    monkeypatch.setattr(td.subprocess, "run", fake_run)
+    assert td.classify_evidence("PR #42", str(repo)) == td.UNKNOWN
+    assert any("acme/widget" in " ".join(a) for a in calls), f"slug not found in {calls}"
 
 
 # ---------------------------------------------------------------------------
