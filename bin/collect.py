@@ -298,44 +298,71 @@ SECRET_RES = [
     re.compile(r"\b(xox[a-z](?:\.[a-z]+)?-[A-Za-z0-9-]{10,})"),
     re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),
     re.compile(r"\b(AIza[0-9A-Za-z_-]{30,})"),
-    re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/-]{16,}={0,2}"),
+    # No floor beyond a handful of chars: the keyword itself ("bearer"/
+    # "basic") is specific enough that a short base64 credential right after
+    # it (Basic auth of a short `user:pass`, e.g. `Basic dTpw`) is still
+    # worth redacting more than the false-positive risk of an unrelated
+    # short word following those two keywords is worth avoiding.
+    re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/-]{4,}={0,2}"),
     # PEM/SSH private key blocks — the BEGIN/END markers alone are signal
     # enough to redact the whole thing, body included. Two separate patterns:
-    # the `... PRIVATE KEY` family (RSA/EC/OPENSSH/DSA/ENCRYPTED/unlabeled)
-    # shares a `-----END <label> PRIVATE KEY-----` marker; PGP's block has a
-    # different suffix (`PRIVATE KEY BLOCK`, no bare "PRIVATE KEY" marker).
-    re.compile(r"-----BEGIN ((?:RSA |EC |OPENSSH |DSA |ENCRYPTED |)PRIVATE KEY)-----"
-               r"[\s\S]*?-----END \1-----"),
+    # the `... PRIVATE KEY` family (RSA/EC/ECDSA/ED25519/OPENSSH/DSA/
+    # ENCRYPTED/unlabeled) shares a `-----END <label> PRIVATE KEY-----`
+    # marker; PGP's block has a different suffix (`PRIVATE KEY BLOCK`, no
+    # bare "PRIVATE KEY" marker).
+    re.compile(r"-----BEGIN ((?:RSA |EC |ECDSA |ED25519 |OPENSSH |DSA |ENCRYPTED |)"
+               r"PRIVATE KEY)-----[\s\S]*?-----END \1-----"),
     re.compile(r"-----BEGIN (PGP PRIVATE KEY BLOCK)-----"
                r"[\s\S]*?-----END \1-----"),
+    # Fallback for a key body that never reaches its own `-----END` marker —
+    # the prose-fallback path's 800-char denoise truncation can cut a pasted
+    # key mid-body. The two patterns above already consumed every BEGIN...END
+    # pair by the time this runs, so any `-----BEGIN...PRIVATE KEY-----`
+    # still standing here is exactly the truncated case; redact from BEGIN to
+    # the end of the text rather than leave the header and partial body live.
+    re.compile(r"-----BEGIN (?:(?:RSA |EC |ECDSA |ED25519 |OPENSSH |DSA |ENCRYPTED |)"
+               r"PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*"),
     # `scheme://user:pass@host` connection strings (DATABASE_URL, a raw
     # psql/mysql DSN). Only the password half is masked; scheme/user stay for
-    # context. The value group allows `@` (greedy, so it backtracks to the
+    # context. The user segment is optional (`redis://:pass@host` is a valid,
+    # common DSN shape with no username) and the password group allows `/`
+    # (a password itself can contain one) — both used to force the whole
+    # pattern to simply not match, leaking the password in full rather than
+    # partially. The value group allows `@` (greedy, so it backtracks to the
     # rightmost `@` before the lookahead succeeds) — a password containing
     # its own `@` used to truncate the match at the first one, leaking the
     # remainder.
-    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@\"']+:)([^\s/\"'\\]+)(?=@)"),
+    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:@\"']*:)([^\s\"'\\]+)(?=@)"),
     # No `\b` in front: `_` is a word character, so a boundary would never
     # match the `API_KEY` inside `OPENAI_API_KEY`, which is exactly the shape
     # these turn up in. The key is `[\w.-]*<keyword>[\w.-]*` rather than the
     # bare keyword, so `AWS_SECRET_ACCESS_KEY`, `_authToken`, and
     # `PGPASSWORD`/`MYSQL_PWD` all match too, not just an exact
-    # `secret`/`token`/`password`. `(?![a-z])` right after the keyword blocks
-    # the mirror-image false positive — a keyword that's really the start of
-    # an unrelated lowercase word (`Author:`, `tokenizer=`) — while still
-    # allowing a real compound continuation (`_authToken`'s `T`, `_ACCESS_KEY`'s
-    # `_`) or the keyword standing alone. `pwd` alone (bare `PWD=`, the shell
-    # env var) still matches on purpose: a missed real credential costs more
-    # than an over-redacted directory path. Quotes allow an optional leading
-    # `\` — `stage_slice` writes raw JSON-escaped bytes, so a quoted value on
-    # disk reads `\"value\"`, not `"value"`. The value group allows a literal
-    # backslash (only an unescaped quote ends it) — excluding backslash used
-    # to truncate the match at the first one inside the value, leaking the
-    # rest. No floor on the value length: a short real secret is worth
-    # redacting more than a floor is worth avoiding one false positive.
+    # `secret`/`token`/`password`. `(?!(?-i:[a-z]))` right after the keyword
+    # blocks the mirror-image false positive — a keyword that's really the
+    # start of an unrelated lowercase word (`Author:`, `tokenizer=`) — while
+    # still allowing a real compound continuation, including a camelCase one
+    # (`_authToken`'s `T`, `_ACCESS_KEY`'s `_`, `secretKey`'s `K`) or the
+    # keyword standing alone. The `(?-i:...)` scopes case-sensitivity to just
+    # this lookahead despite the pattern's own `(?i)` flag — under plain
+    # `(?i)`, `[a-z]` also matches uppercase, so a camelCase key's uppercase
+    # continuation (`secretKey`'s `K`) would wrongly fail the lookahead and
+    # kill the whole match right after the keyword, leaking the key=value
+    # entirely. `pwd` alone (bare `PWD=`, the shell env var) still matches on
+    # purpose: a missed real credential costs more than an over-redacted
+    # directory path. Quotes allow an optional leading `\` — `stage_slice`
+    # writes raw JSON-escaped bytes, so a quoted value on disk reads
+    # `\"value\"`, not `"value"`. The value group stops only at whitespace,
+    # not at a quote or backslash — on the staged JSONL path every quote is
+    # written escaped (`\"`), including a quote embedded inside the secret
+    # itself, so a quote character can never reliably distinguish "end of
+    # value" from "part of the value"; stopping only at whitespace means an
+    # embedded escaped quote can no longer truncate the match early and leak
+    # the remainder. No floor on the value length: a short real secret is
+    # worth redacting more than a floor is worth avoiding one false positive.
     re.compile(r"(?i)(?<![A-Za-z0-9])([\w.-]*(?:api[_-]?key|secret|token|password"
-               r"|passwd|pwd|credential|auth)(?![a-z])[\w.-]*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
-               r"([^\s\"']+)"),
+               r"|passwd|pwd|credential|auth)(?!(?-i:[a-z]))[\w.-]*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
+               r"(\S+)"),
 ]
 
 
@@ -628,6 +655,10 @@ def run_once() -> dict:
                        "rendered": jl.render_slice(entries)})
 
     prune_staging()
+    # Every session this run knows about, across all batches — used below to
+    # tell a garbage session label (safe to re-key) from one that names a real
+    # session (a claim about whose work this is, which must not be re-keyed).
+    known_sids = {s["sid"] for s in slices}
     for gi, group in enumerate(group_slices(slices, cfg["batch_under"], cfg["batch_max"])):
         by_session, res = {}, None
         # Staged path: hand the ferry the raw transcript and let it read the
@@ -700,11 +731,28 @@ def run_once() -> dict:
                         fallback[p.get("session")] = p
                     # Lenient fallback: with exactly one missing slice and one
                     # returned entry, a mislabeled session key is still
-                    # obviously the answer.
+                    # obviously the answer — there's only one session it could
+                    # possibly be about, so a placeholder or hallucinated name
+                    # is safe to re-key. The one exception is a name that
+                    # belongs to another *real* session this run knows about:
+                    # that's not a garbage label, it's a claim this content is
+                    # some other session's, and re-keying it would attribute
+                    # one session's work to another. `read_staged_summaries`
+                    # refuses the analogous mismatch rather than relabeling it;
+                    # this is the same rule, narrowed to the case where the
+                    # conflicting name actually resolves to something.
+                    own_sid = (payload[0].get("session")
+                               if len(payload) == 1 and isinstance(payload[0], dict) else None)
+                    conflicts = bool(missing) and own_sid is not None \
+                        and own_sid != missing[0]["sid"] and own_sid in known_sids
                     if len(missing) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
                             and _looks_like_summary(payload[0]) \
-                            and missing[0]["sid"] not in fallback:
+                            and missing[0]["sid"] not in fallback \
+                            and not conflicts:
                         fallback[missing[0]["sid"]] = {**payload[0], "session": missing[0]["sid"]}
+                    elif conflicts:
+                        jl.log(f"fallback entry for {missing[0]['sid']} claims to be "
+                               f"another session in this batch ({own_sid!r}); not re-keyed")
                     # Scope the merge to the sids this fallback dispatch was
                     # actually asked about — an extra or mislabeled sid in
                     # the response must not silently overwrite an
