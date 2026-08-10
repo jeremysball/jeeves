@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections import defaultdict
@@ -251,8 +252,192 @@ def extract_prompt(group) -> str:
     template = (PROMPTS / "extract-rubric.md").read_text()
     blocks = []
     for s in group:
-        blocks.append(f"[SESSION {s['sid']} — project {Path(s['dir']).name}]\n{s['rendered']}")
+        # Denoised prose is far less likely to carry a raw secret than the
+        # staged path's unfiltered tool output, but it's not impossible (a
+        # user pasting a token into chat, an error message echoing one) —
+        # this path gets none of the staged path's redaction otherwise.
+        blocks.append(f"[SESSION {s['sid']} — project {Path(s['dir']).name}]\n"
+                      f"{redact(s['rendered'])}")
     return template.replace("{slices_block}", "\n\n---\n\n".join(blocks))
+
+
+def staging_root() -> Path:
+    d = jl.state_dir() / "staging"
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o700)
+    return d
+
+
+def prune_staging(keep_h: int = 6) -> int:
+    """Staged slices are verbatim transcript copies. Never leave them lying
+    around past the run that needed them."""
+    cutoff = time.time() - keep_h * 3600
+    n = 0
+    for d in staging_root().iterdir():
+        if d.is_dir() and d.stat().st_mtime < cutoff:
+            shutil.rmtree(d, ignore_errors=True)
+            if d.exists():
+                jl.log(f"staging prune left {d} behind (rmtree failed)")
+            else:
+                n += 1
+    return n
+
+
+# Staging widens what reaches the model from denoised prose to the whole
+# delta, tool results included — and a tool result is where a secret actually
+# shows up (an `env` dump, a curl with a bearer token, a cat of a .env). Prose
+# rarely carries one; command output does. Redact before anything leaves the
+# host, not after.
+SECRET_RES = [
+    re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,})"),
+    re.compile(r"\b(github_pat_[A-Za-z0-9_]{20,})"),
+    re.compile(r"\b(sk-[A-Za-z0-9_-]{16,})"),
+    # `xox[a-z]` rather than a fixed letter class, so a Slack token family
+    # added later — `xoxe-` (workspace token), the `xoxe.xoxp-` compound
+    # refresh-token shape — is covered without another edit here.
+    re.compile(r"\b(xox[a-z](?:\.[a-z]+)?-[A-Za-z0-9-]{10,})"),
+    re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),
+    re.compile(r"\b(AIza[0-9A-Za-z_-]{30,})"),
+    re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/-]{16,}={0,2}"),
+    # PEM/SSH private key blocks — the BEGIN/END markers alone are signal
+    # enough to redact the whole thing, body included. Two separate patterns:
+    # the `... PRIVATE KEY` family (RSA/EC/OPENSSH/DSA/ENCRYPTED/unlabeled)
+    # shares a `-----END <label> PRIVATE KEY-----` marker; PGP's block has a
+    # different suffix (`PRIVATE KEY BLOCK`, no bare "PRIVATE KEY" marker).
+    re.compile(r"-----BEGIN ((?:RSA |EC |OPENSSH |DSA |ENCRYPTED |)PRIVATE KEY)-----"
+               r"[\s\S]*?-----END \1-----"),
+    re.compile(r"-----BEGIN (PGP PRIVATE KEY BLOCK)-----"
+               r"[\s\S]*?-----END \1-----"),
+    # `scheme://user:pass@host` connection strings (DATABASE_URL, a raw
+    # psql/mysql DSN). Only the password half is masked; scheme/user stay for
+    # context. The value group allows `@` (greedy, so it backtracks to the
+    # rightmost `@` before the lookahead succeeds) — a password containing
+    # its own `@` used to truncate the match at the first one, leaking the
+    # remainder.
+    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@\"']+:)([^\s/\"'\\]+)(?=@)"),
+    # No `\b` in front: `_` is a word character, so a boundary would never
+    # match the `API_KEY` inside `OPENAI_API_KEY`, which is exactly the shape
+    # these turn up in. The key is `[\w.-]*<keyword>[\w.-]*` rather than the
+    # bare keyword, so `AWS_SECRET_ACCESS_KEY`, `_authToken`, and
+    # `PGPASSWORD`/`MYSQL_PWD` all match too, not just an exact
+    # `secret`/`token`/`password`. `(?![a-z])` right after the keyword blocks
+    # the mirror-image false positive — a keyword that's really the start of
+    # an unrelated lowercase word (`Author:`, `tokenizer=`) — while still
+    # allowing a real compound continuation (`_authToken`'s `T`, `_ACCESS_KEY`'s
+    # `_`) or the keyword standing alone. `pwd` alone (bare `PWD=`, the shell
+    # env var) still matches on purpose: a missed real credential costs more
+    # than an over-redacted directory path. Quotes allow an optional leading
+    # `\` — `stage_slice` writes raw JSON-escaped bytes, so a quoted value on
+    # disk reads `\"value\"`, not `"value"`. The value group allows a literal
+    # backslash (only an unescaped quote ends it) — excluding backslash used
+    # to truncate the match at the first one inside the value, leaking the
+    # rest. No floor on the value length: a short real secret is worth
+    # redacting more than a floor is worth avoiding one false positive.
+    re.compile(r"(?i)(?<![A-Za-z0-9])([\w.-]*(?:api[_-]?key|secret|token|password"
+               r"|passwd|pwd|credential|auth)(?![a-z])[\w.-]*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
+               r"([^\s\"']+)"),
+]
+
+
+def redact(text: str) -> str:
+    """Mask credential-shaped strings in staged transcript content."""
+    for rx in SECRET_RES:
+        text = rx.sub(lambda m: m.group(1) + "[REDACTED]"
+                      if rx.groups > 1 else "[REDACTED]", text)
+    return text
+
+
+def stage_slice(staging: Path, s: dict) -> Path:
+    """Write a session's raw delta lines for the ferry to read directly.
+
+    Otherwise unfiltered on purpose: the whole point is that tool calls, tool
+    results, and sidechain entries reach the model, and `denoise` drops all
+    three."""
+    f = staging / f"{s['slug']}--{s['sid']}.jsonl"
+    f.write_text(redact("\n".join(s["raw"])) + "\n")
+    f.chmod(0o600)
+    return f
+
+
+def extract_tools_prompt(group, staging: Path) -> str:
+    template = (PROMPTS / "extract-tools.md").read_text()
+    rows = []
+    for s in group:
+        f = f"{s['slug']}--{s['sid']}.jsonl"
+        rows.append(f"- session `{s['sid']}` (project {Path(s['dir']).name}): "
+                    f"`{f}` — write findings to `summary-{s['sid']}.json`")
+    return template.replace("{files_block}", "\n".join(rows))
+
+
+# The extraction schema from prompts/extract-tools.md. Used only for a
+# minimal shape check on what the ferry wrote — not full validation.
+_SUMMARY_FIELDS = {"session", "shipped", "oversaw", "loose_ends", "tangents",
+                   "overlooked", "failures", "shape"}
+_SUMMARY_LIST_FIELDS = _SUMMARY_FIELDS - {"session", "shape"}
+
+
+def _looks_like_summary(payload: dict) -> bool:
+    """Reject a JSON object that happens to parse but isn't shaped like the
+    extraction schema — an empty `{}`, or an unrelated blob (a mutation dict,
+    a stray tool-output object) shouldn't get written into the ledger as if
+    it were a real session summary. Checked against `_SUMMARY_LIST_FIELDS`
+    (not the full field set) so a stub carrying only `session`/`shape` — the
+    two non-list fields — and nothing else doesn't pass: there'd be nothing
+    left for the `isinstance(..., list)` check below to actually typecheck,
+    the same failure mode an all-`session` intersection has."""
+    if not _SUMMARY_LIST_FIELDS & payload.keys():
+        return False
+    return all(isinstance(payload[k], list)
+               for k in _SUMMARY_LIST_FIELDS if k in payload)
+
+
+def read_staged_summaries(staging: Path, group) -> dict:
+    """Collect per-session summary files the ferry wrote. A file that never
+    appeared is absent from the result, never a stub — the caller decides
+    whether to hold the offset for a retry."""
+    out = {}
+    for s in group:
+        f = staging / f"summary-{s['sid']}.json"
+        if f.is_symlink():
+            # The ferry has rw access to this directory (--no-overlay); a
+            # symlink here could point the expected filename at a sensitive
+            # local file instead of a summary it actually wrote.
+            jl.log(f"staged summary for {s['sid']} is a symlink; refusing to read it")
+            continue
+        if not f.exists():
+            continue
+        try:
+            payload = json.loads(f.read_text())
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            jl.log(f"staged summary unreadable for {s['sid']}: {e}")
+            continue
+        if isinstance(payload, list):  # a one-entry array is close enough
+            list_len = len(payload)
+            payload = payload[0] if list_len == 1 else None
+            if payload is not None and not isinstance(payload, dict):
+                jl.log(f"staged summary for {s['sid']} is a one-item list of "
+                       f"a non-dict ({type(payload).__name__}); skipped")
+                continue
+            if payload is None:
+                jl.log(f"staged summary for {s['sid']} is a list of length "
+                       f"{list_len}, expected exactly one; skipped")
+                continue
+        if not isinstance(payload, dict):
+            continue
+        own_sid = payload.get("session")
+        if own_sid is not None and own_sid != s["sid"]:
+            # The filename says one sid, the payload's own `"session"` field
+            # says another — a mislabeled or swapped-content file. Silently
+            # relabeling it to the filename's sid (the old behavior) hides a
+            # real mismatch instead of surfacing it.
+            jl.log(f"staged summary filename says {s['sid']} but payload's "
+                   f"own \"session\" field says {own_sid!r}; skipped")
+        elif _looks_like_summary(payload):
+            out[s["sid"]] = {**payload, "session": s["sid"]}
+        else:
+            jl.log(f"staged summary for {s['sid']} doesn't look like the "
+                   f"extraction schema; skipped")
+    return out
 
 
 def write_summary(date, slug, sid, n, payload: dict) -> None:
@@ -439,27 +624,95 @@ def run_once() -> dict:
             continue
         slices.append({"path": key, "dir": str(path.parent), "slug": path.parent.name,
                        "sid": session_id_of(path), "new_off": new_off,
-                       "entries": entries, "rendered": jl.render_slice(entries)})
+                       "entries": entries, "raw": lines,
+                       "rendered": jl.render_slice(entries)})
 
-    for group in group_slices(slices, cfg["batch_under"], cfg["batch_max"]):
-        res = jl.ferry(extract_prompt(group), cfg["model"])
-        if not res["ok"]:
-            counts["failed"] += len(group)
-            jl.log(f"extraction failed ({res['error']}); offsets held for retry: "
-                   f"{[s['sid'] for s in group]}")
-            continue  # offsets NOT advanced — retry next run
-        payload = jl.parse_fenced_json(res["message"])
-        if not isinstance(payload, list):
-            counts["failed"] += len(group)
-            jl.log(f"extraction output unparseable (task {res['task_id']}); "
-                   f"offsets held; first 300 chars: {res['message'][:300]!r}")
-            continue
-        by_session = {p.get("session"): p for p in payload if isinstance(p, dict)}
-        # Lenient fallback: with exactly one slice and one returned entry, a
-        # mislabeled session key is still obviously the answer.
-        if len(group) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
-                and group[0]["sid"] not in by_session:
-            by_session[group[0]["sid"]] = {**payload[0], "session": group[0]["sid"]}
+    prune_staging()
+    for gi, group in enumerate(group_slices(slices, cfg["batch_under"], cfg["batch_max"])):
+        by_session, res = {}, None
+        # Staged path: hand the ferry the raw transcript and let it read the
+        # tool calls, tool results, and sidechain entries `denoise` throws
+        # away — 98% of the bytes, and where every real evidence ref lives.
+        staging = staging_root() / f"{date}--{jl.now_et().strftime('%H%M%S')}--{gi}"
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            staging.chmod(0o700)  # staging_root() locks the parent; this run's
+            # own subdir inherits the process umask (typically 0755) unless
+            # told otherwise — verbatim transcript copies, not world-readable.
+            for s in group:
+                stage_slice(staging, s)
+            res = jl.ferry(extract_tools_prompt(group, staging), cfg["model"],
+                           directory=str(staging))
+            if res["ok"]:
+                by_session = read_staged_summaries(staging, group)
+        except OSError as e:
+            jl.log(f"staging failed ({e}); falling back to the rendered-prose path")
+        finally:
+            # The TTL prune at the top of the next run would eventually get
+            # this, but there's no reason to leave a verbatim transcript copy
+            # sitting on disk for up to `keep_h` hours once this run is done
+            # reading it.
+            shutil.rmtree(staging, ignore_errors=True)
+            if staging.exists():
+                jl.log(f"staging cleanup left {staging} behind (rmtree failed)")
+
+        # Fallback: for whatever sessions the staged path didn't cover (all
+        # of them, if staging failed outright or wrote no files; a subset,
+        # if the ferry only got partway through the batch), retry on the
+        # pre-staging dispatch, which passes a denoised prose blob and reads
+        # the answer out of the final message. A session the staged path DID
+        # cover is never re-dispatched — falling back per-session, not
+        # all-or-nothing, so one uncovered session in an otherwise-successful
+        # batch doesn't cost every session in it a retry.
+        missing = [s for s in group if s["sid"] not in by_session]
+        if missing:
+            if res is not None and res["ok"] and by_session:
+                jl.log(f"staged run covered {sorted(by_session)}, missing "
+                       f"{[s['sid'] for s in missing]}; retrying those on the "
+                       f"rendered-prose path")
+            elif res is not None and res["ok"]:
+                jl.log(f"staged run wrote no summary files (task {res['task_id']}); "
+                       f"retrying on the rendered-prose path")
+            elif res is not None and not res["ok"]:
+                jl.log(f"staged dispatch failed ({res['error']}); retrying on "
+                       f"the rendered-prose path")
+            fb_res = jl.ferry(extract_prompt(missing), cfg["model"])
+            if not fb_res["ok"]:
+                jl.log(f"extraction failed ({fb_res['error']}); offsets held "
+                       f"for retry: {[s['sid'] for s in missing]}")
+            else:
+                payload = jl.parse_fenced_json(fb_res["message"])
+                if not isinstance(payload, list):
+                    jl.log(f"extraction output unparseable (task {fb_res['task_id']}); "
+                           f"offsets held; first 300 chars: {fb_res['message'][:300]!r}")
+                else:
+                    fallback = {}
+                    for p in payload:
+                        if not isinstance(p, dict):
+                            continue
+                        if not _looks_like_summary(p):
+                            # No shape gate existed here at all before — the
+                            # staged path's own `_looks_like_summary` gate
+                            # applies here too, not just there.
+                            jl.log(f"fallback entry for {p.get('session')!r} "
+                                   f"doesn't look like the extraction schema; skipped")
+                            continue
+                        fallback[p.get("session")] = p
+                    # Lenient fallback: with exactly one missing slice and one
+                    # returned entry, a mislabeled session key is still
+                    # obviously the answer.
+                    if len(missing) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
+                            and _looks_like_summary(payload[0]) \
+                            and missing[0]["sid"] not in fallback:
+                        fallback[missing[0]["sid"]] = {**payload[0], "session": missing[0]["sid"]}
+                    # Scope the merge to the sids this fallback dispatch was
+                    # actually asked about — an extra or mislabeled sid in
+                    # the response must not silently overwrite an
+                    # already-staged (tool-evidence-backed) summary for a
+                    # session outside `missing`.
+                    missing_sids = {s["sid"] for s in missing}
+                    by_session.update({sid: v for sid, v in fallback.items()
+                                       if sid in missing_sids})
         for s in group:
             item = by_session.get(s["sid"])
             if item is None:

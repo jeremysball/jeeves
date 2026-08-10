@@ -363,7 +363,7 @@ def task_log_message(tid: str):
 _PRIMARY_FAILURES: dict = {}
 
 
-def ferry(prompt: str, model: str, wait_s: int = 420) -> dict:
+def ferry(prompt: str, model: str, wait_s: int = 420, directory: str = "") -> dict:
     """Dispatch to `model`, falling back to the configured paid route once if
     the primary route fails outright (crash, timeout, empty output).
 
@@ -377,9 +377,9 @@ def ferry(prompt: str, model: str, wait_s: int = 420) -> dict:
     # guidance is to stop after 1-2 retries and switch routes, so honour that
     # per-run instead of re-paying the timeout on every batch.
     if fb and fb != model and _PRIMARY_FAILURES.get(model, 0) >= 2:
-        return _ferry_once(prompt, fb, wait_s)
+        return _ferry_once(prompt, fb, wait_s, directory)
 
-    res = _ferry_once(prompt, model, wait_s)
+    res = _ferry_once(prompt, model, wait_s, directory)
     if res["ok"]:
         _PRIMARY_FAILURES.pop(model, None)
         return res
@@ -389,7 +389,7 @@ def ferry(prompt: str, model: str, wait_s: int = 420) -> dict:
     if _PRIMARY_FAILURES[model] == 2:
         log(f"ferry: {model} failed twice; routing the rest of this run to {fb}")
     log(f"ferry: {model} failed ({res['error']}); retrying on {fb}")
-    alt = _ferry_once(prompt, fb, wait_s)
+    alt = _ferry_once(prompt, fb, wait_s, directory)
     if alt["ok"]:
         log(f"ferry: fallback {fb} succeeded")
         return alt
@@ -401,7 +401,7 @@ def ferry(prompt: str, model: str, wait_s: int = 420) -> dict:
     return {**res, "error": f"{model}: {res['error']}; {fb}: {alt['error']}"}
 
 
-def _ferry_once(prompt: str, model: str, wait_s: int = 420) -> dict:
+def _ferry_once(prompt: str, model: str, wait_s: int = 420, directory: str = "") -> dict:
     def fail(err, tid=""):
         return {"ok": False, "message": "", "task_id": tid, "error": err}
 
@@ -410,7 +410,26 @@ def _ferry_once(prompt: str, model: str, wait_s: int = 420) -> dict:
     # `--prompt -` reads from stdin, bypassing argv length limits that
     # would otherwise crash with [Errno 7] Argument list too long when
     # the synthesis prompt is large.
-    rc, out, err = _tf(["dispatch", "--prompt", "-", "--model", model], input=prompt)
+    args = ["dispatch", "--prompt", "-", "--model", model]
+    if directory:
+        # --no-overlay: the ferry gets ungated read-write access to whatever
+        # `directory` holds, with no accept/reject gate on what it writes
+        # back. That's only acceptable because every caller in this codebase
+        # passes collect.py's per-run staging subdir and nothing else — never
+        # a real project directory. The summary files need to land directly
+        # (that's the entire point: skip the accept/reject round-trip an
+        # overlay would need to extract them), and the input side is a
+        # scratch copy jeeves made for this dispatch, not a live source of
+        # truth. The blast radius of the ungated rw is bounded by what's
+        # already true of that directory on the collect.py side: contents are
+        # redacted before they're staged (`redact()`), the subdir is
+        # chmod 0700, and it's deleted the moment this dispatch returns
+        # (success or failure) rather than left for the next run's TTL
+        # prune. If a future caller ever wants to pass something other than
+        # a disposable staging dir here, that's the point to revisit this,
+        # not before.
+        args += ["--directory", directory, "--no-overlay"]
+    rc, out, err = _tf(args, input=prompt)
     m = re.search(r"oc_[a-z0-9_]+", out)
     if rc != 0 or not m:
         return fail(f"dispatch failed: {err or out}")
