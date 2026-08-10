@@ -271,7 +271,10 @@ def prune_staging(keep_h: int = 6) -> int:
     for d in staging_root().iterdir():
         if d.is_dir() and d.stat().st_mtime < cutoff:
             shutil.rmtree(d, ignore_errors=True)
-            n += 1
+            if d.exists():
+                jl.log(f"staging prune left {d} behind (rmtree failed)")
+            else:
+                n += 1
     return n
 
 
@@ -345,6 +348,24 @@ def extract_tools_prompt(group, staging: Path) -> str:
     return template.replace("{files_block}", "\n".join(rows))
 
 
+# The extraction schema from prompts/extract-tools.md. Used only for a
+# minimal shape check on what the ferry wrote — not full validation.
+_SUMMARY_FIELDS = {"session", "shipped", "oversaw", "loose_ends", "tangents",
+                   "overlooked", "failures", "shape"}
+_SUMMARY_LIST_FIELDS = _SUMMARY_FIELDS - {"session", "shape"}
+
+
+def _looks_like_summary(payload: dict) -> bool:
+    """Reject a JSON object that happens to parse but isn't shaped like the
+    extraction schema — an empty `{}`, or an unrelated blob (a mutation dict,
+    a stray tool-output object) shouldn't get written into the ledger as if
+    it were a real session summary."""
+    if not _SUMMARY_FIELDS & payload.keys():
+        return False
+    return all(isinstance(payload[k], list)
+               for k in _SUMMARY_LIST_FIELDS if k in payload)
+
+
 def read_staged_summaries(staging: Path, group) -> dict:
     """Collect per-session summary files the ferry wrote. A file that never
     appeared is absent from the result, never a stub — the caller decides
@@ -352,6 +373,12 @@ def read_staged_summaries(staging: Path, group) -> dict:
     out = {}
     for s in group:
         f = staging / f"summary-{s['sid']}.json"
+        if f.is_symlink():
+            # The ferry has rw access to this directory (--no-overlay); a
+            # symlink here could point the expected filename at a sensitive
+            # local file instead of a summary it actually wrote.
+            jl.log(f"staged summary for {s['sid']} is a symlink; refusing to read it")
+            continue
         if not f.exists():
             continue
         try:
@@ -361,8 +388,11 @@ def read_staged_summaries(staging: Path, group) -> dict:
             continue
         if isinstance(payload, list):  # a one-entry array is close enough
             payload = payload[0] if len(payload) == 1 else None
-        if isinstance(payload, dict):
+        if isinstance(payload, dict) and _looks_like_summary(payload):
             out[s["sid"]] = {**payload, "session": s["sid"]}
+        elif isinstance(payload, dict):
+            jl.log(f"staged summary for {s['sid']} doesn't look like the "
+                   f"extraction schema; skipped")
     return out
 
 
@@ -562,6 +592,9 @@ def run_once() -> dict:
         staging = staging_root() / f"{date}--{jl.now_et().strftime('%H%M%S')}--{gi}"
         try:
             staging.mkdir(parents=True, exist_ok=True)
+            staging.chmod(0o700)  # staging_root() locks the parent; this run's
+            # own subdir inherits the process umask (typically 0755) unless
+            # told otherwise — verbatim transcript copies, not world-readable.
             for s in group:
                 stage_slice(staging, s)
             res = jl.ferry(extract_tools_prompt(group, staging), cfg["model"],
@@ -570,6 +603,12 @@ def run_once() -> dict:
                 by_session = read_staged_summaries(staging, group)
         except OSError as e:
             jl.log(f"staging failed ({e}); falling back to the rendered-prose path")
+        finally:
+            # The TTL prune at the top of the next run would eventually get
+            # this, but there's no reason to leave a verbatim transcript copy
+            # sitting on disk for up to `keep_h` hours once this run is done
+            # reading it.
+            shutil.rmtree(staging, ignore_errors=True)
 
         # Fallback: the pre-staging dispatch, which passes a denoised prose
         # blob and reads the answer out of the final message.

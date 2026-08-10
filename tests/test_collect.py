@@ -422,6 +422,79 @@ def test_staging_is_pruned_transcript_copies_do_not_linger(tmp_path, monkeypatch
     assert not old.exists() and fresh.exists()
 
 
+def test_prune_staging_does_not_count_a_dir_rmtree_left_behind(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch)
+    old = cc.staging_root() / "2026-08-01--000000--0"
+    old.mkdir(parents=True)
+    _age(old, 48)
+    monkeypatch.setattr(cc.shutil, "rmtree", lambda *a, **k: None)  # simulate a failed rmtree
+    assert cc.prune_staging() == 0  # not counted as removed
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "rmtree failed" in log
+
+
+def test_run_once_leaves_no_staging_dir_after_a_successful_run(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["a", "b"])
+    staged = _staging_ferry(monkeypatch, "ses1")
+    cc.run_once()
+    assert staged["dir"] is not None and not staged["dir"].exists()
+
+
+def test_run_once_leaves_no_staging_dir_after_a_failed_run(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["a", "b"])
+    captured = {"dir": None}
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:
+            captured["dir"] = Path(directory)
+        return {"ok": False, "message": "", "task_id": "", "error": "crashed"}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    cc.run_once()
+    assert captured["dir"] is not None and not captured["dir"].exists()
+
+
+def test_run_once_staging_subdir_is_chmod_0700(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["a", "b"])
+    modes = []
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:
+            modes.append(oct(Path(directory).stat().st_mode)[-3:])
+        return {"ok": True, "task_id": "oc_1", "error": "",
+                "message": '```json\n[{"session": "ses1", "shipped": [], "oversaw": [], '
+                           '"loose_ends": [], "tangents": [], "overlooked": [], "shape": "s"}]\n```'}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    cc.run_once()
+    assert modes == ["700"]
+
+
+def test_read_staged_summaries_refuses_symlinks(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch)
+    staging = cc.staging_root() / "run"
+    staging.mkdir(parents=True)
+    target = tmp_path / "sensitive.json"
+    target.write_text(json.dumps({"secret": "leaked"}))
+    (staging / "summary-ses1.json").symlink_to(target)
+    out = cc.read_staged_summaries(staging, [{"sid": "ses1"}])
+    assert out == {}
+
+
+def test_read_staged_summaries_rejects_shapeless_payload(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch)
+    staging = cc.staging_root() / "run"
+    staging.mkdir(parents=True)
+    (staging / "summary-ses1.json").write_text(json.dumps({"unrelated": "blob"}))
+    out = cc.read_staged_summaries(staging, [{"sid": "ses1"}])
+    assert out == {}
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "doesn't look like the" in log
+
+
 def test_staged_content_is_redacted_before_it_leaves_the_host():
     cases = [
         ("ghp_abcdefghijklmnopqrstuvwxyz01", "ghp_"),
