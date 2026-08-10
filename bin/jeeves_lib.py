@@ -8,6 +8,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import NoReturn
 from unicodedata import normalize as unicodedata_normalize
 from zoneinfo import ZoneInfo
 
@@ -71,9 +72,7 @@ def load_config() -> dict:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = [s.strip() for s in line.split("=", 1)]
-            if k in cfg and isinstance(cfg[k], int):
-                v = int(v)
-            cfg[k] = v
+            cfg[k] = int(v) if k in cfg and isinstance(cfg[k], int) else v
     return cfg
 
 
@@ -83,7 +82,7 @@ def log(msg: str) -> None:
         fh.write(f"{now_et().isoformat(timespec='seconds')} {msg}\n")
 
 
-def die(msg: str) -> None:
+def die(msg: str) -> NoReturn:
     """Fail fast and loud."""
     log(f"FATAL {msg}")
     print(f"jeeves: {msg}", file=sys.stderr)

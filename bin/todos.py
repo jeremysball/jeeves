@@ -27,7 +27,7 @@ def ledger_path() -> Path:
 
 
 def parse_ledger(text: str) -> dict:
-    sections = {s: [] for s in SECTIONS}
+    sections: dict[str, list[str]] = {s: [] for s in SECTIONS}
     current = None
     for line in text.splitlines():
         if line.startswith("## "):
@@ -497,7 +497,7 @@ def _open_items(text: str) -> list:
     """Parse a loose checklist file into open items, joining wrapped
     continuation lines onto whichever item they physically follow — a
     continuation of a `[x]` (done) item is not a separate open item."""
-    items = []
+    items: list[str] = []
     cur_text = None
     cur_checked = None
 

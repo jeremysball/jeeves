@@ -8,7 +8,6 @@ pass.
 
 import subprocess
 
-import pytest
 
 import jeeves_lib as jl
 import todos as td
