@@ -1,7 +1,5 @@
 import json
-from pathlib import Path
 
-import pytest
 
 import jeeves_lib as jl
 import todos as td
@@ -135,8 +133,8 @@ def test_prune_ambiguous_done_lines_are_kept_not_dropped_as_moot(tmp_path, monke
     # The ledger line is no longer open, but it's duplicated in `done`, so a
     # human still needs to look -- the row must not be silently counted moot
     # and dropped from the queue just because a match exists somewhere.
-    p = _ledger(tmp_path, monkeypatch,
-                "# jeeves todo ledger\n\n## open\n\n## done\n- [x] dupe\n- [x] dupe\n\n## dismissed\n")
+    _ledger(tmp_path, monkeypatch,
+            "# jeeves todo ledger\n\n## open\n\n## done\n- [x] dupe\n- [x] dupe\n\n## dismissed\n")
     row = _row("- [x] dupe", "", None)
     td.save_pending([row])
     counts = td.prune_pending()
@@ -146,8 +144,8 @@ def test_prune_ambiguous_done_lines_are_kept_not_dropped_as_moot(tmp_path, monke
 
 def test_prune_queue_file_holds_exactly_the_kept_rows(tmp_path, monkeypatch):
     repo, _, unlanded = _git_repo(tmp_path)
-    p = _ledger(tmp_path, monkeypatch,
-                "# jeeves todo ledger\n\n## open\n- [ ] still open item (jeeves: loose-end, x, 2026-07-30)\n\n## done\n- [x] done item\n\n## dismissed\n")
+    _ledger(tmp_path, monkeypatch,
+            "# jeeves todo ledger\n\n## open\n- [ ] still open item (jeeves: loose-end, x, 2026-07-30)\n\n## done\n- [x] done item\n\n## dismissed\n")
     kept = _row("- [ ] still open item (jeeves: loose-end, x, 2026-07-30)",
                 f"commit {unlanded[:10]}", repo)
     moot = _row("- [ ] done item", "commit abc1234", None)
@@ -162,8 +160,8 @@ def test_prune_counts_sum_to_rows_held_before_call(tmp_path, monkeypatch):
     # The four counts must be internally consistent: they add up to the number
     # of rows the queue held before the call.
     repo, _, unlanded = _git_repo(tmp_path)
-    p = _ledger(tmp_path, monkeypatch,
-                "# jeeves todo ledger\n\n## open\n- [ ] still open item (jeeves: loose-end, x, 2026-07-30)\n\n## done\n- [x] done item\n\n## dismissed\n")
+    _ledger(tmp_path, monkeypatch,
+            "# jeeves todo ledger\n\n## open\n- [ ] still open item (jeeves: loose-end, x, 2026-07-30)\n\n## done\n- [x] done item\n\n## dismissed\n")
     rows = [
         _row("- [ ] still open item (jeeves: loose-end, x, 2026-07-30)",
              f"commit {unlanded[:10]}", repo),
