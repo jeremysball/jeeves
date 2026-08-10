@@ -443,9 +443,12 @@ def test_staged_summary_file_beats_the_final_message(tmp_path, monkeypatch):
     def fake_ferry(prompt, model, wait_s=420, directory=""):
         if directory:
             (Path(directory) / "summary-ses1.json").write_text(json.dumps(
-                {"session": "ses1", "shape": "from the file"}))
+                {"session": "ses1", "shipped": [], "oversaw": [], "loose_ends": [],
+                 "tangents": [], "overlooked": [], "shape": "from the file"}))
         return {"ok": True, "task_id": "oc_1", "error": "",
-                "message": '```json\n[{"session": "ses1", "shape": "from the message"}]\n```'}
+                "message": '```json\n[{"session": "ses1", "shipped": [], "oversaw": [], '
+                           '"loose_ends": [], "tangents": [], "overlooked": [], '
+                           '"shape": "from the message"}]\n```'}
 
     monkeypatch.setattr(jl, "ferry", fake_ferry)
     counts = cc.run_once()
@@ -462,7 +465,9 @@ def test_falls_back_to_prose_when_no_summary_file_appears(tmp_path, monkeypatch)
     def fake_ferry(prompt, model, wait_s=420, directory=""):
         seen.append(bool(directory))
         return {"ok": True, "task_id": "oc_1", "error": "",
-                "message": '```json\n[{"session": "ses1", "shape": "from the message"}]\n```'}
+                "message": '```json\n[{"session": "ses1", "shipped": [], "oversaw": [], '
+                           '"loose_ends": [], "tangents": [], "overlooked": [], '
+                           '"shape": "from the message"}]\n```'}
 
     monkeypatch.setattr(jl, "ferry", fake_ferry)
     counts = cc.run_once()
@@ -609,3 +614,143 @@ def test_stage_slice_redacts_and_locks_down_permissions(tmp_path, monkeypatch):
     body = f.read_text()
     assert "ghp_abcdefghijklmnopqrstuvwxyz01" not in body and "[REDACTED]" in body
     assert oct(f.stat().st_mode)[-3:] == "600"
+
+
+def test_redact_dsn_password_containing_an_at_sign():
+    # the password itself contains '@' — the old regex stopped at the first
+    # one, leaking everything after it.
+    raw = "DATABASE_URL=postgres://user:p@ss@db.internal:5432/app"
+    out = cc.redact(raw)
+    assert out == "DATABASE_URL=postgres://user:[REDACTED]@db.internal:5432/app"
+
+
+def test_redact_pem_encrypted_and_pgp_key_blocks():
+    for header in ("ENCRYPTED PRIVATE KEY", "PGP PRIVATE KEY BLOCK"):
+        raw = f"-----BEGIN {header}-----\nMIIBfakekeymaterial\n-----END {header}-----"
+        out = cc.redact(raw)
+        assert "MIIBfakekeymaterial" not in out, f"leaked from {header!r} block -> {out!r}"
+        assert "[REDACTED]" in out
+
+
+def test_redact_value_with_embedded_backslash():
+    # a literal backslash inside the secret value (not an escaped quote)
+    # used to truncate the match early and leak the remainder.
+    assert "cd" not in cc.redact("PASSWORD=ab\\cd")
+    out = cc.redact('PASSWORD="ab\\cd"')
+    assert "ab\\cd" not in out and "[REDACTED]" in out
+
+
+def test_redact_basic_auth_header_credential():
+    raw = "curl -H 'Authorization: Basic dXNlcjpwYXNzd29yZA==' https://api.example.com"
+    out = cc.redact(raw)
+    assert "dXNlcjpwYXNzd29yZA==" not in out
+
+
+def test_redact_leaves_keyword_lookalikes_alone():
+    # "auth"/"token" as a substring of an unrelated word must not trigger —
+    # only a real compound key (an underscore/camelCase boundary, or the
+    # keyword standing alone before ':'/'=') should.
+    for keep in ("Author: Jane Doe <js@example.com>",
+                 "tokenizer=1024 tokens used",
+                 "git log --author=jane"):
+        assert cc.redact(keep) == keep, f"false-positive redaction of {keep!r}"
+    # compound names must still redact
+    assert "abc123" not in cc.redact("myAuthToken=abc123")
+    assert "SECRETVALUE" not in cc.redact("AWS_SECRET_ACCESS_KEY=AKIAWXYZ0123SECRETVALUE")
+
+
+def test_looks_like_summary_rejects_a_session_only_stub():
+    # a crashed/partial write with just {"session": "ses1"} has nothing to
+    # typecheck, so the old intersection-only check passed it as complete.
+    assert not cc._looks_like_summary({"session": "ses1"})
+    assert not cc._looks_like_summary({"session": "ses1", "shape": "s"})
+
+
+def test_read_staged_summaries_rejects_a_sid_mismatch(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch)
+    staging = cc.staging_root() / "run"
+    staging.mkdir(parents=True)
+    # filed under ses1's expected name, but the payload's own "session"
+    # field says ses2 — a mislabeled/swapped-content file.
+    (staging / "summary-ses1.json").write_text(json.dumps(
+        {"session": "ses2", "shipped": [], "oversaw": [], "loose_ends": [],
+         "tangents": [], "overlooked": [], "shape": "s"}))
+    out = cc.read_staged_summaries(staging, [{"sid": "ses1"}])
+    assert out == {}
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "ses1" in log and "ses2" in log
+
+
+def test_run_once_logs_when_the_per_run_staging_rmtree_fails(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["a", "b"])
+    monkeypatch.setattr(cc.shutil, "rmtree", lambda *a, **k: None)  # simulate a failed rmtree
+    staged = _staging_ferry(monkeypatch, "ses1")
+    cc.run_once()
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "rmtree failed" in log
+    assert staged["dir"] is not None and staged["dir"].exists()  # left behind, as logged
+
+
+def test_fallback_merge_is_scoped_to_the_missing_sids(tmp_path, monkeypatch):
+    """A prose-fallback response that echoes a sid outside `missing` must not
+    clobber that sid's already-staged (tool-evidence-backed) summary."""
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    root = tmp_path / "projects"
+    _mk_session(root, "-home-x-proj1", "ses1", ["a", "b"])
+    _mk_session(root, "-home-x-proj1", "ses2", ["c", "d"])
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:  # staged path: only ses1 gets a summary file
+            (Path(directory) / "summary-ses1.json").write_text(json.dumps(
+                {"session": "ses1", "shipped": [], "oversaw": [], "loose_ends": [],
+                 "tangents": [], "overlooked": [], "failures": [], "shape": "staged"}))
+            return {"ok": True, "task_id": "oc_staged", "error": "", "message": "Status: DONE"}
+        # fallback (asked only about ses2) misbehaves and also echoes ses1
+        # with weaker content — must not overwrite the staged ses1 summary.
+        return {"ok": True, "task_id": "oc_fb", "error": "",
+                "message": '```json\n[{"session": "ses2", "shipped": [], "oversaw": [], '
+                           '"loose_ends": [], "tangents": [], "overlooked": [], "shape": "prose"}, '
+                           '{"session": "ses1", "shipped": [], "oversaw": [], "loose_ends": [], '
+                           '"tangents": [], "overlooked": [], "shape": "prose-clobber"}]\n```'}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    cc.run_once()
+    s1 = next((tmp_path / "state" / "summaries").rglob("*--ses1--*.md")).read_text()
+    assert "staged" in s1 and "prose-clobber" not in s1
+
+
+def test_fallback_path_rejects_a_shapeless_response(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["a", "b"])
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:
+            return {"ok": True, "task_id": "oc_staged", "error": "", "message": "Status: DONE"}
+        return {"ok": True, "task_id": "oc_fb", "error": "",
+                "message": '```json\n[{"session": "ses1", "unrelated": "blob"}]\n```'}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    counts = cc.run_once()
+    assert counts["failed"] == 1  # held for retry, not written as a real summary
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "doesn't look like the" in log
+
+
+def test_fallback_path_content_is_redacted(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1",
+                ["GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz01"])
+    captured = {"prompt": None}
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:
+            return {"ok": False, "task_id": "", "error": "crashed", "message": ""}
+        if "[SESSION" in prompt:
+            captured["prompt"] = prompt
+        return {"ok": True, "task_id": "oc_fb", "error": "", "message": '```json\n[]\n```'}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    cc.run_once()
+    assert captured["prompt"] is not None
+    assert "ghp_abcdefghijklmnopqrstuvwxyz01" not in captured["prompt"]

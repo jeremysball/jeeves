@@ -252,7 +252,12 @@ def extract_prompt(group) -> str:
     template = (PROMPTS / "extract-rubric.md").read_text()
     blocks = []
     for s in group:
-        blocks.append(f"[SESSION {s['sid']} — project {Path(s['dir']).name}]\n{s['rendered']}")
+        # Denoised prose is far less likely to carry a raw secret than the
+        # staged path's unfiltered tool output, but it's not impossible (a
+        # user pasting a token into chat, an error message echoing one) —
+        # this path gets none of the staged path's redaction otherwise.
+        blocks.append(f"[SESSION {s['sid']} — project {Path(s['dir']).name}]\n"
+                      f"{redact(s['rendered'])}")
     return template.replace("{slices_block}", "\n\n---\n\n".join(blocks))
 
 
@@ -293,28 +298,44 @@ SECRET_RES = [
     re.compile(r"\b(xox[a-z](?:\.[a-z]+)?-[A-Za-z0-9-]{10,})"),
     re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),
     re.compile(r"\b(AIza[0-9A-Za-z_-]{30,})"),
-    re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]{20,}={0,2}"),
+    re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/-]{16,}={0,2}"),
     # PEM/SSH private key blocks — the BEGIN/END markers alone are signal
-    # enough to redact the whole thing, body included.
-    re.compile(r"-----BEGIN ((?:RSA |EC |OPENSSH |DSA |)PRIVATE KEY)-----"
+    # enough to redact the whole thing, body included. Two separate patterns:
+    # the `... PRIVATE KEY` family (RSA/EC/OPENSSH/DSA/ENCRYPTED/unlabeled)
+    # shares a `-----END <label> PRIVATE KEY-----` marker; PGP's block has a
+    # different suffix (`PRIVATE KEY BLOCK`, no bare "PRIVATE KEY" marker).
+    re.compile(r"-----BEGIN ((?:RSA |EC |OPENSSH |DSA |ENCRYPTED |)PRIVATE KEY)-----"
+               r"[\s\S]*?-----END \1-----"),
+    re.compile(r"-----BEGIN (PGP PRIVATE KEY BLOCK)-----"
                r"[\s\S]*?-----END \1-----"),
     # `scheme://user:pass@host` connection strings (DATABASE_URL, a raw
-    # psql/mysql DSN). Only the password half is masked; scheme/user stay
-    # for context.
-    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@\"']+:)([^\s/@\"'\\]+)(?=@)"),
+    # psql/mysql DSN). Only the password half is masked; scheme/user stay for
+    # context. The value group allows `@` (greedy, so it backtracks to the
+    # rightmost `@` before the lookahead succeeds) — a password containing
+    # its own `@` used to truncate the match at the first one, leaking the
+    # remainder.
+    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@\"']+:)([^\s/\"'\\]+)(?=@)"),
     # No `\b` in front: `_` is a word character, so a boundary would never
     # match the `API_KEY` inside `OPENAI_API_KEY`, which is exactly the shape
     # these turn up in. The key is `[\w.-]*<keyword>[\w.-]*` rather than the
     # bare keyword, so `AWS_SECRET_ACCESS_KEY`, `_authToken`, and
     # `PGPASSWORD`/`MYSQL_PWD` all match too, not just an exact
-    # `secret`/`token`/`password`. Quotes allow an optional leading `\` —
-    # `stage_slice` writes raw JSON-escaped bytes, so a quoted value on disk
-    # reads `\"value\"`, not `"value"`. No floor on the value length: a
-    # short real secret is worth redacting more than a floor is worth
-    # avoiding one false positive.
+    # `secret`/`token`/`password`. `(?![a-z])` right after the keyword blocks
+    # the mirror-image false positive — a keyword that's really the start of
+    # an unrelated lowercase word (`Author:`, `tokenizer=`) — while still
+    # allowing a real compound continuation (`_authToken`'s `T`, `_ACCESS_KEY`'s
+    # `_`) or the keyword standing alone. `pwd` alone (bare `PWD=`, the shell
+    # env var) still matches on purpose: a missed real credential costs more
+    # than an over-redacted directory path. Quotes allow an optional leading
+    # `\` — `stage_slice` writes raw JSON-escaped bytes, so a quoted value on
+    # disk reads `\"value\"`, not `"value"`. The value group allows a literal
+    # backslash (only an unescaped quote ends it) — excluding backslash used
+    # to truncate the match at the first one inside the value, leaking the
+    # rest. No floor on the value length: a short real secret is worth
+    # redacting more than a floor is worth avoiding one false positive.
     re.compile(r"(?i)(?<![A-Za-z0-9])([\w.-]*(?:api[_-]?key|secret|token|password"
-               r"|passwd|pwd|credential|auth)[\w.-]*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
-               r"([^\s\"'\\]+)"),
+               r"|passwd|pwd|credential|auth)(?![a-z])[\w.-]*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
+               r"([^\s\"']+)"),
 ]
 
 
@@ -359,8 +380,12 @@ def _looks_like_summary(payload: dict) -> bool:
     """Reject a JSON object that happens to parse but isn't shaped like the
     extraction schema — an empty `{}`, or an unrelated blob (a mutation dict,
     a stray tool-output object) shouldn't get written into the ledger as if
-    it were a real session summary."""
-    if not _SUMMARY_FIELDS & payload.keys():
+    it were a real session summary. Checked against `_SUMMARY_LIST_FIELDS`
+    (not the full field set) so a stub carrying only `session`/`shape` — the
+    two non-list fields — and nothing else doesn't pass: there'd be nothing
+    left for the `isinstance(..., list)` check below to actually typecheck,
+    the same failure mode an all-`session` intersection has."""
+    if not _SUMMARY_LIST_FIELDS & payload.keys():
         return False
     return all(isinstance(payload[k], list)
                for k in _SUMMARY_LIST_FIELDS if k in payload)
@@ -388,9 +413,19 @@ def read_staged_summaries(staging: Path, group) -> dict:
             continue
         if isinstance(payload, list):  # a one-entry array is close enough
             payload = payload[0] if len(payload) == 1 else None
-        if isinstance(payload, dict) and _looks_like_summary(payload):
+        if not isinstance(payload, dict):
+            continue
+        own_sid = payload.get("session")
+        if own_sid is not None and own_sid != s["sid"]:
+            # The filename says one sid, the payload's own `"session"` field
+            # says another — a mislabeled or swapped-content file. Silently
+            # relabeling it to the filename's sid (the old behavior) hides a
+            # real mismatch instead of surfacing it.
+            jl.log(f"staged summary filename says {s['sid']} but payload's "
+                   f"own \"session\" field says {own_sid!r}; skipped")
+        elif _looks_like_summary(payload):
             out[s["sid"]] = {**payload, "session": s["sid"]}
-        elif isinstance(payload, dict):
+        else:
             jl.log(f"staged summary for {s['sid']} doesn't look like the "
                    f"extraction schema; skipped")
     return out
@@ -609,6 +644,8 @@ def run_once() -> dict:
             # sitting on disk for up to `keep_h` hours once this run is done
             # reading it.
             shutil.rmtree(staging, ignore_errors=True)
+            if staging.exists():
+                jl.log(f"staging cleanup left {staging} behind (rmtree failed)")
 
         # Fallback: for whatever sessions the staged path didn't cover (all
         # of them, if staging failed outright or wrote no files; a subset,
@@ -640,14 +677,33 @@ def run_once() -> dict:
                     jl.log(f"extraction output unparseable (task {fb_res['task_id']}); "
                            f"offsets held; first 300 chars: {fb_res['message'][:300]!r}")
                 else:
-                    fallback = {p.get("session"): p for p in payload if isinstance(p, dict)}
+                    fallback = {}
+                    for p in payload:
+                        if not isinstance(p, dict):
+                            continue
+                        if not _looks_like_summary(p):
+                            # No shape gate existed here at all before — the
+                            # staged path's own `_looks_like_summary` gate
+                            # applies here too, not just there.
+                            jl.log(f"fallback entry for {p.get('session')!r} "
+                                   f"doesn't look like the extraction schema; skipped")
+                            continue
+                        fallback[p.get("session")] = p
                     # Lenient fallback: with exactly one missing slice and one
                     # returned entry, a mislabeled session key is still
                     # obviously the answer.
                     if len(missing) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
+                            and _looks_like_summary(payload[0]) \
                             and missing[0]["sid"] not in fallback:
                         fallback[missing[0]["sid"]] = {**payload[0], "session": missing[0]["sid"]}
-                    by_session.update(fallback)
+                    # Scope the merge to the sids this fallback dispatch was
+                    # actually asked about — an extra or mislabeled sid in
+                    # the response must not silently overwrite an
+                    # already-staged (tool-evidence-backed) summary for a
+                    # session outside `missing`.
+                    missing_sids = {s["sid"] for s in missing}
+                    by_session.update({sid: v for sid, v in fallback.items()
+                                       if sid in missing_sids})
         for s in group:
             item = by_session.get(s["sid"])
             if item is None:
