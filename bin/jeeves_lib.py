@@ -401,9 +401,22 @@ def _ferry_once(prompt: str, model: str, wait_s: int = 420, directory: str = "")
     # the synthesis prompt is large.
     args = ["dispatch", "--prompt", "-", "--model", model]
     if directory:
-        # --no-overlay because the staging dir is scratch jeeves owns: the
-        # ferry's summary files land directly instead of needing an
-        # accept/reject round-trip to extract them.
+        # --no-overlay: the ferry gets ungated read-write access to whatever
+        # `directory` holds, with no accept/reject gate on what it writes
+        # back. That's only acceptable because every caller in this codebase
+        # passes collect.py's per-run staging subdir and nothing else — never
+        # a real project directory. The summary files need to land directly
+        # (that's the entire point: skip the accept/reject round-trip an
+        # overlay would need to extract them), and the input side is a
+        # scratch copy jeeves made for this dispatch, not a live source of
+        # truth. The blast radius of the ungated rw is bounded by what's
+        # already true of that directory on the collect.py side: contents are
+        # redacted before they're staged (`redact()`), the subdir is
+        # chmod 0700, and it's deleted the moment this dispatch returns
+        # (success or failure) rather than left for the next run's TTL
+        # prune. If a future caller ever wants to pass something other than
+        # a disposable staging dir here, that's the point to revisit this,
+        # not before.
         args += ["--directory", directory, "--no-overlay"]
     rc, out, err = _tf(args, input=prompt)
     m = re.search(r"oc_[a-z0-9_]+", out)
