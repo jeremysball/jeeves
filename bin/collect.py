@@ -412,7 +412,16 @@ def read_staged_summaries(staging: Path, group) -> dict:
             jl.log(f"staged summary unreadable for {s['sid']}: {e}")
             continue
         if isinstance(payload, list):  # a one-entry array is close enough
-            payload = payload[0] if len(payload) == 1 else None
+            list_len = len(payload)
+            payload = payload[0] if list_len == 1 else None
+            if payload is not None and not isinstance(payload, dict):
+                jl.log(f"staged summary for {s['sid']} is a one-item list of "
+                       f"a non-dict ({type(payload).__name__}); skipped")
+                continue
+            if payload is None:
+                jl.log(f"staged summary for {s['sid']} is a list of length "
+                       f"{list_len}, expected exactly one; skipped")
+                continue
         if not isinstance(payload, dict):
             continue
         own_sid = payload.get("session")

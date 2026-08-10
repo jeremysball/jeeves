@@ -681,6 +681,19 @@ def test_read_staged_summaries_rejects_a_sid_mismatch(tmp_path, monkeypatch):
     assert "ses1" in log and "ses2" in log
 
 
+def test_read_staged_summaries_logs_a_malformed_list_payload(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch)
+    staging = cc.staging_root() / "run"
+    staging.mkdir(parents=True)
+    # a list of length != 1 falls through both isinstance(dict) branches —
+    # previously silent, the session just looked "missing" with no trace.
+    (staging / "summary-ses1.json").write_text(json.dumps([{"a": 1}, {"b": 2}]))
+    out = cc.read_staged_summaries(staging, [{"sid": "ses1"}])
+    assert out == {}
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "ses1" in log and "list" in log.lower()
+
+
 def test_run_once_logs_when_the_per_run_staging_rmtree_fails(tmp_path, monkeypatch):
     _env_carry(tmp_path, monkeypatch, trivial_min=1)
     _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["a", "b"])
