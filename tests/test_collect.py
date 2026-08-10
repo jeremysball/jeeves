@@ -429,9 +429,21 @@ def test_staged_content_is_redacted_before_it_leaves_the_host():
         ("sk-proj-abcdefghijklmnopqrstuvwx", "sk-"),
         ("AKIAIOSFODNN7EXAMPLE", "AKIA"),
         ("xoxb-1234567890-abcdefghij", "xoxb-"),
+        ("xoxe-notarealtoken-fakevalue", "xoxe-"),
+        ("xoxe.xoxp-notarealtoken-fakevalue", "xoxp-"),
         ("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "eyJhbG"),
         ('OPENAI_API_KEY="hunter2hunter2"', "hunter2"),
         ("password: correct-horse-battery", "correct-horse"),
+        # multi-segment / camelCase key names, not just the bare keyword
+        ("AWS_SECRET_ACCESS_KEY=AKIAWXYZ0123SECRETVALUE", "SECRETVALUE"),
+        ("myAuthToken=abc123def456", "abc123def456"),
+        ("PGPASSWORD=hi", "hi"),  # under the old 8-char floor
+        ("MYSQL_PWD=short1", "short1"),
+        # DATABASE_URL / raw DSN with embedded creds
+        ("DATABASE_URL=postgres://user:hunterpass@db.internal:5432/app", "hunterpass"),
+        # PEM private key block
+        ("-----BEGIN OPENSSH PRIVATE KEY-----\nAAAABBBBCCCC\n-----END OPENSSH PRIVATE KEY-----",
+         "AAAABBBBCCCC"),
     ]
     for raw, leaked in cases:
         out = cc.redact(raw)
@@ -440,6 +452,16 @@ def test_staged_content_is_redacted_before_it_leaves_the_host():
     # ordinary transcript content survives untouched
     keep = 'commit abc1234 shipped it; ran `npm test`, 1138 passed'
     assert cc.redact(keep) == keep
+
+
+def test_redact_handles_json_escaped_quotes():
+    # stage_slice writes raw JSONL bytes: a `KEY="value"` that appeared
+    # inside a JSON string field is escaped on disk as `KEY=\"value\"`
+    # (backslash then quote), not the bare unescaped form.
+    raw = 'OPENAI_API_KEY=\\"hunter2hunter2\\"'
+    out = cc.redact(raw)
+    assert "hunter2hunter2" not in out
+    assert "[REDACTED]" in out
 
 
 def test_stage_slice_redacts_and_locks_down_permissions(tmp_path, monkeypatch):

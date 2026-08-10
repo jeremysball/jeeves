@@ -284,15 +284,34 @@ SECRET_RES = [
     re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,})"),
     re.compile(r"\b(github_pat_[A-Za-z0-9_]{20,})"),
     re.compile(r"\b(sk-[A-Za-z0-9_-]{16,})"),
-    re.compile(r"\b(xox[abprs]-[A-Za-z0-9-]{10,})"),
+    # `xox[a-z]` rather than a fixed letter class, so a Slack token family
+    # added later — `xoxe-` (workspace token), the `xoxe.xoxp-` compound
+    # refresh-token shape — is covered without another edit here.
+    re.compile(r"\b(xox[a-z](?:\.[a-z]+)?-[A-Za-z0-9-]{10,})"),
     re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),
     re.compile(r"\b(AIza[0-9A-Za-z_-]{30,})"),
     re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]{20,}={0,2}"),
+    # PEM/SSH private key blocks — the BEGIN/END markers alone are signal
+    # enough to redact the whole thing, body included.
+    re.compile(r"-----BEGIN ((?:RSA |EC |OPENSSH |DSA |)PRIVATE KEY)-----"
+               r"[\s\S]*?-----END \1-----"),
+    # `scheme://user:pass@host` connection strings (DATABASE_URL, a raw
+    # psql/mysql DSN). Only the password half is masked; scheme/user stay
+    # for context.
+    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@\"']+:)([^\s/@\"'\\]+)(?=@)"),
     # No `\b` in front: `_` is a word character, so a boundary would never
     # match the `API_KEY` inside `OPENAI_API_KEY`, which is exactly the shape
-    # these turn up in.
-    re.compile(r"(?i)(?<![A-Za-z0-9])((?:api[_-]?key|secret|token|password|passwd)"
-               r"[\"']?\s*[:=]\s*[\"']?)([^\s\"',]{8,})"),
+    # these turn up in. The key is `[\w.-]*<keyword>[\w.-]*` rather than the
+    # bare keyword, so `AWS_SECRET_ACCESS_KEY`, `_authToken`, and
+    # `PGPASSWORD`/`MYSQL_PWD` all match too, not just an exact
+    # `secret`/`token`/`password`. Quotes allow an optional leading `\` —
+    # `stage_slice` writes raw JSON-escaped bytes, so a quoted value on disk
+    # reads `\"value\"`, not `"value"`. No floor on the value length: a
+    # short real secret is worth redacting more than a floor is worth
+    # avoiding one false positive.
+    re.compile(r"(?i)(?<![A-Za-z0-9])([\w.-]*(?:api[_-]?key|secret|token|password"
+               r"|passwd|pwd|credential|auth)[\w.-]*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
+               r"([^\s\"'\\]+)"),
 ]
 
 
