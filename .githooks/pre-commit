@@ -1,0 +1,35 @@
+#!/bin/sh
+# jeeves pre-commit hook: lint + typecheck staged Python.
+#
+# 1. ruff catches syntax errors, unused imports, and style issues on the
+#    staged files themselves.
+# 2. mypy type-checks bin/ (whole-directory: type inference needs full import
+#    context, not just the staged files — bin/*.py import each other flatly,
+#    e.g. `import jeeves_lib as jl`).
+# Full pytest runs in CI only (.github/workflows/check.yml) -- it's the
+# authoritative gate, not something every commit needs to pay for locally.
+#
+# Bypass in a pinch with `git commit --no-verify`.
+
+files=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+[ -z "$files" ] && exit 0
+
+fail=0
+
+# --- 1. ruff (staged files only, fast) ---
+# shellcheck disable=SC2086
+if ! uv run ruff check $files; then
+  fail=1
+fi
+
+# --- 2. mypy (whole bin/, for import-graph correctness) ---
+if ! uv run mypy bin; then
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo
+  echo "Commit blocked by pre-commit: fix the error(s) above."
+  echo "(Run \`uv run pytest -q\` for tests; \`git commit --no-verify\` to bypass.)"
+  exit 1
+fi
