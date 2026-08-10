@@ -69,15 +69,21 @@ def test_run_once_happy_path(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     root = tmp_path / "projects"
     _mk_session(root, "-home-x-proj1", "ses1", ["did the thing", "shipped it"])
-    extracted = {"ok": True, "task_id": "oc_t_1", "error": "",
-                 "message": '```json\n[{"session": "ses1", "shipped": [{"item": "thing", "evidence": "file f.txt"}], "oversaw": [], "loose_ends": ["edge trim"], "tangents": [], "overlooked": [], "shape": "short focused"}]\n```\nStatus: DONE'}
     digest = {"ok": True, "task_id": "oc_t_2", "error": "",
               "message": '```markdown\n# jeeves digest — D\n**Shipped**\n- thing\n```\n```json\n[{"op": "add", "line": "edge trim", "kind": "loose-end", "source": "proj1", "repo": null}]\n```\nStatus: DONE'}
     calls = []
 
     def fake_ferry(prompt, model, wait_s=420, directory=""):
         calls.append(prompt)
-        return extracted if len(calls) == 1 else digest
+        if directory:  # the staged path — write the summary file directly,
+            # the real ferry contract, so this test actually exercises
+            # extraction instead of the prose fallback swallowing it.
+            (Path(directory) / "summary-ses1.json").write_text(json.dumps(
+                {"session": "ses1", "shipped": [{"item": "thing", "evidence": "file f.txt"}],
+                 "oversaw": [], "loose_ends": ["edge trim"], "tangents": [],
+                 "overlooked": [], "failures": [], "shape": "short focused"}))
+            return {"ok": True, "task_id": "oc_t_1", "error": "", "message": "Status: DONE"}
+        return digest  # the synthesis dispatch — no directory
 
     monkeypatch.setattr(jl, "ferry", fake_ferry)
     monkeypatch.setattr(cc, "tf_diff", lambda: "(test notes)")  # never shell out in tests
@@ -86,7 +92,8 @@ def test_run_once_happy_path(tmp_path, monkeypatch):
     assert counts["digest"] == 1
     # summary + digest files landed
     state = tmp_path / "state"
-    assert list((state / "summaries").rglob("*.md"))
+    summary = next((state / "summaries").rglob("*--ses1--*.md")).read_text()
+    assert "short focused" in summary  # extraction path actually exercised
     assert list((state / "digests").glob("*.md"))
     # mutation applied to ledger
     assert "edge trim" in (tmp_path / "data" / "todo.md").read_text()
