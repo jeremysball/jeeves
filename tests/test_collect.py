@@ -297,6 +297,61 @@ def test_missing_session_block_holds_offset_for_retry(tmp_path, monkeypatch):
     assert not any("ses2" in k for k in held)  # ses2 retries next run
 
 
+def test_partial_staged_summary_falls_back_only_for_the_missing_session(tmp_path, monkeypatch):
+    """The staged ferry covered one session in the batch but not the other —
+    the prose fallback should retry only the uncovered one, not the whole
+    batch (the previous all-or-nothing bug this replaces)."""
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    root = tmp_path / "projects"
+    _mk_session(root, "-home-x-proj1", "ses1", ["a", "b"])
+    _mk_session(root, "-home-x-proj1", "ses2", ["c", "d"])
+    fallback_prompts = []
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:  # staged path: only ses1 gets a summary file written
+            (Path(directory) / "summary-ses1.json").write_text(json.dumps(
+                {"session": "ses1", "shipped": [], "oversaw": [], "loose_ends": [],
+                 "tangents": [], "overlooked": [], "failures": [], "shape": "staged"}))
+            return {"ok": True, "task_id": "oc_staged", "error": "", "message": "Status: DONE"}
+        fallback_prompts.append(prompt)  # prose fallback: only ses2 should be asked for
+        return {"ok": True, "task_id": "oc_fb", "error": "",
+                "message": '```json\n[{"session": "ses2", "shipped": [], "oversaw": [], '
+                           '"loose_ends": [], "tangents": [], "overlooked": [], "shape": "prose"}]\n```'}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    counts = cc.run_once()
+    assert counts["extracted"] == 2 and counts["failed"] == 0
+    # one of the two no-directory calls is the extraction fallback, the other
+    # is digest synthesis — only the extraction one is shaped like a labeled
+    # session slice, and it should ask for ses2 only, never ses1.
+    extraction_prompts = [p for p in fallback_prompts if "[SESSION" in p]
+    assert len(extraction_prompts) == 1
+    assert "SESSION ses1" not in extraction_prompts[0]
+    assert "SESSION ses2" in extraction_prompts[0]
+    s1 = next((tmp_path / "state" / "summaries").rglob("*--ses1--*.md")).read_text()
+    s2 = next((tmp_path / "state" / "summaries").rglob("*--ses2--*.md")).read_text()
+    assert "staged" in s1  # ses1 came from the staged path, not re-dispatched
+    assert "prose" in s2   # ses2 came from the fallback
+
+
+def test_staged_dispatch_failure_is_logged(tmp_path, monkeypatch):
+    _env_carry(tmp_path, monkeypatch, trivial_min=1)
+    root = tmp_path / "projects"
+    _mk_session(root, "-home-x-proj1", "ses1", ["a", "b"])
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:
+            return {"ok": False, "message": "", "task_id": "", "error": "staging dispatch crashed"}
+        return {"ok": True, "task_id": "oc_fb", "error": "",
+                "message": '```json\n[{"session": "ses1", "shipped": [], "oversaw": [], '
+                           '"loose_ends": [], "tangents": [], "overlooked": [], "shape": "prose"}]\n```'}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    cc.run_once()
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "staged dispatch failed" in log and "staging dispatch crashed" in log
+
+
 def test_flag_refs_does_not_match_inside_a_longer_sibling_name(monkeypatch):
     # `\b` sits between a word char and `-`, so a plain \bcatbow\b would
     # match inside `catbow-tools` and judge it against catbow's numbering

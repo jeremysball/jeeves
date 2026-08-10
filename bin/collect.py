@@ -610,30 +610,44 @@ def run_once() -> dict:
             # reading it.
             shutil.rmtree(staging, ignore_errors=True)
 
-        # Fallback: the pre-staging dispatch, which passes a denoised prose
-        # blob and reads the answer out of the final message.
-        if not by_session:
-            if res is not None and res["ok"]:
+        # Fallback: for whatever sessions the staged path didn't cover (all
+        # of them, if staging failed outright or wrote no files; a subset,
+        # if the ferry only got partway through the batch), retry on the
+        # pre-staging dispatch, which passes a denoised prose blob and reads
+        # the answer out of the final message. A session the staged path DID
+        # cover is never re-dispatched — falling back per-session, not
+        # all-or-nothing, so one uncovered session in an otherwise-successful
+        # batch doesn't cost every session in it a retry.
+        missing = [s for s in group if s["sid"] not in by_session]
+        if missing:
+            if res is not None and res["ok"] and by_session:
+                jl.log(f"staged run covered {sorted(by_session)}, missing "
+                       f"{[s['sid'] for s in missing]}; retrying those on the "
+                       f"rendered-prose path")
+            elif res is not None and res["ok"]:
                 jl.log(f"staged run wrote no summary files (task {res['task_id']}); "
                        f"retrying on the rendered-prose path")
-            res = jl.ferry(extract_prompt(group), cfg["model"])
-            if not res["ok"]:
-                counts["failed"] += len(group)
-                jl.log(f"extraction failed ({res['error']}); offsets held for retry: "
-                       f"{[s['sid'] for s in group]}")
-                continue  # offsets NOT advanced — retry next run
-            payload = jl.parse_fenced_json(res["message"])
-            if not isinstance(payload, list):
-                counts["failed"] += len(group)
-                jl.log(f"extraction output unparseable (task {res['task_id']}); "
-                       f"offsets held; first 300 chars: {res['message'][:300]!r}")
-                continue
-            by_session = {p.get("session"): p for p in payload if isinstance(p, dict)}
-            # Lenient fallback: with exactly one slice and one returned entry,
-            # a mislabeled session key is still obviously the answer.
-            if len(group) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
-                    and group[0]["sid"] not in by_session:
-                by_session[group[0]["sid"]] = {**payload[0], "session": group[0]["sid"]}
+            elif res is not None and not res["ok"]:
+                jl.log(f"staged dispatch failed ({res['error']}); retrying on "
+                       f"the rendered-prose path")
+            fb_res = jl.ferry(extract_prompt(missing), cfg["model"])
+            if not fb_res["ok"]:
+                jl.log(f"extraction failed ({fb_res['error']}); offsets held "
+                       f"for retry: {[s['sid'] for s in missing]}")
+            else:
+                payload = jl.parse_fenced_json(fb_res["message"])
+                if not isinstance(payload, list):
+                    jl.log(f"extraction output unparseable (task {fb_res['task_id']}); "
+                           f"offsets held; first 300 chars: {fb_res['message'][:300]!r}")
+                else:
+                    fallback = {p.get("session"): p for p in payload if isinstance(p, dict)}
+                    # Lenient fallback: with exactly one missing slice and one
+                    # returned entry, a mislabeled session key is still
+                    # obviously the answer.
+                    if len(missing) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
+                            and missing[0]["sid"] not in fallback:
+                        fallback[missing[0]["sid"]] = {**payload[0], "session": missing[0]["sid"]}
+                    by_session.update(fallback)
         for s in group:
             item = by_session.get(s["sid"])
             if item is None:
