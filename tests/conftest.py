@@ -37,6 +37,14 @@ def _isolate_jeeves_state(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("JEEVES_STATE_DIR", str(base / "state"))
     monkeypatch.setenv("JEEVES_DATA_DIR", str(base / "data"))
     monkeypatch.setenv("JEEVES_PROJECTS_ROOT", str(base / "projects"))
+    # todos.py's coverage check shells out to auditing-worktrees' coverage-score
+    # if it happens to be installed on the box. Left alone, every commit-evidence
+    # test would take a different code path on a developer machine than on CI,
+    # which is the kind of divergence that only ever surfaces as a mystery CI
+    # failure. Point it at nothing by default; the tests that actually mean to
+    # exercise the pass set it themselves and win, same as the directories above.
+    monkeypatch.setenv("AUDIT_WORKTREES_BIN", str(base / "no-such-bin"))
+    monkeypatch.delenv("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD", raising=False)
     import todos as td
     for cache_name in (
         "_MEMO", "_PR_CACHE", "_ISSUE_CACHE", "_PULLS_CACHE", "_DEFAULT_BRANCH_CACHE",

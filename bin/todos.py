@@ -5,6 +5,7 @@ import argparse
 import atexit
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -236,6 +237,53 @@ def _default_branch(repo) -> str:
     return ""
 
 
+def _coverage_score_bin() -> Path:
+    """auditing-worktrees' coverage-score CLI, wherever it is installed.
+
+    Read at call time rather than at import so a test (or a caller pointing at
+    a worktree copy) can move it with AUDIT_WORKTREES_BIN.
+    """
+    root = os.environ.get("AUDIT_WORKTREES_BIN") or str(
+        Path.home() / ".claude" / "skills" / "auditing-worktrees" / "bin")
+    return Path(root) / "coverage-score"
+
+
+def _coverage_threshold() -> int:
+    """Coverage % at or above which a commit's content counts as already in base.
+
+    Shares WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD with auditing-worktrees and
+    orient rather than hardcoding a third copy of 95. A malformed value falls
+    back to the default instead of being read as some other number: 0 is
+    rejected with the rest, since it would call every commit landed.
+    """
+    raw = os.environ.get("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD")
+    if raw is not None and re.fullmatch(r"[1-9][0-9]?|100", raw):
+        return int(raw)
+    return 95
+
+
+def _coverage_landed(sha: str, base: str, repo) -> bool:
+    """True when coverage-score says this commit's content is already in base.
+
+    Offline, and it answers the squash shape ancestry cannot see. Once base
+    advances between the branch point and the squash, the squash commit's tree
+    is `new-base + branch changes` while the branch's own tree is still
+    `old-base + branch changes`, so neither ancestry nor a tree comparison
+    matches. Scoring residual content does.
+
+    Only a score at or above the threshold is an answer. UNSCORED (a binary or
+    mode-only row) and UNKNOWN (criss-cross history, a merge conflict) mean the
+    scorer declined to judge, not that the work is outstanding, so the caller
+    keeps asking. A missing CLI reads the same way: this closes a gap in the
+    offline path, it does not make auditing-worktrees a dependency.
+    """
+    out = _capture([str(_coverage_score_bin()), str(repo), base, sha]).strip()
+    m = re.fullmatch(r"SCORED (\d+)", out)
+    if not m:
+        return False
+    return int(m.group(1)) >= _coverage_threshold()
+
+
 def _repo_slug(repo) -> str:
     """owner/repo for gh-axi's -R flag, read from origin's URL. gh-axi rejects
     a filesystem path there (exit 1), which an earlier version of this function
@@ -296,19 +344,29 @@ def _classify_commit(sha: str, repo) -> str:
     either: a squash of several commits into one matches no single patch-id,
     confirmed against jeeves PR #1, whose four commits all came back unmatched.
 
-    So ancestry runs first because it is free and offline, and GitHub is asked
-    only when it misses. The caller (classify_evidence) has already verified the
-    sha resolves via cat-file -e, so this function does not re-check it.
+    So the three checks run cheapest-first: ancestry (free, offline, exact),
+    then content coverage (offline, a merge-tree plus two diffs), then GitHub
+    (network, slow, needs auth). Coverage sits in the middle because it answers
+    most squashes without leaving the machine, and because it is the only one
+    of the three that works at all for a repo whose origin is not GitHub.
+
+    The caller (classify_evidence) has already verified the sha resolves via
+    cat-file -e, so this function does not re-check it.
     """
     base = _default_branch(repo)
     if not base:
         return UNKNOWN
     if _runs(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, base]) == 0:
         return LANDED
+    if _coverage_landed(sha, base, repo):
+        return LANDED
     slug = _repo_slug(repo)
     if not slug:
-        # No GitHub remote to ask, so ancestry was the whole of the available
-        # truth and it said no. That is only the whole truth when there is no
+        # No GitHub remote to ask, so ancestry and coverage were the whole of
+        # the available truth and both said no. Coverage narrows this case but
+        # cannot close it: a score under the threshold is "not enough of it is
+        # in base to be sure", never proof the work is still live. That is only
+        # the whole truth when there is no
         # origin remote at all: a fetched origin that just is not GitHub could
         # still have squash-merged the work, and there is no way to ask it
         # further, so that case is UNKNOWN rather than a confident OUTSTANDING.
