@@ -29,6 +29,34 @@ jobs:
       - name: Sync dependencies
         run: uv sync --extra dev
 
+      # The real-boundary coverage tests (test_spec_coverage.py's needs_real_cli
+      # set) run when auditing-worktrees' coverage-score is on disk, and FAIL in
+      # CI when it is absent (see the needs_real_cli marker) -- never silently
+      # skip, so contract drift cannot ship green. Fetch the sibling with
+      # actions/checkout, which injects the GITHUB_TOKEN as a git credential the
+      # way a bare `git clone` cannot (git over HTTPS does not read GH_TOKEN).
+      # Same-owner private repos are readable this way; the token grants the
+      # workflow access to them. Pinned to a known commit so the contract is a
+      # deliberate, reviewable fact rather than "whatever main is today".
+      - name: Fetch auditing-worktrees for real-boundary tests
+        uses: actions/checkout@v4
+        with:
+          repository: jeremysball/auditing-worktrees
+          ref: ea0915cded8eb899c324765b2430964eb78f288c
+          path: .ci/auditing-worktrees
+          # The default GITHUB_TOKEN cannot read a private sibling repo (confirmed:
+          # a 404 even via checkout). A fine-grained PAT scoped to
+          # jeremysball/auditing-worktrees with Contents: Read, stored as the
+          # JEEVES_CI_PAT secret, grants it. Without the secret this step
+          # fails and the real-boundary tests turn the run red -- the loud signal
+          # that the boundary is untested.
+          token: ${{ secrets.JEEVES_CI_PAT || github.token }}
+      - name: Point coverage at the pinned sibling
+        run: |
+          test -x ".ci/auditing-worktrees/bin/coverage-score" \
+            || { echo "coverage-score missing from pinned sibling"; exit 1; }
+          echo "AUDIT_WORKTREES_BIN=$PWD/.ci/auditing-worktrees/bin" >> "$GITHUB_ENV"
+
       - name: Run lint
         run: uv run ruff check bin tests
 

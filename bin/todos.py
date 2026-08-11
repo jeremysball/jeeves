@@ -5,6 +5,7 @@ import argparse
 import atexit
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -236,6 +237,91 @@ def _default_branch(repo) -> str:
     return ""
 
 
+def _coverage_score_bin() -> Path:
+    """auditing-worktrees' coverage-score CLI, wherever it is installed.
+
+    Read at call time rather than at import so a test (or a caller pointing at
+    a worktree copy) can move it with AUDIT_WORKTREES_BIN.
+    """
+    root = os.environ.get("AUDIT_WORKTREES_BIN") or str(
+        Path.home() / ".claude" / "skills" / "auditing-worktrees" / "bin")
+    return Path(root) / "coverage-score"
+
+
+def _coverage_threshold() -> int:
+    """Coverage % at or above which a commit's content counts as already in base.
+
+    Shares WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD with auditing-worktrees and
+    orient rather than hardcoding a third copy of 95. A malformed value falls
+    back to the default instead of being read as some other number: 0 is
+    rejected with the rest, since it would call every commit landed.
+    """
+    raw = os.environ.get("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD")
+    if raw is not None and re.fullmatch(r"[1-9][0-9]?|100", raw):
+        return int(raw)
+    return 95
+
+
+# Per (repo, base, sha) coverage verdict, in-process. prune_pending and --pending
+# classify the same rows repeatedly, and each call re-spawns a coverage-score
+# subprocess that runs a merge-tree plus two diffs -- several hundred ms on a
+# large repo, and the whole reason to cache the GitHub pull lookup in
+# _PULLS_CACHE applies here too. Keyed by all three so a verdict is never
+# reused across bases or repos.
+_COVERAGE_CACHE: dict[tuple[str, str, str], bool] = {}
+
+# _capture's 15s budget is tuned for quick git status/log calls. A coverage
+# score runs a merge-tree plus two diffs across the whole history, which on a
+# large repo can exceed it; the verifier reproduced a 700k-file repo flapping
+# between SCORED 100 at 14.46s and a silent "" at 15.0s run-to-run. The offline
+# pass needs its own, longer budget, separate from _capture so a slow repo does
+# not stretch the budget of every unrelated git call.
+_COVERAGE_TIMEOUT = 60
+
+
+def _coverage_landed(sha: str, base: str, repo) -> bool:
+    """True when coverage-score says this commit's content is already in base.
+
+    Offline, and it answers the squash shape ancestry cannot see. Once base
+    advances between the branch point and the squash, the squash commit's tree
+    is `new-base + branch changes` while the branch's own tree is still
+    `old-base + branch changes`, so neither ancestry nor a tree comparison
+    matches. Scoring residual content does.
+
+    Only a score at or above the threshold is an answer. UNSCORED (a binary or
+    mode-only row) and UNKNOWN (criss-cross history, a merge conflict) mean the
+    scorer declined to judge, not that the work is outstanding, so the caller
+    keeps asking. A missing CLI reads the same way: this closes a gap in the
+    offline path, it does not make auditing-worktrees a dependency.
+
+    The score is a percentage of content present in base, so a value outside
+    0-100 is not a valid verdict -- it means a CLI regression or a mispointed
+    AUDIT_WORKTREES_BIN, and is treated as "declined to judge" rather than
+    trusted as landed. The subprocess gets its own longer timeout so a large
+    repo cannot silently time out the offline pass.
+    """
+    key = (str(repo), base, sha)
+    if key in _COVERAGE_CACHE:
+        return _COVERAGE_CACHE[key]
+    try:
+        p = subprocess.run(
+            [str(_coverage_score_bin()), str(repo), base, sha],
+            capture_output=True, text=True, timeout=_COVERAGE_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    out = (p.stdout if p.returncode == 0 else "").strip()
+    m = re.fullmatch(r"SCORED (\d+)", out)
+    if not m:
+        return False
+    score = int(m.group(1))
+    if not 0 <= score <= 100:
+        return False
+    landed = score >= _coverage_threshold()
+    _COVERAGE_CACHE[key] = landed
+    return landed
+
+
 def _repo_slug(repo) -> str:
     """owner/repo for gh-axi's -R flag, read from origin's URL. gh-axi rejects
     a filesystem path there (exit 1), which an earlier version of this function
@@ -296,25 +382,39 @@ def _classify_commit(sha: str, repo) -> str:
     either: a squash of several commits into one matches no single patch-id,
     confirmed against jeeves PR #1, whose four commits all came back unmatched.
 
-    So ancestry runs first because it is free and offline, and GitHub is asked
-    only when it misses. The caller (classify_evidence) has already verified the
-    sha resolves via cat-file -e, so this function does not re-check it.
+    Content coverage measures *content present in base*, not mergedness. A
+    squash-merged branch scores SCORED 100, but so does an independently-identical
+    or cherry-picked-but-never-merged commit. Treating a pure coverage match as
+    LANDED therefore calls duplicate work done on the strength of coincidence.
+    So coverage is authoritative only when it is the *only* possible arbiter: a
+    repo with no GitHub origin, which had no answer at all before coverage
+    existed. When a GitHub origin exists, GitHub is the final arbiter even when
+    coverage says landed -- coverage is not even run, since it could not decide.
+
+    The caller (classify_evidence) has already verified the sha resolves via
+    cat-file -e, so this function does not re-check it.
     """
     base = _default_branch(repo)
     if not base:
         return UNKNOWN
+    # Ancestry (free, offline, exact).
     if _runs(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, base]) == 0:
         return LANDED
     slug = _repo_slug(repo)
     if not slug:
-        # No GitHub remote to ask, so ancestry was the whole of the available
-        # truth and it said no. That is only the whole truth when there is no
-        # origin remote at all: a fetched origin that just is not GitHub could
-        # still have squash-merged the work, and there is no way to ask it
-        # further, so that case is UNKNOWN rather than a confident OUTSTANDING.
+        # No GitHub remote to ask. Coverage is the only offline answer for the
+        # squash shape, and authoritative here -- there was no answer before it.
+        if _coverage_landed(sha, base, repo):
+            return LANDED
+        # Coverage said no (or declined). A fetched origin that is not GitHub
+        # could still have squash-merged the work and there is no way to ask it
+        # further, so that case is UNKNOWN; only with no origin at all is
+        # "still live" a confident OUTSTANDING.
         if _runs(["git", "-C", str(repo), "remote", "get-url", "origin"]) == 0:
             return UNKNOWN
         return OUTSTANDING
+    # GitHub origin exists: GitHub is the arbiter, since coverage cannot
+    # distinguish merged from coincidentally-present content.
     carried = _merged_pr_carries(sha, slug)
     if carried is None:
         return UNKNOWN

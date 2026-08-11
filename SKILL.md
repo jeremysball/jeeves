@@ -104,10 +104,15 @@ git-state snapshot, render:
   proof either: a squash or rebase merge rewrites the branch into a new
   commit, so `git merge-base --is-ancestor` reports shipped work as
   unmerged, and this repo squash-merges its own PRs. Call `todos.py`'s
-  `classify_evidence`, which tries ancestry first and then asks GitHub
-  which pull requests carry the commit, returning `landed` /
-  `outstanding` / `unknown`. Anything not proven `landed` belongs under
-  **Unmerged work**, never under **Shipped**.
+  `classify_evidence`, which asks three sources cheapest-first — ancestry,
+  then how much of the commit's content is already in the base branch (via
+  `auditing-worktrees`' `coverage-score`, when it is installed; point
+  `AUDIT_WORKTREES_BIN` elsewhere to move it), then GitHub for the pull
+  requests carrying the commit — and returns `landed` / `outstanding` /
+  `unknown`. The middle one catches most squashes without a network call at
+  all, and is the only source that answers for a repo whose origin is not
+  GitHub. Anything not proven `landed` belongs under **Unmerged work**,
+  never under **Shipped**.
 - **Label every item's state inline**, so the two are never
   ambiguous at a glance: `#413 merged` vs `b8f57f0 unmerged
   (feat/ro-rw-dirs, PR #401 open)`. A bare SHA next to a bare PR number
