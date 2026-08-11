@@ -44,6 +44,13 @@ jobs:
           repository: jeremysball/auditing-worktrees
           ref: ea0915cded8eb899c324765b2430964eb78f288c
           path: .ci/auditing-worktrees
+          # The default GITHUB_TOKEN cannot read a private sibling repo (confirmed:
+          # a 404 even via checkout). A fine-grained PAT scoped to
+          # jeremysball/auditing-worktrees with Contents: Read, stored as the
+          # AUDIT_WORKTREES_PAT secret, grants it. Without the secret this step
+          # fails and the real-boundary tests turn the run red -- the loud signal
+          # that the boundary is untested.
+          token: ${{ secrets.AUDIT_WORKTREES_PAT || github.token }}
       - name: Point coverage at the pinned sibling
         run: |
           test -x ".ci/auditing-worktrees/bin/coverage-score" \
