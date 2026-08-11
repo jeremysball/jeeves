@@ -731,14 +731,24 @@ def run_once() -> dict:
                     for p in payload:
                         if not isinstance(p, dict):
                             continue
+                        sid = p.get("session")
+                        if not isinstance(sid, str):
+                            # The fallback keys summaries by the real session
+                            # sid (always a str). A non-str `session` here — a
+                            # ferry returning a list/dict for the field — can't
+                            # be a real sid, and using a list/dict as a dict key
+                            # would raise TypeError; skip rather than crash the
+                            # whole run.
+                            jl.log(f"fallback entry has non-string session {sid!r}; skipped")
+                            continue
                         if not _looks_like_summary(p):
                             # No shape gate existed here at all before — the
                             # staged path's own `_looks_like_summary` gate
                             # applies here too, not just there.
-                            jl.log(f"fallback entry for {p.get('session')!r} "
+                            jl.log(f"fallback entry for {sid!r} "
                                    f"doesn't look like the extraction schema; skipped")
                             continue
-                        fallback[p.get("session")] = p
+                        fallback[sid] = p
                     # Lenient fallback: with exactly one missing slice and one
                     # returned entry, a mislabeled session key is still
                     # obviously the answer — there's only one session it could
@@ -751,15 +761,26 @@ def run_once() -> dict:
                     # refuses the analogous mismatch rather than relabeling it;
                     # this is the same rule, narrowed to the case where the
                     # conflicting name actually resolves to something.
-                    own_sid = (payload[0].get("session")
-                               if len(payload) == 1 and isinstance(payload[0], dict) else None)
-                    conflicts = bool(missing) and own_sid is not None \
+                    only = (payload[0] if len(payload) == 1 and isinstance(payload[0], dict)
+                            else None)
+                    own_sid = only.get("session") if only is not None else None
+                    # `fallback.get(own_sid) is only` reuses the loop's shape
+                    # gate above: `fallback` holds only entries that passed
+                    # `_looks_like_summary` with a string session, so if the
+                    # sole entry is there under its own sid it's the validated
+                    # value — no need (or room for drift) to re-check it.
+                    valid_single = isinstance(own_sid, str) and fallback.get(own_sid) is only
+                    conflicts = valid_single and bool(missing) \
                         and own_sid != missing[0]["sid"] and own_sid in known_sids
-                    if len(missing) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
-                            and _looks_like_summary(payload[0]) \
+                    if valid_single and len(missing) == 1 \
                             and missing[0]["sid"] not in fallback \
                             and not conflicts:
-                        fallback[missing[0]["sid"]] = {**payload[0], "session": missing[0]["sid"]}
+                        # `valid_single` implies `only is not None` (a None
+                        # can't be a dict value in `fallback`), but mypy can't
+                        # track that through the boolean — assert it so `{**only,
+                        # ...}` narrows `only` from `dict | None`.
+                        assert only is not None
+                        fallback[missing[0]["sid"]] = {**only, "session": missing[0]["sid"]}
                     elif conflicts:
                         jl.log(f"fallback entry for {missing[0]['sid']} claims to be "
                                f"another session in this batch ({own_sid!r}); not re-keyed")
