@@ -22,7 +22,12 @@ import pytest
 
 import todos as td
 
-REAL_COVERAGE_BIN = Path.home() / ".claude" / "skills" / "auditing-worktrees" / "bin"
+# The real coverage-score lives wherever AUDIT_WORKTREES_BIN points (CI sets it
+# to the pinned sibling), else the developer's installed copy, else the
+# auditing-worktrees source in ~/.claude/skills.
+_real_bin_root = os.environ.get("AUDIT_WORKTREES_BIN") or str(
+    Path.home() / ".claude" / "skills" / "auditing-worktrees" / "bin")
+REAL_COVERAGE_BIN = Path(_real_bin_root)
 
 # Skip locally (a dev box may lack the sibling), but FAIL in CI when the real
 # boundary is missing -- the whole point is that CI must exercise the real
