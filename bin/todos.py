@@ -29,7 +29,7 @@ def ledger_path() -> Path:
 
 
 def parse_ledger(text: str) -> dict:
-    sections = {s: [] for s in SECTIONS}
+    sections: dict[str, list[str]] = {s: [] for s in SECTIONS}
     current = None
     for line in text.splitlines():
         if line.startswith("## "):
@@ -205,7 +205,7 @@ UNKNOWN = "unknown"      # could not determine; never treated as landed
 
 # The base branch is a property of the repo, not of any one evidence row, and
 # resolving it costs up to three git calls; memoize per repo path.
-_DEFAULT_BRANCH_CACHE = {}
+_DEFAULT_BRANCH_CACHE: dict[str, str] = {}
 
 
 def _default_branch(repo) -> str:
@@ -254,11 +254,11 @@ def _repo_slug(repo) -> str:
 # Answers per (slug, sha) for the run. prune_pending classifies every queued row
 # and --pending classifies them all again for listing, so without this a queue of
 # N rows spends N network round trips rediscovering one unchanging fact.
-_PULLS_CACHE = {}
+_PULLS_CACHE: dict[tuple[str, str], bool] = {}
 # Same shape for pr/issue views: a ledger full of rows citing the same PR or
 # issue would otherwise spend one gh-axi round trip per row.
-_PR_CACHE = {}
-_ISSUE_CACHE = {}
+_PR_CACHE: dict[tuple[str, str], str] = {}
+_ISSUE_CACHE: dict[tuple[str, str], str] = {}
 
 
 def _merged_pr_carries(sha: str, slug: str):
@@ -597,7 +597,19 @@ def prune_pending() -> dict:
         if open_hit is None:
             # Distinguish "resolved since" from "never existed" so a genuinely
             # lost line is visible rather than silently swallowed as handled.
-            known = _match(sections, line, "done") or _match(sections, line, "dismissed")
+            # A line ambiguous in done/dismissed is NOT "resolved" -- a
+            # duplicated match is a reason to keep the row for a human (same
+            # rationale as the open-section AMBIGUOUS case above), not to drop
+            # it as moot. The AMBIGUOUS sentinel is truthy, so it must be
+            # checked explicitly rather than folded into `known`.
+            done_hit = _match(sections, line, "done")
+            dismissed_hit = _match(sections, line, "dismissed")
+            if done_hit is AMBIGUOUS or dismissed_hit is AMBIGUOUS:
+                kept.append(row)
+                counts["kept"] += 1
+                jl.log(f"prune-pending: kept (ambiguous done/dismissed match): {line}")
+                continue
+            known = done_hit or dismissed_hit
             counts["moot" if known else "stale"] += 1
             jl.log(f"prune-pending: dropped ({'moot' if known else 'stale'}): {line}")
             continue
@@ -675,7 +687,7 @@ def _open_items(text: str) -> list:
     """Parse a loose checklist file into open items, joining wrapped
     continuation lines onto whichever item they physically follow — a
     continuation of a `[x]` (done) item is not a separate open item."""
-    items = []
+    items: list[str] = []
     cur_text = None
     cur_checked = None
 
