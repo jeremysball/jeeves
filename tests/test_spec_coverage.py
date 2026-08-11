@@ -31,14 +31,33 @@ needs_real_cli = pytest.mark.skipif(
 
 
 def _git(repo, *args):
-    return subprocess.run(["git", "-C", str(repo), *args],
-                          capture_output=True, text=True, check=True).stdout.strip()
+    p = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        # git puts the actual reason on stderr, and check=True throws it away.
+        # Losing it cost a CI round trip to diagnose a one-line fixture bug.
+        raise AssertionError(f"git {' '.join(args)} exited {p.returncode}:\n{p.stderr}")
+    return p.stdout.strip()
+
+
+def _init(tmp_path, repo):
+    """A repo with an identity of its own, not the machine's.
+
+    Set locally rather than passed per-commit: `git merge --squash` needs a
+    committer identity too when the merge is not a fast-forward, which is
+    exactly the shape these fixtures build. Per-commit `-c` flags cover the
+    commits and leave that one call to fall back to the machine's global git
+    config -- fine here, fatal on a CI runner that has none.
+    """
+    repo.mkdir()
+    _git(tmp_path, "init", "-q", "-b", "main", str(repo))
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
 
 
 def _commit(repo, fname, content, msg):
     (repo / fname).write_text(content)
     _git(repo, "add", ".")
-    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", msg)
+    _git(repo, "commit", "-qm", msg)
     return _git(repo, "rev-parse", "HEAD")
 
 
@@ -50,8 +69,7 @@ def _squashed_onto_advanced_base(tmp_path, origin="https://github.com/o/r.git"):
     not any tree in main's history either.
     """
     repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(tmp_path, "init", "-q", "-b", "main", str(repo))
+    _init(tmp_path, repo)
     _commit(repo, "a.txt", "a\n", "init")
     _git(repo, "remote", "add", "origin", origin)
     _git(repo, "checkout", "-q", "-b", "feature")
@@ -59,8 +77,7 @@ def _squashed_onto_advanced_base(tmp_path, origin="https://github.com/o/r.git"):
     _git(repo, "checkout", "-q", "main")
     _commit(repo, "b.txt", "b\n", "unrelated main commit")
     _git(repo, "merge", "-q", "--squash", "feature")
-    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t",
-         "commit", "-qm", "squash: add feat (#1)")
+    _git(repo, "commit", "-qm", "squash: add feat (#1)")
     _git(repo, "update-ref", "refs/remotes/origin/main", _git(repo, "rev-parse", "main"))
     return repo, branch_sha
 
@@ -68,8 +85,7 @@ def _squashed_onto_advanced_base(tmp_path, origin="https://github.com/o/r.git"):
 def _unmerged_branch(tmp_path, origin="https://github.com/o/r.git"):
     """A repo whose branch commit is genuinely not in main, by content or ancestry."""
     repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(tmp_path, "init", "-q", "-b", "main", str(repo))
+    _init(tmp_path, repo)
     main_sha = _commit(repo, "a.txt", "a\n", "init")
     _git(repo, "remote", "add", "origin", origin)
     _git(repo, "update-ref", "refs/remotes/origin/main", main_sha)
