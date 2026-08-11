@@ -29,6 +29,27 @@ jobs:
       - name: Sync dependencies
         run: uv sync --extra dev
 
+      # The real-boundary coverage tests (test_spec_coverage.py's needs_real_cli
+      # set) only run when auditing-worktrees' coverage-score is on disk. If it
+      # is absent they silently skip, so contract drift between jeeves and the
+      # sibling ships green -- exactly what those tests exist to catch. Install
+      # the sibling at a pinned commit so the real CLI is exercised in CI. The
+      # default GITHUB_TOKEN cannot read a private sibling repo; if this step
+      # fails with 404, grant the workflow a PAT secret (e.g. AUDIT_WORKTREES_PAT)
+      # with repo read access, or make the sibling accessible to the token.
+      - name: Install auditing-worktrees for real-boundary tests
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_WORKTREES_PAT || github.token }}
+        run: |
+          mkdir -p "$HOME/.claude/skills"
+          git clone --quiet --filter=blob:none \
+            https://github.com/jeremysball/auditing-worktrees.git \
+            "$HOME/.claude/skills/auditing-worktrees"
+          git -C "$HOME/.claude/skills/auditing-worktrees" \
+            checkout --quiet ea0915cded8eb899c324765b2430964eb78f288c
+          test -x "$HOME/.claude/skills/auditing-worktrees/bin/coverage-score" \
+            || { echo "coverage-score missing from pinned sibling"; exit 1; }
+
       - name: Run lint
         run: uv run ruff check bin tests
 

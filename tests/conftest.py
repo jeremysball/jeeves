@@ -48,5 +48,6 @@ def _isolate_jeeves_state(tmp_path_factory, monkeypatch):
     import todos as td
     for cache_name in (
         "_MEMO", "_PR_CACHE", "_ISSUE_CACHE", "_PULLS_CACHE", "_DEFAULT_BRANCH_CACHE",
+        "_COVERAGE_CACHE",
     ):
         monkeypatch.setattr(td, cache_name, None if cache_name == "_MEMO" else {}, raising=False)

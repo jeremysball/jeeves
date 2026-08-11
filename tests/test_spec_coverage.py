@@ -136,10 +136,11 @@ def _stub_coverage(tmp_path, verdict):
 
 
 @needs_real_cli
-def test_squash_onto_advanced_base_is_landed_without_asking_github(tmp_path, monkeypatch):
+def test_squash_onto_advanced_base_is_landed_via_github(tmp_path, monkeypatch):
+    """A squash-merged branch on a GitHub repo is LANDED, but coverage alone is
+    not the reason -- GitHub confirms the squash. Both offline checks genuinely
+    fail on this shape, so the answer has to come from somewhere authoritative."""
     repo, sha = _squashed_onto_advanced_base(tmp_path)
-    # Both offline checks that existed before genuinely fail on this repo, so
-    # the test is measuring the new pass and not a shape the old ones handled.
     assert subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor",
                            sha, "origin/main"]).returncode != 0
     tip_tree = _git(repo, "rev-parse", "feature^{tree}")
@@ -148,7 +149,21 @@ def test_squash_onto_advanced_base_is_landed_without_asking_github(tmp_path, mon
     monkeypatch.setenv("AUDIT_WORKTREES_BIN", str(REAL_COVERAGE_BIN))
     calls = _stub_gh(monkeypatch)
     assert td.classify_evidence(f"commit {sha}", repo) == td.LANDED
-    assert calls == [], "coverage answered offline, so nothing should reach the network"
+    assert calls, "a GitHub repo asks GitHub even though coverage says landed"
+
+
+@needs_real_cli
+def test_coincidental_content_is_not_landed_on_github(tmp_path, monkeypatch):
+    """The fix: coverage cannot declare LANDED for a GitHub repo on content
+    overlap alone. A cherry-picked / independently-identical commit scores
+    SCORED 100 but has no merged PR carrying it, so it must be OUTSTANDING."""
+    repo, sha = _squashed_onto_advanced_base(tmp_path)
+    # Simulate a merged-but-cherry-picked shape: content fully in base (coverage
+    # says landed) but GitHub reports no merged PR carries the sha.
+    monkeypatch.setenv("AUDIT_WORKTREES_BIN", str(REAL_COVERAGE_BIN))
+    calls = _stub_gh(monkeypatch, output="[]\n")
+    assert td.classify_evidence(f"commit {sha}", repo) == td.OUTSTANDING
+    assert calls, "GitHub was consulted and said the branch never merged"
 
 
 @needs_real_cli
@@ -198,15 +213,19 @@ def test_declined_verdicts_keep_asking_rather_than_deciding(tmp_path, monkeypatc
 
 
 def test_a_score_under_the_threshold_is_not_landed(tmp_path, monkeypatch):
-    repo, sha = _squashed_onto_advanced_base(tmp_path)
+    """Coverage below the threshold is not landed. On a repo with a non-GitHub
+    origin there is no GitHub to arbitrate and the origin could have squash-merged,
+    so the careful answer is UNKNOWN -- the point is it is not LANDED."""
+    repo, sha = _squashed_onto_advanced_base(tmp_path, origin=str(tmp_path / "origin.git"))
     monkeypatch.setenv("AUDIT_WORKTREES_BIN", str(_stub_coverage(tmp_path, "SCORED 94")))
     calls = _stub_gh(monkeypatch, output="[]\n")
-    assert td.classify_evidence(f"commit {sha}", repo) == td.OUTSTANDING
-    assert calls
+    assert td.classify_evidence(f"commit {sha}", repo) == td.UNKNOWN
+    assert calls == [], "a non-GitHub repo has no GitHub to ask"
 
 
 def test_threshold_env_var_moves_the_bar(tmp_path, monkeypatch):
-    repo, sha = _squashed_onto_advanced_base(tmp_path)
+    """On a non-GitHub repo the threshold env var moves the coverage bar."""
+    repo, sha = _squashed_onto_advanced_base(tmp_path, origin=str(tmp_path / "origin.git"))
     monkeypatch.setenv("AUDIT_WORKTREES_BIN", str(_stub_coverage(tmp_path, "SCORED 94")))
     monkeypatch.setenv("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD", "90")
     calls = _stub_gh(monkeypatch, output="[]\n")
@@ -237,3 +256,68 @@ def test_bin_location_is_read_at_call_time(monkeypatch):
     monkeypatch.delenv("AUDIT_WORKTREES_BIN")
     assert td._coverage_score_bin() == (
         Path.home() / ".claude/skills/auditing-worktrees/bin/coverage-score")
+
+
+@pytest.mark.parametrize("verdict", ["SCORED 101", "SCORED 200", "SCORED -5"])
+def test_out_of_range_score_is_not_landed(tmp_path, monkeypatch, verdict):
+    """A score outside 0-100 is not a valid verdict -- a CLI regression or a
+    mispointed AUDIT_WORKTREES_BIN must not be read as LANDED."""
+    repo, sha = _squashed_onto_advanced_base(tmp_path, origin=str(tmp_path / "origin.git"))
+    monkeypatch.setenv("AUDIT_WORKTREES_BIN", str(_stub_coverage(tmp_path, verdict)))
+    assert td._coverage_landed(sha, "origin/main", repo) is False
+
+
+def test_coverage_result_is_cached_per_repo_base_sha(tmp_path, monkeypatch):
+    """prune_pending and --pending classify the same rows twice; the coverage
+    subprocess (a merge-tree plus two diffs) must not re-spawn each time."""
+    calls = []
+    real_run = td.subprocess.run
+
+    def counting_run(args, **kw):
+        calls.append(args)
+        return real_run(args, **kw)
+
+    monkeypatch.setattr(td.subprocess, "run", counting_run)
+    repo, sha = _squashed_onto_advanced_base(tmp_path, origin=str(tmp_path / "origin.git"))
+    bin_dir = _stub_coverage(tmp_path, "SCORED 100")
+    monkeypatch.setenv("AUDIT_WORKTREES_BIN", str(bin_dir))
+    base = "origin/main"
+    assert td._coverage_landed(sha, base, repo) is True
+    assert td._coverage_landed(sha, base, repo) is True
+    # One coverage-score spawn, not two.
+    coverage_runs = [a for a in calls if str(a[0]).endswith("coverage-score")]
+    assert len(coverage_runs) == 1
+
+
+def test_coverage_result_is_not_reused_across_bases(tmp_path, monkeypatch):
+    """A verdict is keyed on (repo, base, sha), never reused across bases."""
+    calls = []
+    real_run = td.subprocess.run
+
+    def counting_run(args, **kw):
+        calls.append(args)
+        return real_run(args, **kw)
+
+    monkeypatch.setattr(td.subprocess, "run", counting_run)
+    repo, sha = _squashed_onto_advanced_base(tmp_path, origin=str(tmp_path / "origin.git"))
+    monkeypatch.setenv("AUDIT_WORKTREES_BIN", str(_stub_coverage(tmp_path, "SCORED 100")))
+    assert td._coverage_landed(sha, "origin/main", repo) is True
+    assert td._coverage_landed(sha, "origin/other", repo) is True
+    coverage_runs = [a for a in calls if str(a[0]).endswith("coverage-score")]
+    assert len(coverage_runs) == 2
+
+
+def test_coverage_uses_its_own_timeout_not_capture(tmp_path, monkeypatch):
+    """The offline pass budgets its own subprocess with _COVERAGE_TIMEOUT,
+    independent of _capture's 15s. Proved by shrinking that budget and showing
+    the coverage call honors it (times out -> declined, not LANDED)."""
+    repo, sha = _squashed_onto_advanced_base(tmp_path, origin=str(tmp_path / "origin.git"))
+    bin_dir = tmp_path / "stub-bin"
+    bin_dir.mkdir()
+    cli = bin_dir / "coverage-score"
+    cli.write_text("#!/bin/sh\nsleep 1.5\n echo SCORED 100\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("AUDIT_WORKTREES_BIN", str(bin_dir))
+    monkeypatch.setattr(td, "_COVERAGE_TIMEOUT", 0.2)
+    # Times out under its own budget: a silent "" (declined), not LANDED.
+    assert td._coverage_landed(sha, "origin/main", repo) is False
