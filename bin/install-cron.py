@@ -3,7 +3,6 @@
 import argparse
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import jeeves_lib as jl
@@ -67,8 +66,8 @@ def _read(args) -> str:
     if args.crontab_file:
         p = Path(args.crontab_file)
         return p.read_text() if p.exists() else ""
-    p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    return p.stdout if p.returncode == 0 else ""
+    result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    return result.stdout if result.returncode == 0 else ""
 
 
 def _write(args, text: str) -> None:

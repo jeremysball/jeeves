@@ -238,3 +238,21 @@ def test_normalize_strips_stacked_provenance_suffixes():
 
 def test_normalize_leaves_ordinary_parentheses_alone():
     assert jl.normalize("- [ ] fix parse(x) handling") == "fix parse(x) handling"
+
+
+def test_log_never_touches_the_real_state_dir():
+    """The suite must not write into the live cron log.
+
+    `jl.log()` resolves through `state_dir()`, which falls back to the real
+    `~/.local/state/jeeves` whenever `JEEVES_STATE_DIR` is unset —
+    `test_ferry_failure_paths` was appending two lines to it on every run,
+    which reads back as a genuine dispatch failure. conftest's autouse
+    fixture closes that; this asserts the fixture is actually in force, so
+    removing it fails here instead of silently resuming the leak.
+    """
+    real = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "jeeves"
+    resolved = jl.state_dir().resolve()
+    assert resolved != real.resolve(), \
+        f"tests are pointed at the real jeeves state dir ({resolved})"
+    jl.log("isolation probe")
+    assert (jl.state_dir() / "collect.log").read_text().endswith("isolation probe\n")

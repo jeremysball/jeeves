@@ -87,19 +87,10 @@ GH_SIGNAL_REASONS = {"review-requested", "mention", "team-mention", "comment",
                      "assign", "author"}
 
 
-def _parse_origin(url: str):
-    """owner/name from a git origin URL, or None if it isn't GitHub.
-
-    `git remote get-url` output keeps its trailing newline, and the old
-    `([^/.]+)` name class happily matched it — producing a repo id ending in
-    `\\n` that made every later API path fail with "invalid control character
-    in URL". Strip first, and let the name carry dots so `foo.bar` survives.
-    """
-    # rstrip the slash before matching: a `.../owner/name/` origin otherwise
-    # carries it into the name and 404s every path built from the id, which
-    # is the same silent-drop this function exists to fix.
-    m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", url.strip().rstrip("/"))
-    return f"{m.group(1)}/{m.group(2)}" if m else None
+# Shared with todos.py, which needs the same parse to build a `-R owner/repo`
+# and an API path. Two copies of it had already drifted on which URL shapes
+# they accept, so the one that decides evidence lives in jeeves_lib.
+_parse_origin = jl.parse_github_slug
 
 
 _ORIGINS: dict = {}
@@ -214,7 +205,7 @@ def tf_diff() -> str:
         return "(taskferry list unavailable)"
     f = jl.state_dir() / "tf-state.json"
     prev = json.loads(f.read_text()) if f.exists() else {"lines": []}
-    cur_lines = {l.strip() for l in current.splitlines() if "oc_" in l}
+    cur_lines = {line.strip() for line in current.splitlines() if "oc_" in line}
     prev_lines = set(prev.get("lines", []))
     new = sorted(cur_lines - prev_lines)
     f.write_text(json.dumps({"lines": sorted(cur_lines)}))
@@ -520,7 +511,7 @@ def _repo_index() -> dict:
     the directory basename: the ferry uses whichever the user says out loud,
     and those differ (`token-burn` for
     `token-burn-dashboard-model-faceoff`)."""
-    idx = {}
+    idx: dict[str, str] = {}
     for d, full in _repo_origins():
         for key in (full.split("/")[-1], Path(d).name):
             idx.setdefault(key.lower(), full)
@@ -826,7 +817,7 @@ def run_once() -> dict:
                                res["message"], re.S)
                 if m2:
                     digest_md = m2.group(1).strip() + "\n"
-                    jl.log(f"digest recovered without markdown fence")
+                    jl.log("digest recovered without markdown fence")
             muts = jl.parse_fenced_json(res["message"])
             if digest_md is None or not isinstance(muts, list):
                 jl.log("synthesis output malformed; digest not refreshed")
@@ -843,7 +834,8 @@ def run_once() -> dict:
                 # only grow. todos.verify_evidence gates each check with a
                 # real per-ref lookup; `add` has no evidence field to check,
                 # so it gets the same disproof test the digest uses.
-                keep, disproved = [], []
+                keep: list[dict] = []
+                disproved: list[dict] = []
                 for mut in muts:
                     (disproved if _add_is_disproved(mut) else keep).append(mut)
                 if disproved:
