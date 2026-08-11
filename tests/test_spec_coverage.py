@@ -14,6 +14,7 @@ it, and jeeves now asks it before spending a network round trip -- or instead of
 one, for a repo whose origin is not GitHub and which therefore had no answer at
 all before.
 """
+import os
 import subprocess
 from pathlib import Path
 
@@ -23,8 +24,13 @@ import todos as td
 
 REAL_COVERAGE_BIN = Path.home() / ".claude" / "skills" / "auditing-worktrees" / "bin"
 
+# Skip locally (a dev box may lack the sibling), but FAIL in CI when the real
+# boundary is missing -- the whole point is that CI must exercise the real
+# coverage-score, not silently skip it and ship contract drift green. The CI
+# workflow installs the sibling; if that step was skipped or failed, these
+# tests turning red is the loud signal that the boundary is untested.
 needs_real_cli = pytest.mark.skipif(
-    not (REAL_COVERAGE_BIN / "coverage-score").is_file(),
+    not (REAL_COVERAGE_BIN / "coverage-score").is_file() and os.environ.get("CI") != "true",
     reason="auditing-worktrees is not installed; the stub-backed tests below still "
            "cover the integration, this one covers the real boundary",
 )

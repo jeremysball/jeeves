@@ -30,14 +30,17 @@ jobs:
         run: uv sync --extra dev
 
       # The real-boundary coverage tests (test_spec_coverage.py's needs_real_cli
-      # set) only run when auditing-worktrees' coverage-score is on disk. If it
-      # is absent they silently skip, so contract drift between jeeves and the
-      # sibling ships green -- exactly what those tests exist to catch. Install
-      # the sibling at a pinned commit so the real CLI is exercised in CI. The
-      # default GITHUB_TOKEN cannot read a private sibling repo; if this step
-      # fails with 404, grant the workflow a PAT secret (e.g. AUDIT_WORKTREES_PAT)
-      # with repo read access, or make the sibling accessible to the token.
+      # set) run when auditing-worktrees' coverage-score is on disk, and FAIL in
+      # CI when it is absent (see the needs_real_cli marker) -- never silently
+      # skip, so contract drift cannot ship green. This step installs the
+      # sibling at a pinned commit so the real CLI is exercised. The default
+      # GITHUB_TOKEN cannot read a private sibling repo, so the step is
+      # best-effort: if it cannot clone (no AUDIT_WORKTREES_PAT secret, or the
+      # sibling is inaccessible), it logs a warning and the real-boundary tests
+      # turn the run red -- the loud signal that the boundary is untested. To go
+      # green, add an AUDIT_WORKTREES_PAT secret with repo read access.
       - name: Install auditing-worktrees for real-boundary tests
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.AUDIT_WORKTREES_PAT || github.token }}
         run: |
