@@ -302,8 +302,13 @@ SECRET_RES = [
     # "basic") is specific enough that a short base64 credential right after
     # it (Basic auth of a short `user:pass`, e.g. `Basic dTpw`) is still
     # worth redacting more than the false-positive risk of an unrelated
-    # short word following those two keywords is worth avoiding.
-    re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/-]{4,}={0,2}"),
+    # short word following those two keywords is worth avoiding. The floor
+    # counts the whole credential including its `=` padding, not the base64
+    # characters alone — a padded short `user:pass` like `OnA=` or `YQ==`
+    # is 4 chars only once the padding is counted.
+    re.compile(r"(?i)\b((?:bearer|basic)\s+)"
+               r"(?:[A-Za-z0-9._~+/-]{4,}={0,2}|[A-Za-z0-9._~+/-]{2}={2}"
+               r"|[A-Za-z0-9._~+/-]{3}={1,2})"),
     # PEM/SSH private key blocks — the BEGIN/END markers alone are signal
     # enough to redact the whole thing, body included. Two separate patterns:
     # the `... PRIVATE KEY` family (RSA/EC/ECDSA/ED25519/OPENSSH/DSA/
@@ -318,21 +323,29 @@ SECRET_RES = [
     # the prose-fallback path's 800-char denoise truncation can cut a pasted
     # key mid-body. The two patterns above already consumed every BEGIN...END
     # pair by the time this runs, so any `-----BEGIN...PRIVATE KEY-----`
-    # still standing here is exactly the truncated case; redact from BEGIN to
-    # the end of the text rather than leave the header and partial body live.
+    # still standing here is exactly the truncated case. Redact the header
+    # plus a bounded base64 body rather than to end-of-file: the body is
+    # limited to base64 characters, whitespace (line-wrapped base64), and
+    # escaped-newline backslashes (the staged JSONL form), capped at a
+    # generous fixed length — one truncated key can no longer wipe every
+    # subsequent staged line.
     re.compile(r"-----BEGIN (?:(?:RSA |EC |ECDSA |ED25519 |OPENSSH |DSA |ENCRYPTED |)"
-               r"PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*"),
+               r"PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----"
+               r"[A-Za-z0-9+/=\s\\]{0,8192}"),
     # `scheme://user:pass@host` connection strings (DATABASE_URL, a raw
     # psql/mysql DSN). Only the password half is masked; scheme/user stay for
     # context. The user segment is optional (`redis://:pass@host` is a valid,
-    # common DSN shape with no username) and the password group allows `/`
-    # (a password itself can contain one) — both used to force the whole
-    # pattern to simply not match, leaking the password in full rather than
-    # partially. The value group allows `@` (greedy, so it backtracks to the
-    # rightmost `@` before the lookahead succeeds) — a password containing
+    # common DSN shape with no username) but bans `/` — without that ban the
+    # pattern also fired on plain-URL path shapes like `example.com/path:8080@`
+    # and destroyed path/port content. The password group allows `/` (a
+    # password itself can contain one) and `@` (greedy, so it backtracks to
+    # the rightmost `@` before the lookahead succeeds) — a password containing
     # its own `@` used to truncate the match at the first one, leaking the
-    # remainder.
-    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:@\"']*:)([^\s\"'\\]+)(?=@)"),
+    # remainder. It is escape-aware: a `\` plus any char (a JSON-escaped quote
+    # or backslash inside the password) counts as one password character, so an
+    # escaped quote no longer makes the `(?=@)` lookahead fail and leak the
+    # whole password.
+    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s/@:\"']*:)((?:\\.|[^\s\"'\\])+)(?=@)"),
     # No `\b` in front: `_` is a word character, so a boundary would never
     # match the `API_KEY` inside `OPENAI_API_KEY`, which is exactly the shape
     # these turn up in. The key is `[\w.-]*<keyword>[\w.-]*` rather than the
@@ -352,17 +365,18 @@ SECRET_RES = [
     # purpose: a missed real credential costs more than an over-redacted
     # directory path. Quotes allow an optional leading `\` — `stage_slice`
     # writes raw JSON-escaped bytes, so a quoted value on disk reads
-    # `\"value\"`, not `"value"`. The value group stops only at whitespace,
-    # not at a quote or backslash — on the staged JSONL path every quote is
-    # written escaped (`\"`), including a quote embedded inside the secret
-    # itself, so a quote character can never reliably distinguish "end of
-    # value" from "part of the value"; stopping only at whitespace means an
-    # embedded escaped quote can no longer truncate the match early and leak
-    # the remainder. No floor on the value length: a short real secret is
-    # worth redacting more than a floor is worth avoiding one false positive.
+    # `\"value\"`, not `"value"`. A quoted value is matched escape-aware and
+    # stops at its closing quote when a JSON delimiter (`,`/`}`/`]`/
+    # whitespace/end) follows: an embedded `\"` inside the secret is consumed
+    # as an escaped pair, and an adjacent `"key":"value"` pair keeps its own
+    # key instead of the value group running to whitespace and swallowing the
+    # comma plus the next key, which leaked the second value. Unquoted values
+    # still run to whitespace. No floor on the value length: a short real
+    # secret is worth redacting more than a floor is worth avoiding one false
+    # positive.
     re.compile(r"(?i)(?<![A-Za-z0-9])([\w.-]*(?:api[_-]?key|secret|token|password"
                r"|passwd|pwd|credential|auth)(?!(?-i:[a-z]))[\w.-]*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
-               r"(\S+)"),
+               r"((?:\\.|[^\\\"])*?(?=\\?[\"'](?=\s*[,}\]]|$))|\S+)"),
 ]
 
 
@@ -629,7 +643,8 @@ def run_once() -> dict:
     all_cwds = set()
     pending_offsets = dict(offs)
 
-    for path in discover_sessions():
+    sessions = discover_sessions()
+    for path in sessions:
         key = str(path)
         off = offs.get(key, {}).get("offset", 0)
         lines, new_off, status = jl.read_delta(path, off)
@@ -655,10 +670,14 @@ def run_once() -> dict:
                        "rendered": jl.render_slice(entries)})
 
     prune_staging()
-    # Every session this run knows about, across all batches — used below to
-    # tell a garbage session label (safe to re-key) from one that names a real
-    # session (a claim about whose work this is, which must not be re-keyed).
-    known_sids = {s["sid"] for s in slices}
+    # Every real session the collector discovered this run, across all batches
+    # — used below to tell a garbage session label (safe to re-key) from one
+    # that names a real session (a claim about whose work this is, which must
+    # not be re-keyed). Derive it from the discovered session universe, not
+    # just the slices with new content this run: a real-but-quiet session (no
+    # new bytes, so never sliced) is still a real name, and a fallback payload
+    # naming it must not be re-keyed onto a slice that happens to be missing.
+    known_sids = {session_id_of(p) for p in sessions}
     for gi, group in enumerate(group_slices(slices, cfg["batch_under"], cfg["batch_max"])):
         by_session, res = {}, None
         # Staged path: hand the ferry the raw transcript and let it read the
