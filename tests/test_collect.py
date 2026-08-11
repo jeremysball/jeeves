@@ -147,6 +147,39 @@ def test_run_once_tolerates_mislabeled_single_slice(tmp_path, monkeypatch):
     assert "thing" in summary  # content kept, session re-keyed
 
 
+def test_run_once_refuses_to_rekey_onto_another_real_session(tmp_path, monkeypatch):
+    # A garbage label is safe to re-key (there's only one session it could be
+    # about — see the test above). A label naming *another real session in the
+    # batch* is a different claim: re-keying it would file one session's work
+    # under another, which is exactly the mismatch `read_staged_summaries`
+    # refuses rather than silently relabeling.
+    _env(tmp_path, monkeypatch)
+    root = tmp_path / "projects"
+    _mk_session(root, "-home-x-proj1", "ses1", ["work happened", "more work"])
+    _mk_session(root, "-home-x-proj2", "ses2", ["other work here"])
+    entry = ('{"session": "ses2", "shipped": [{"item": "thing", "evidence": "file f.txt"}], '
+             '"oversaw": [], "loose_ends": [], "tangents": [], "overlooked": [], "shape": "fine"}')
+
+    calls = {"n": 0}
+
+    def fake_ferry(*a, **k):
+        # first call covers ses2 only; the retry for ses1 comes back claiming
+        # to be ses2 again.
+        calls["n"] += 1
+        return {"ok": True, "task_id": "oc_t_9", "error": "",
+                "message": f'```json\n[{entry}]\n```\nStatus: DONE'}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    monkeypatch.setattr(cc, "tf_diff", lambda: "(test notes)")
+    cc.run_once()
+    # ses1 must not have been handed ses2's content
+    ses1 = list((tmp_path / "state" / "summaries").rglob("*--ses1--*.md"))
+    assert all("thing" not in f.read_text() for f in ses1), \
+        "ses2's content was re-keyed onto ses1"
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "another session in this batch" in log
+
+
 def test_run_once_crash_does_not_advance(tmp_path, monkeypatch):
     _env(tmp_path, monkeypatch)
     root = tmp_path / "projects"
@@ -644,6 +677,67 @@ def test_redact_basic_auth_header_credential():
     raw = "curl -H 'Authorization: Basic dXNlcjpwYXNzd29yZA==' https://api.example.com"
     out = cc.redact(raw)
     assert "dXNlcjpwYXNzd29yZA==" not in out
+
+
+def test_redact_short_basic_auth_credentials():
+    # base64 of a short `user:pass` is well under the old 16-char floor, and
+    # short credentials are exactly the common ones: `user:p` -> 12 chars,
+    # `admin:admin` -> 15, `u:p` -> 4.
+    for cred in ("dTpw", "dXNlcjpw", "YWRtaW46YWRtaW4="):
+        out = cc.redact(f"Authorization: Basic {cred}")
+        assert cred not in out, f"leaked short Basic credential {cred!r} -> {out!r}"
+        assert "[REDACTED]" in out
+
+
+def test_redact_camelcase_credential_keys():
+    # `(?![a-z])` under the pattern's own `(?i)` flag also rejected uppercase
+    # continuations, so a camelCase key's match died right after the keyword
+    # and the whole key=value came back untouched.
+    for raw, leaked in (("secretKey=sk-live-abc123", "sk-live-abc123"),
+                        ("authKey=abc123def456", "abc123def456"),
+                        ("tokenValue=xyz789xyz", "xyz789xyz"),
+                        ("passwordHash=deadbeefcafe", "deadbeefcafe"),
+                        ('{"authHeader": "abc123def456"}', "abc123def456")):
+        out = cc.redact(raw)
+        assert leaked not in out, f"leaked {leaked!r} from {raw!r} -> {out!r}"
+        assert "[REDACTED]" in out
+
+
+def test_redact_value_with_json_escaped_quote_inside_it():
+    # stage_slice writes raw JSON-escaped bytes, so a quote *inside* the
+    # secret is written `\"` — indistinguishable from the value's own closing
+    # quote. Stopping at it truncated the match and leaked the tail.
+    raw = 'PASSWORD=\\"ab\\"cd\\"'
+    out = cc.redact(raw)
+    assert "cd" not in out, f"leaked the tail past the escaped quote -> {out!r}"
+    assert "[REDACTED]" in out
+
+
+def test_redact_ecdsa_and_ed25519_pem_blocks():
+    for label in ("ECDSA PRIVATE KEY", "ED25519 PRIVATE KEY"):
+        raw = f"-----BEGIN {label}-----\nMIIBfakekeymaterial\n-----END {label}-----"
+        out = cc.redact(raw)
+        assert "MIIBfakekeymaterial" not in out, f"leaked from {label!r} -> {out!r}"
+        assert "[REDACTED]" in out
+
+
+def test_redact_pem_block_truncated_before_its_end_marker():
+    # the prose-fallback path truncates each entry, so a pasted key can lose
+    # its `-----END` marker entirely; requiring that marker meant the header
+    # plus partial body shipped unredacted.
+    raw = "-----BEGIN RSA PRIVATE KEY-----\nMIIBfakekeymaterialcuthere"
+    out = cc.redact(raw)
+    assert "MIIBfakekeymaterialcuthere" not in out
+    assert "[REDACTED]" in out
+
+
+def test_redact_dsn_shapes_that_previously_never_matched():
+    # empty user (standard redis DSN) and a password containing `/` both made
+    # the pattern fail to match at all, leaking the password in full.
+    assert cc.redact("redis://:supersecret@host:6379") == \
+        "redis://:[REDACTED]@host:6379"
+    assert cc.redact("postgres://u:my/pass@host/db") == \
+        "postgres://u:[REDACTED]@host/db"
 
 
 def test_redact_leaves_keyword_lookalikes_alone():
