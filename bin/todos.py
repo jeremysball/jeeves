@@ -376,7 +376,7 @@ def _load_memo() -> dict:
     raising, so the shape is checked explicitly rather than trusted."""
     try:
         data = json.loads((jl.state_dir() / _MEMO_PATH).read_text())
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -455,8 +455,8 @@ def classify_evidence(evidence: str, repo) -> str:
     hit = _MEMO.get(key)
     if (
         isinstance(hit, dict)
-        and "t" in hit
-        and "verdict" in hit
+        and isinstance(hit.get("t"), (int, float))
+        and hit.get("verdict") in (LANDED, OUTSTANDING, UNKNOWN)
         and time.time() - hit["t"] < _MEMO_TTL
     ):
         return hit["verdict"]
