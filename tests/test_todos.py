@@ -42,8 +42,8 @@ def test_check_moves_to_done_with_evidence(tmp_path, monkeypatch):
 
 def test_check_ambiguous_match_raises(tmp_path, monkeypatch):
     # two lines that normalize to the same string — genuinely ambiguous
-    p = _ledger(tmp_path, monkeypatch,
-                "# jeeves todo ledger\n\n## open\n- [ ] fix the thing\n- [ ] fix   the  thing\n\n## done\n\n## dismissed\n")
+    _ledger(tmp_path, monkeypatch,
+            "# jeeves todo ledger\n\n## open\n- [ ] fix the thing\n- [ ] fix   the  thing\n\n## done\n\n## dismissed\n")
     with pytest.raises(td.AmbiguousMatch):
         td.apply_check("fix the thing", evidence="commit abc1234")
 
@@ -173,7 +173,8 @@ def test_wake_updates_last_wake(tmp_path, monkeypatch):
 
 
 def test_cli_add(tmp_path):
-    import subprocess, sys
+    import subprocess
+    import sys
     todos_py = str(Path(__file__).parent.parent / "bin" / "todos.py")
     env = dict(__import__("os").environ,
                JEEVES_DATA_DIR=str(tmp_path), JEEVES_STATE_DIR=str(tmp_path / "state"))
