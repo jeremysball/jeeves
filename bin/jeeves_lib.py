@@ -8,7 +8,9 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import NoReturn
 from unicodedata import normalize as unicodedata_normalize
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -71,9 +73,7 @@ def load_config() -> dict:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = [s.strip() for s in line.split("=", 1)]
-            if k in cfg and isinstance(cfg[k], int):
-                v = int(v)
-            cfg[k] = v
+            cfg[k] = int(v) if k in cfg and isinstance(cfg[k], int) else v
     return cfg
 
 
@@ -83,7 +83,7 @@ def log(msg: str) -> None:
         fh.write(f"{now_et().isoformat(timespec='seconds')} {msg}\n")
 
 
-def die(msg: str) -> None:
+def die(msg: str) -> NoReturn:
     """Fail fast and loud."""
     log(f"FATAL {msg}")
     print(f"jeeves: {msg}", file=sys.stderr)
@@ -172,6 +172,58 @@ def normalize(s: str) -> str:
 
 def line_hash(s: str) -> str:
     return hashlib.sha256(normalize(s).encode("utf-8")).hexdigest()
+
+
+def parse_github_slug(url: str):
+    """owner/name from a git origin URL, or None if it isn't GitHub.
+
+    Requiring the host is what makes this safe to build an API path from. A
+    tail-anchored `owner/repo` match alone accepts anything URL-shaped, so a
+    filesystem origin such as `/tmp/x/origin.git` yields `x/origin` -- a
+    plausible-looking slug naming a repo that does not exist, or worse, one
+    that does and belongs to somebody else.
+
+    The host is anchored, not just the tail: the old unanchored regex matched
+    `github.com` as a substring anywhere, so `https://notgithub.com/acme/widget.git`
+    and `https://gitlab.com/github.com/acme/widget.git` both read as GitHub
+    origins. A scheme URL is parsed with urlsplit and trusted only when the
+    hostname is exactly `github.com`; the scp-like `[user@]github.com:owner/repo`
+    shape (which urlsplit cannot parse a host out of) gets its own regex
+    requiring `github.com` to immediately precede `:` -- the `user@` prefix is
+    optional there too, matching git's own scp-like syntax, where a bare
+    `github.com:owner/repo.git` (no explicit user) is valid.
+
+    `urlsplit` raises `ValueError` on some malformed-but-git-accepted URLs
+    (e.g. an unbalanced `[` reads as an invalid IPv6 host) -- git itself does
+    not validate a remote URL before accepting it, so a repo can genuinely
+    have one of these as its origin. That is not a GitHub origin either way,
+    so it degrades to the same `None` any other non-GitHub URL gets, rather
+    than raising out of every caller.
+
+    `git remote get-url` output keeps its trailing newline, and the old
+    `([^/.]+)` name class happily matched it -- producing a repo id ending in
+    `\\n` that made every later API path fail with "invalid control character
+    in URL". Strip first, and let the name carry dots so `foo.bar` survives.
+    """
+    # rstrip the slash before matching: a `.../owner/name/` origin otherwise
+    # carries it into the name and 404s every path built from the id, which
+    # is the same silent-drop this function exists to fix.
+    s = url.strip().rstrip("/")
+    if "://" in s:
+        try:
+            parts = urlsplit(s)
+        except ValueError:
+            return None
+        if parts.hostname != "github.com":
+            return None
+        path = parts.path
+    else:
+        m = re.fullmatch(r"(?:[^@]+@)?github\.com:([^/]+)/(.+?)(?:\.git)?", s)
+        if not m:
+            return None
+        return f"{m.group(1)}/{m.group(2)}"
+    m = re.fullmatch(r"/([^/]+)/(.+?)(?:\.git)?", path)
+    return f"{m.group(1)}/{m.group(2)}" if m else None
 
 
 class SeenStore:

@@ -1,0 +1,39 @@
+name: check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # Single collapsed job rather than a [lint, typecheck, unit] matrix — see
+    # scaffolding-repos: this account's shared Actions concurrent-runner cap
+    # saturates once a few PRs are open across repos, leaving matrix legs
+    # queued 10-20+ min for a runner slot. One job means one runner request
+    # per push/PR; the tradeoff is legs running sequentially instead of in
+    # parallel.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
+      - name: Run lint
+        run: uv run ruff check bin tests
+
+      - name: Run type check
+        run: uv run mypy bin
+
+      - name: Run tests
+        run: uv run pytest -q

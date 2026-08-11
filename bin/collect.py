@@ -87,19 +87,10 @@ GH_SIGNAL_REASONS = {"review-requested", "mention", "team-mention", "comment",
                      "assign", "author"}
 
 
-def _parse_origin(url: str):
-    """owner/name from a git origin URL, or None if it isn't GitHub.
-
-    `git remote get-url` output keeps its trailing newline, and the old
-    `([^/.]+)` name class happily matched it — producing a repo id ending in
-    `\\n` that made every later API path fail with "invalid control character
-    in URL". Strip first, and let the name carry dots so `foo.bar` survives.
-    """
-    # rstrip the slash before matching: a `.../owner/name/` origin otherwise
-    # carries it into the name and 404s every path built from the id, which
-    # is the same silent-drop this function exists to fix.
-    m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", url.strip().rstrip("/"))
-    return f"{m.group(1)}/{m.group(2)}" if m else None
+# Shared with todos.py, which needs the same parse to build a `-R owner/repo`
+# and an API path. Two copies of it had already drifted on which URL shapes
+# they accept, so the one that decides evidence lives in jeeves_lib.
+_parse_origin = jl.parse_github_slug
 
 
 _ORIGINS: dict = {}
@@ -214,7 +205,7 @@ def tf_diff() -> str:
         return "(taskferry list unavailable)"
     f = jl.state_dir() / "tf-state.json"
     prev = json.loads(f.read_text()) if f.exists() else {"lines": []}
-    cur_lines = {l.strip() for l in current.splitlines() if "oc_" in l}
+    cur_lines = {line.strip() for line in current.splitlines() if "oc_" in line}
     prev_lines = set(prev.get("lines", []))
     new = sorted(cur_lines - prev_lines)
     f.write_text(json.dumps({"lines": sorted(cur_lines)}))
@@ -298,44 +289,85 @@ SECRET_RES = [
     re.compile(r"\b(xox[a-z](?:\.[a-z]+)?-[A-Za-z0-9-]{10,})"),
     re.compile(r"\b(AKIA[0-9A-Z]{16})\b"),
     re.compile(r"\b(AIza[0-9A-Za-z_-]{30,})"),
-    re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/-]{16,}={0,2}"),
+    # No floor beyond a handful of chars: the keyword itself ("bearer"/
+    # "basic") is specific enough that a short base64 credential right after
+    # it (Basic auth of a short `user:pass`, e.g. `Basic dTpw`) is still
+    # worth redacting more than the false-positive risk of an unrelated
+    # short word following those two keywords is worth avoiding. The floor
+    # counts the whole credential including its `=` padding, not the base64
+    # characters alone — a padded short `user:pass` like `OnA=` or `YQ==`
+    # is 4 chars only once the padding is counted.
+    re.compile(r"(?i)\b((?:bearer|basic)\s+)"
+               r"(?:[A-Za-z0-9._~+/-]{4,}={0,2}|[A-Za-z0-9._~+/-]{2}={2}"
+               r"|[A-Za-z0-9._~+/-]{3}={1,2})"),
     # PEM/SSH private key blocks — the BEGIN/END markers alone are signal
     # enough to redact the whole thing, body included. Two separate patterns:
-    # the `... PRIVATE KEY` family (RSA/EC/OPENSSH/DSA/ENCRYPTED/unlabeled)
-    # shares a `-----END <label> PRIVATE KEY-----` marker; PGP's block has a
-    # different suffix (`PRIVATE KEY BLOCK`, no bare "PRIVATE KEY" marker).
-    re.compile(r"-----BEGIN ((?:RSA |EC |OPENSSH |DSA |ENCRYPTED |)PRIVATE KEY)-----"
-               r"[\s\S]*?-----END \1-----"),
+    # the `... PRIVATE KEY` family (RSA/EC/ECDSA/ED25519/OPENSSH/DSA/
+    # ENCRYPTED/unlabeled) shares a `-----END <label> PRIVATE KEY-----`
+    # marker; PGP's block has a different suffix (`PRIVATE KEY BLOCK`, no
+    # bare "PRIVATE KEY" marker).
+    re.compile(r"-----BEGIN ((?:RSA |EC |ECDSA |ED25519 |OPENSSH |DSA |ENCRYPTED |)"
+               r"PRIVATE KEY)-----[\s\S]*?-----END \1-----"),
     re.compile(r"-----BEGIN (PGP PRIVATE KEY BLOCK)-----"
                r"[\s\S]*?-----END \1-----"),
+    # Fallback for a key body that never reaches its own `-----END` marker —
+    # the prose-fallback path's 800-char denoise truncation can cut a pasted
+    # key mid-body. The two patterns above already consumed every BEGIN...END
+    # pair by the time this runs, so any `-----BEGIN...PRIVATE KEY-----`
+    # still standing here is exactly the truncated case. Redact the header
+    # plus a bounded base64 body rather than to end-of-file: the body is
+    # limited to base64 characters, whitespace (line-wrapped base64), and
+    # escaped-newline backslashes (the staged JSONL form), capped at a
+    # generous fixed length — one truncated key can no longer wipe every
+    # subsequent staged line.
+    re.compile(r"-----BEGIN (?:(?:RSA |EC |ECDSA |ED25519 |OPENSSH |DSA |ENCRYPTED |)"
+               r"PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----"
+               r"[A-Za-z0-9+/=\s\\]{0,8192}"),
     # `scheme://user:pass@host` connection strings (DATABASE_URL, a raw
     # psql/mysql DSN). Only the password half is masked; scheme/user stay for
-    # context. The value group allows `@` (greedy, so it backtracks to the
-    # rightmost `@` before the lookahead succeeds) — a password containing
+    # context. The user segment is optional (`redis://:pass@host` is a valid,
+    # common DSN shape with no username) but bans `/` — without that ban the
+    # pattern also fired on plain-URL path shapes like `example.com/path:8080@`
+    # and destroyed path/port content. The password group allows `/` (a
+    # password itself can contain one) and `@` (greedy, so it backtracks to
+    # the rightmost `@` before the lookahead succeeds) — a password containing
     # its own `@` used to truncate the match at the first one, leaking the
-    # remainder.
-    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@\"']+:)([^\s/\"'\\]+)(?=@)"),
+    # remainder. It is escape-aware: a `\` plus any char (a JSON-escaped quote
+    # or backslash inside the password) counts as one password character, so an
+    # escaped quote no longer makes the `(?=@)` lookahead fail and leak the
+    # whole password.
+    re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s/@:\"']*:)((?:\\.|[^\s\"'\\])+)(?=@)"),
     # No `\b` in front: `_` is a word character, so a boundary would never
     # match the `API_KEY` inside `OPENAI_API_KEY`, which is exactly the shape
     # these turn up in. The key is `[\w.-]*<keyword>[\w.-]*` rather than the
     # bare keyword, so `AWS_SECRET_ACCESS_KEY`, `_authToken`, and
     # `PGPASSWORD`/`MYSQL_PWD` all match too, not just an exact
-    # `secret`/`token`/`password`. `(?![a-z])` right after the keyword blocks
-    # the mirror-image false positive — a keyword that's really the start of
-    # an unrelated lowercase word (`Author:`, `tokenizer=`) — while still
-    # allowing a real compound continuation (`_authToken`'s `T`, `_ACCESS_KEY`'s
-    # `_`) or the keyword standing alone. `pwd` alone (bare `PWD=`, the shell
-    # env var) still matches on purpose: a missed real credential costs more
-    # than an over-redacted directory path. Quotes allow an optional leading
-    # `\` — `stage_slice` writes raw JSON-escaped bytes, so a quoted value on
-    # disk reads `\"value\"`, not `"value"`. The value group allows a literal
-    # backslash (only an unescaped quote ends it) — excluding backslash used
-    # to truncate the match at the first one inside the value, leaking the
-    # rest. No floor on the value length: a short real secret is worth
-    # redacting more than a floor is worth avoiding one false positive.
+    # `secret`/`token`/`password`. `(?!(?-i:[a-z]))` right after the keyword
+    # blocks the mirror-image false positive — a keyword that's really the
+    # start of an unrelated lowercase word (`Author:`, `tokenizer=`) — while
+    # still allowing a real compound continuation, including a camelCase one
+    # (`_authToken`'s `T`, `_ACCESS_KEY`'s `_`, `secretKey`'s `K`) or the
+    # keyword standing alone. The `(?-i:...)` scopes case-sensitivity to just
+    # this lookahead despite the pattern's own `(?i)` flag — under plain
+    # `(?i)`, `[a-z]` also matches uppercase, so a camelCase key's uppercase
+    # continuation (`secretKey`'s `K`) would wrongly fail the lookahead and
+    # kill the whole match right after the keyword, leaking the key=value
+    # entirely. `pwd` alone (bare `PWD=`, the shell env var) still matches on
+    # purpose: a missed real credential costs more than an over-redacted
+    # directory path. Quotes allow an optional leading `\` — `stage_slice`
+    # writes raw JSON-escaped bytes, so a quoted value on disk reads
+    # `\"value\"`, not `"value"`. A quoted value is matched escape-aware and
+    # stops at its closing quote when a JSON delimiter (`,`/`}`/`]`/
+    # whitespace/end) follows: an embedded `\"` inside the secret is consumed
+    # as an escaped pair, and an adjacent `"key":"value"` pair keeps its own
+    # key instead of the value group running to whitespace and swallowing the
+    # comma plus the next key, which leaked the second value. Unquoted values
+    # still run to whitespace. No floor on the value length: a short real
+    # secret is worth redacting more than a floor is worth avoiding one false
+    # positive.
     re.compile(r"(?i)(?<![A-Za-z0-9])([\w.-]*(?:api[_-]?key|secret|token|password"
-               r"|passwd|pwd|credential|auth)(?![a-z])[\w.-]*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
-               r"([^\s\"']+)"),
+               r"|passwd|pwd|credential|auth)(?!(?-i:[a-z]))[\w.-]*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
+               r"((?:\\.|[^\\\"])*?(?=\\?[\"'](?=\s*[,}\]]|$))|\S+)"),
 ]
 
 
@@ -479,7 +511,7 @@ def _repo_index() -> dict:
     the directory basename: the ferry uses whichever the user says out loud,
     and those differ (`token-burn` for
     `token-burn-dashboard-model-faceoff`)."""
-    idx = {}
+    idx: dict[str, str] = {}
     for d, full in _repo_origins():
         for key in (full.split("/")[-1], Path(d).name):
             idx.setdefault(key.lower(), full)
@@ -602,7 +634,8 @@ def run_once() -> dict:
     all_cwds = set()
     pending_offsets = dict(offs)
 
-    for path in discover_sessions():
+    sessions = discover_sessions()
+    for path in sessions:
         key = str(path)
         off = offs.get(key, {}).get("offset", 0)
         lines, new_off, status = jl.read_delta(path, off)
@@ -628,6 +661,14 @@ def run_once() -> dict:
                        "rendered": jl.render_slice(entries)})
 
     prune_staging()
+    # Every real session the collector discovered this run, across all batches
+    # — used below to tell a garbage session label (safe to re-key) from one
+    # that names a real session (a claim about whose work this is, which must
+    # not be re-keyed). Derive it from the discovered session universe, not
+    # just the slices with new content this run: a real-but-quiet session (no
+    # new bytes, so never sliced) is still a real name, and a fallback payload
+    # naming it must not be re-keyed onto a slice that happens to be missing.
+    known_sids = {session_id_of(p) for p in sessions}
     for gi, group in enumerate(group_slices(slices, cfg["batch_under"], cfg["batch_max"])):
         by_session, res = {}, None
         # Staged path: hand the ferry the raw transcript and let it read the
@@ -700,11 +741,28 @@ def run_once() -> dict:
                         fallback[p.get("session")] = p
                     # Lenient fallback: with exactly one missing slice and one
                     # returned entry, a mislabeled session key is still
-                    # obviously the answer.
+                    # obviously the answer — there's only one session it could
+                    # possibly be about, so a placeholder or hallucinated name
+                    # is safe to re-key. The one exception is a name that
+                    # belongs to another *real* session this run knows about:
+                    # that's not a garbage label, it's a claim this content is
+                    # some other session's, and re-keying it would attribute
+                    # one session's work to another. `read_staged_summaries`
+                    # refuses the analogous mismatch rather than relabeling it;
+                    # this is the same rule, narrowed to the case where the
+                    # conflicting name actually resolves to something.
+                    own_sid = (payload[0].get("session")
+                               if len(payload) == 1 and isinstance(payload[0], dict) else None)
+                    conflicts = bool(missing) and own_sid is not None \
+                        and own_sid != missing[0]["sid"] and own_sid in known_sids
                     if len(missing) == 1 and len(payload) == 1 and isinstance(payload[0], dict) \
                             and _looks_like_summary(payload[0]) \
-                            and missing[0]["sid"] not in fallback:
+                            and missing[0]["sid"] not in fallback \
+                            and not conflicts:
                         fallback[missing[0]["sid"]] = {**payload[0], "session": missing[0]["sid"]}
+                    elif conflicts:
+                        jl.log(f"fallback entry for {missing[0]['sid']} claims to be "
+                               f"another session in this batch ({own_sid!r}); not re-keyed")
                     # Scope the merge to the sids this fallback dispatch was
                     # actually asked about — an extra or mislabeled sid in
                     # the response must not silently overwrite an
@@ -759,7 +817,7 @@ def run_once() -> dict:
                                res["message"], re.S)
                 if m2:
                     digest_md = m2.group(1).strip() + "\n"
-                    jl.log(f"digest recovered without markdown fence")
+                    jl.log("digest recovered without markdown fence")
             muts = jl.parse_fenced_json(res["message"])
             if digest_md is None or not isinstance(muts, list):
                 jl.log("synthesis output malformed; digest not refreshed")
@@ -776,7 +834,8 @@ def run_once() -> dict:
                 # only grow. todos.verify_evidence gates each check with a
                 # real per-ref lookup; `add` has no evidence field to check,
                 # so it gets the same disproof test the digest uses.
-                keep, disproved = [], []
+                keep: list[dict] = []
+                disproved: list[dict] = []
                 for mut in muts:
                     (disproved if _add_is_disproved(mut) else keep).append(mut)
                 if disproved:
