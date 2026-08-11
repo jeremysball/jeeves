@@ -87,19 +87,10 @@ GH_SIGNAL_REASONS = {"review-requested", "mention", "team-mention", "comment",
                      "assign", "author"}
 
 
-def _parse_origin(url: str):
-    """owner/name from a git origin URL, or None if it isn't GitHub.
-
-    `git remote get-url` output keeps its trailing newline, and the old
-    `([^/.]+)` name class happily matched it — producing a repo id ending in
-    `\\n` that made every later API path fail with "invalid control character
-    in URL". Strip first, and let the name carry dots so `foo.bar` survives.
-    """
-    # rstrip the slash before matching: a `.../owner/name/` origin otherwise
-    # carries it into the name and 404s every path built from the id, which
-    # is the same silent-drop this function exists to fix.
-    m = re.search(r"github\.com[:/]([^/]+)/(.+?)(?:\.git)?$", url.strip().rstrip("/"))
-    return f"{m.group(1)}/{m.group(2)}" if m else None
+# Shared with todos.py, which needs the same parse to build a `-R owner/repo`
+# and an API path. Two copies of it had already drifted on which URL shapes
+# they accept, so the one that decides evidence lives in jeeves_lib.
+_parse_origin = jl.parse_github_slug
 
 
 _ORIGINS: dict = {}

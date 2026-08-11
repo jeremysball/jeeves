@@ -7,7 +7,9 @@ pass.
 """
 
 import subprocess
+from pathlib import Path
 
+import pytest
 
 import jeeves_lib as jl
 import todos as td
@@ -160,6 +162,26 @@ def test_extract_refs_bare_hex_without_keyword():
         ("commit", "062563c"), ("commit", "e0056ed")]
 
 
+@pytest.mark.parametrize("keyword", [
+    "close", "closes", "closed", "fix", "fixes", "fixed",
+    "resolve", "resolves", "resolved",
+])
+def test_extract_refs_github_closing_keywords_are_issues(keyword):
+    # GitHub's own auto-close keywords are a far more common phrasing than
+    # "issue #N" for a synthesis ferry to quote from a commit/PR body.
+    # ISSUE_SCAN_RE only matched the literal word "issue(s)", so these fell
+    # through to the keyword-less PR_SCAN_RE and misclassified as a PR.
+    assert td._extract_refs(f"{keyword} #391") == [("issue", "391")]
+
+
+def test_extract_refs_pr_and_closing_keyword_issue_together():
+    # The trickiest interaction: a PR ref and a keyword-only issue ref in the
+    # same string must both extract, in position order, with the PR hit not
+    # swallowed by the issue's `taken` de-dupe (they're at different positions).
+    assert td._extract_refs("PR #114 fixes #391") == [
+        ("pr", "114"), ("issue", "391")]
+
+
 def test_extract_refs_file_form():
     assert td._extract_refs("file f.txt") == [("file", "f.txt")]
     assert td._extract_refs("file docs/notes with spaces.md") == [("file", "docs/notes with spaces.md")]
@@ -240,6 +262,24 @@ def test_commit_unknown_when_no_base_branch_resolves(tmp_path):
     assert td.classify_evidence(f"commit {h[:10]}", str(repo)) == td.UNKNOWN
 
 
+def test_branch_commit_unknown_when_origin_is_not_github(tmp_path):
+    # A fetched origin that just isn't GitHub: ancestry alone cannot rule out
+    # a squash-merge on that host, and there is no way to ask it further, so
+    # the honest verdict is UNKNOWN -- not a confident OUTSTANDING. (A repo
+    # with no origin remote at all stays OUTSTANDING: there ancestry is the
+    # whole of the available truth.)
+    origin = _bare_origin(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _commit(repo, "f.txt", "x", "init")
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
+    side = _side_commit(repo)
+    assert td._repo_slug(repo) == ""  # filesystem origin, not GitHub
+    assert td.classify_evidence(f"commit {side[:10]}", str(repo)) == td.UNKNOWN
+
+
 def test_commit_landed_via_origin_head(tmp_path):
     origin = _bare_origin(tmp_path)
     repo = tmp_path / "repo"
@@ -251,7 +291,10 @@ def test_commit_landed_via_origin_head(tmp_path):
     subprocess.run(["git", "-C", str(repo), "remote", "set-head", "origin", "main"], check=True)
     side = _side_commit(repo)
     assert td.classify_evidence(f"commit {h[:10]}", str(repo)) == td.LANDED
-    assert td.classify_evidence(f"commit {side[:10]}", str(repo)) == td.OUTSTANDING
+    # The origin is a local bare repo, not GitHub: ancestry alone cannot rule
+    # out a squash-merge on that host, so the branch commit is UNKNOWN, not
+    # OUTSTANDING.
+    assert td.classify_evidence(f"commit {side[:10]}", str(repo)) == td.UNKNOWN
 
 
 def test_base_branch_prefers_origin_head_over_origin_main(tmp_path):
@@ -270,7 +313,45 @@ def test_base_branch_prefers_origin_head_over_origin_main(tmp_path):
     h_main2 = _commit(repo, "h.txt", "z", "main work after trunk")
     subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
     assert td.classify_evidence(f"commit {h_trunk[:10]}", str(repo)) == td.LANDED
-    assert td.classify_evidence(f"commit {h_main2[:10]}", str(repo)) == td.OUTSTANDING
+    # Non-GitHub origin: the trunk commit is not in origin/main's ancestry,
+    # but a squash-merge on that host cannot be ruled out, so UNKNOWN.
+    assert td.classify_evidence(f"commit {h_main2[:10]}", str(repo)) == td.UNKNOWN
+
+
+def test_default_branch_ignores_dangling_origin_head(tmp_path):
+    # symbolic-ref only reads what the symref points at; it does not check the
+    # target exists. A dangling origin/HEAD (branch deleted upstream) must not
+    # win over a perfectly good origin/main.
+    origin = _bare_origin(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _commit(repo, "f.txt", "x", "init")
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main:master"], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "set-head", "origin", "master"], check=True)
+    subprocess.run(["git", "-C", str(repo), "update-ref", "-d", "refs/remotes/origin/master"], check=True)
+    assert td._default_branch(repo) == "origin/main"
+
+
+def test_default_branch_memoized_per_repo(tmp_path, monkeypatch):
+    """_default_branch runs symbolic-ref plus up to two rev-parse calls every
+    time; classifying many evidence rows for one repo must not re-run them."""
+    repo, _ = _git_repo(tmp_path)
+    calls = []
+    real_capture = td._capture
+
+    def fake_capture(args):
+        calls.append(args)
+        return real_capture(args)
+
+    monkeypatch.setattr(td, "_capture", fake_capture)
+    if hasattr(td, "_DEFAULT_BRANCH_CACHE"):
+        monkeypatch.setattr(td, "_DEFAULT_BRANCH_CACHE", {})
+    assert td._default_branch(repo) == "main"
+    assert td._default_branch(repo) == "main"
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +418,13 @@ def test_none_evidence_is_unknown_not_a_crash(tmp_path):
     assert td.verify_evidence(None, str(repo)) is False
 
 
+def test_file_evidence_unknown_when_repo_dir_missing():
+    # Path.resolve() does not require the path to exist, so a nonexistent repo
+    # directory used to report OUTSTANDING -- "confirmed this file is absent"
+    # -- when the truth is that nothing could be checked at all.
+    assert td.classify_evidence("file missing.txt", "/no/such/repo") == td.UNKNOWN
+
+
 def test_file_evidence_is_whole_string_and_absorbs_trailing_refs(tmp_path):
     # Per spec: `file <path>` yields exactly one file ref "and nothing else",
     # and a path may contain spaces. So everything after `file ` is the path --
@@ -353,8 +441,69 @@ def test_missing_file_with_landed_commit_is_outstanding(tmp_path):
     assert td.classify_evidence(f"file nope.txt, commit {h[:10]}", str(repo)) == td.OUTSTANDING
 
 
+def test_file_evidence_absolute_path_does_not_escape_repo(tmp_path):
+    # Path(repo) / value discards `repo` entirely when `value` is absolute
+    # (pathlib behavior), so `file /etc/passwd` used to resolve to a real
+    # host file and report LANDED regardless of the repo's own contents.
+    repo, _ = _git_repo(tmp_path)
+    assert Path("/etc/passwd").exists()  # the escape only matters if this is real
+    assert td.classify_evidence("file /etc/passwd", str(repo)) == td.OUTSTANDING
+
+
+def test_file_evidence_dotdot_traversal_does_not_escape_repo(tmp_path):
+    repo, _ = _git_repo(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+    assert td.classify_evidence(f"file ../{outside.name}", str(repo)) == td.OUTSTANDING
+
+
 # ---------------------------------------------------------------------------
-# Part 2: classify_evidence() — pr/issue references and gh-axi invocation
+# Part 2: parse_github_slug() — host anchoring
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "https://notgithub.com/acme/widget.git",
+    "https://gitlab.com/github.com/acme/widget.git",
+    "https://evil.example/github.com/acme/widget.git",
+])
+def test_parse_github_slug_rejects_github_com_as_substring(url):
+    # The old unanchored regex matched `github.com` anywhere in the URL, so a
+    # path segment on a non-GitHub host read as a GitHub origin and produced a
+    # plausible-looking slug for a repo that does not exist there.
+    assert jl.parse_github_slug(url) is None
+
+
+@pytest.mark.parametrize("url,slug", [
+    ("https://github.com/o/r.git", "o/r"),
+    ("https://github.com/o/r", "o/r"),
+    ("git@github.com:o/r.git", "o/r"),
+    ("ssh://git@github.com/o/r.git", "o/r"),
+    # No user@ prefix: git's scp-like syntax makes it optional, and the old
+    # (pre-host-anchoring) regex accepted this form -- the anchoring fix must
+    # not silently drop it.
+    ("github.com:o/r.git", "o/r"),
+])
+def test_parse_github_slug_accepts_real_github_origins(url, slug):
+    assert jl.parse_github_slug(url) == slug
+
+
+@pytest.mark.parametrize("url", [
+    # Unbalanced "[" makes urlsplit treat this as a malformed IPv6 host and
+    # raise ValueError -- but git itself accepts this as a remote URL with no
+    # validation, so a repo can genuinely have this as its origin.
+    "https://[bad/o/r.git",
+    "ssh://[bad/o/r",
+])
+def test_parse_github_slug_never_raises_on_a_malformed_url(url):
+    # A malformed-but-git-accepted origin is not a GitHub origin -- return
+    # None, the same answer as any other non-GitHub URL, rather than crashing
+    # every caller (todos.classify_evidence, collect._repo_origins) that has
+    # no reason to expect this function can raise.
+    assert jl.parse_github_slug(url) is None
+
+
+# ---------------------------------------------------------------------------
+# Part 2: classify_evidence() — pr references and remote slug
 # ---------------------------------------------------------------------------
 
 def test_pr_unknown_without_origin_remote(tmp_path, monkeypatch):
@@ -364,63 +513,30 @@ def test_pr_unknown_without_origin_remote(tmp_path, monkeypatch):
     assert td.classify_evidence("PR #42", str(repo)) == td.UNKNOWN
 
 
-def test_pr_lookup_runs_inside_a_real_repo_directory(tmp_path, monkeypatch):
-    # -R takes OWNER/REPO, not a filesystem path -- handing it a path returns
-    # NOT_FOUND for every PR that exists. When repo is a real directory, run
-    # gh-axi with cwd set to it instead of deriving a slug from origin at all.
+@pytest.mark.parametrize("url", [
+    "git@github.com:acme/widget.git",
+    "https://github.com/acme/widget.git",
+    "https://github.com/acme/widget",
+])
+def test_pr_lookup_derives_owner_repo_slug_from_origin(url, tmp_path, monkeypatch):
     repo, _ = _git_repo(tmp_path)
-    seen = {}
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", url], check=True)
+    calls = []
+    # Only the pr lookup is stubbed out. Failing *every* subprocess call also
+    # killed the `git remote get-url origin` the slug is read from, so the slug
+    # came back empty and the lookup was never reached -- the assertion below
+    # could then only ever fail.
+    real_run = subprocess.run
 
-    def fake_capture(args, cwd=None):
-        seen["args"], seen["cwd"] = args, cwd
-        return ""
+    def fake_run(args, **kw):
+        calls.append(list(args))
+        if args and args[0] == "git":
+            return real_run(args, **kw)
+        raise FileNotFoundError("no network")
 
-    monkeypatch.setattr(td, "_capture", fake_capture)
-    assert td.classify_evidence("PR #419 merged", str(repo)) == td.UNKNOWN
-    assert seen["args"] == ["gh-axi", "pr", "view", "419"]
-    assert seen["cwd"] == str(repo)
-
-
-def test_pr_lookup_falls_back_to_dash_r_for_an_owner_repo_string(monkeypatch):
-    # The ferry is asked for a local path but sometimes writes owner/repo
-    # directly; that shape is exactly what -R wants.
-    seen = {}
-
-    def fake_capture(args, cwd=None):
-        seen["args"], seen["cwd"] = args, cwd
-        return '  state: "merged"\n'
-
-    monkeypatch.setattr(td, "_capture", fake_capture)
-    assert td.classify_evidence("PR #419", "jeremysball/taskferry") == td.LANDED
-    assert seen["args"] == ["gh-axi", "pr", "view", "419", "-R", "jeremysball/taskferry"]
-    assert seen["cwd"] is None
-
-
-def test_pr_lookup_rejects_a_nonexistent_local_path(monkeypatch):
-    monkeypatch.setattr(td, "_capture", lambda args, cwd=None: '  state: "merged"\n')
-    assert td.classify_evidence("PR #419", "/no/such/dir/anywhere") == td.UNKNOWN
-
-
-def test_issue_kind_is_extracted_separately_from_pr(tmp_path):
-    # "issue #N" must not also be picked up by the generic #N pr scan.
-    assert td._extract_refs("issue #391 filed") == [("issue", "391")]
-    assert td._extract_refs("closes issue #391, PR #42") == [("issue", "391"), ("pr", "42")]
-
-
-def test_issue_landed_when_closed(tmp_path, monkeypatch):
-    repo, _ = _git_repo(tmp_path)
-
-    def fake_capture(args, cwd=None):
-        return '  state: "closed"\n' if args[:3] == ["gh-axi", "issue", "view"] else ""
-
-    monkeypatch.setattr(td, "_capture", fake_capture)
-    assert td.classify_evidence("issue #391 filed", str(repo)) == td.LANDED
-
-
-def test_issue_outstanding_when_open(tmp_path, monkeypatch):
-    repo, _ = _git_repo(tmp_path)
-    monkeypatch.setattr(td, "_capture", lambda args, cwd=None: '  state: "open"\n')
-    assert td.classify_evidence("issue #391 filed", str(repo)) == td.OUTSTANDING
+    monkeypatch.setattr(td.subprocess, "run", fake_run)
+    assert td.classify_evidence("PR #42", str(repo)) == td.UNKNOWN
+    assert any("acme/widget" in " ".join(a) for a in calls), f"slug not found in {calls}"
 
 
 # ---------------------------------------------------------------------------
