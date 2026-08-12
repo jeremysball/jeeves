@@ -194,6 +194,90 @@ def test_run_once_crash_does_not_advance(tmp_path, monkeypatch):
     assert "crashed" in (tmp_path / "state" / "collect.log").read_text()
 
 
+def test_run_once_survives_a_transcript_deleted_mid_run(tmp_path, monkeypatch):
+    """A transcript can vanish between discovery and the offset save.
+
+    Real cause: the sessions live under a project dir named after a git
+    worktree, and deleting that worktree takes the transcripts with it. The
+    window is minutes wide because a ferry dispatch sits inside it. Sizing
+    the file unguarded turned that into a FileNotFoundError that escaped
+    run_once entirely, so `offsets_save` never ran and *every* session in the
+    batch lost its already-paid-for extraction — then the next cron hour
+    re-did the work and crashed the same way. Hit twice on 2026-08-11
+    (`docs-recursive-ferry-rename` at 19:26, `sandbox-narrow-binds` at 22:1x).
+    """
+    _env(tmp_path, monkeypatch)
+    root = tmp_path / "projects"
+    doomed = _mk_session(root, "-workspace-proj--worktrees-gone", "ses_gone", ["work a"])
+    _mk_session(root, "-home-x-proj1", "ses_live", ["work b"])
+
+    real_ferry = _staging_ferry(monkeypatch, "ses_gone", "ses_live")
+    inner = jl.ferry
+
+    def ferry_then_delete(*a, **k):
+        res = inner(*a, **k)
+        doomed.unlink(missing_ok=True)  # the worktree goes away mid-dispatch
+        return res
+
+    monkeypatch.setattr(jl, "ferry", ferry_then_delete)
+
+    counts = cc.run_once()  # must not raise
+
+    # The surviving session's offset was still saved — the whole run is not
+    # forfeited because one unrelated transcript disappeared.
+    offs = cc.offsets_load()
+    assert any(k.endswith("ses_live.jsonl") for k in offs), offs
+    assert counts["extracted"] >= 1
+    assert real_ferry["dir"] is not None
+
+
+def test_run_once_skips_a_transcript_that_vanishes_before_the_read(tmp_path, monkeypatch):
+    """The same race, one stage earlier: gone between glob and read_delta."""
+    _env(tmp_path, monkeypatch)
+    root = tmp_path / "projects"
+    doomed = _mk_session(root, "-workspace-proj--worktrees-gone", "ses_gone", ["work a"])
+    _mk_session(root, "-home-x-proj1", "ses_live", ["work b"])
+    _staging_ferry(monkeypatch, "ses_live")
+
+    real_discover = cc.discover_sessions
+
+    def discover_then_delete():
+        found = real_discover()
+        doomed.unlink(missing_ok=True)
+        return found
+
+    monkeypatch.setattr(cc, "discover_sessions", discover_then_delete)
+
+    counts = cc.run_once()  # must not raise
+    assert counts["sessions"] == 1  # only the live one was readable
+    assert "vanished before read" in (tmp_path / "state" / "collect.log").read_text()
+
+
+def test_vanished_transcript_offset_is_not_written_back(tmp_path, monkeypatch):
+    """A file that no longer exists must not get a resurrected offset row.
+
+    Writing one back would keep a dead path in offsets.tsv forever, and the
+    size recorded for it would be a guess about a file nobody can stat.
+    """
+    _env(tmp_path, monkeypatch)
+    root = tmp_path / "projects"
+    doomed = _mk_session(root, "-workspace-proj--worktrees-gone", "ses_gone", ["work a"])
+    _staging_ferry(monkeypatch, "ses_gone")
+    inner = jl.ferry
+
+    def ferry_then_delete(*a, **k):
+        res = inner(*a, **k)
+        doomed.unlink(missing_ok=True)
+        return res
+
+    monkeypatch.setattr(jl, "ferry", ferry_then_delete)
+    cc.run_once()
+
+    offs = cc.offsets_load()
+    assert not any(k.endswith("ses_gone.jsonl") for k in offs), offs
+    assert "vanished" in (tmp_path / "state" / "collect.log").read_text().lower()
+
+
 def test_parse_origin_tolerates_trailing_newline_and_git_suffix():
     # `git remote get-url` output keeps its newline; the old [^/.]+ class ate
     # it, producing repos/owner/name\n/pulls -> invalid control character

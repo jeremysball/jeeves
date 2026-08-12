@@ -638,7 +638,15 @@ def run_once() -> dict:
     for path in sessions:
         key = str(path)
         off = offs.get(key, {}).get("offset", 0)
-        lines, new_off, status = jl.read_delta(path, off)
+        # Same vanishing-transcript race as the offset write further down:
+        # `discover_sessions()` globbed this path, but a worktree removal can
+        # delete it before the read reaches it. Skip the session rather than
+        # letting the whole run die on one dead path.
+        try:
+            lines, new_off, status = jl.read_delta(path, off)
+        except OSError:
+            jl.log(f"transcript vanished before read, skipping: {key}")
+            continue
         if status == "rotated":
             jl.log(f"rotation detected, re-reading from 0: {key}")
         all_cwds |= collect_cwds(lines)
@@ -807,8 +815,23 @@ def run_once() -> dict:
                 item = {"session": s["sid"], "note": "no block for session"}
             n = len(list((jl.state_dir() / "summaries" / date).glob(f"*--{s['sid']}--*.md"))) + 1
             write_summary(date, s["slug"], s["sid"], n, item)
-            pending_offsets[s["path"]] = {"offset": s["new_off"],
-                                          "size": Path(s["path"]).stat().st_size}
+            # The transcript can disappear between discovery and here — the
+            # project dir is named after a git worktree, so removing that
+            # worktree deletes it, and a ferry dispatch sits inside the
+            # window. Sizing it unguarded raised FileNotFoundError out of
+            # run_once, which skipped `offsets_save` below and threw away the
+            # whole batch's extraction, including every session that was
+            # perfectly fine. Drop the row instead: the summary above is
+            # already written, and an offset into a file nobody can stat is
+            # not worth carrying forward. Matches `_is_dead`'s reading of a
+            # missing transcript as one that has stopped growing.
+            try:
+                size = Path(s["path"]).stat().st_size
+            except OSError:
+                jl.log(f"transcript vanished mid-run, dropping its offset: {s['path']}")
+                counts["extracted"] += 1
+                continue
+            pending_offsets[s["path"]] = {"offset": s["new_off"], "size": size}
             counts["extracted"] += 1
 
     offsets_save(pending_offsets)
