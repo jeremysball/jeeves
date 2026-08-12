@@ -169,6 +169,45 @@ def test_parse_axi_message_missing():
     assert jl.parse_axi_message("status: crashed") is None
 
 
+# TOON only quotes a scalar it has to. A one-line message with no special
+# characters comes back bare, and the quote-anchored parser read that as
+# "no message present" — so `ferry()` reported "could not read message from
+# result output" for a task that had actually succeeded. Live-reproduced
+# 2026-08-11 on oc_msphn3q6_de82fc0f (`status: done`, `exitCode: 0`,
+# `message: JEEVES_ROUTE_OK`), which the collector logged as a model failure
+# and retried against the fallback route, which then "failed" identically.
+BARE_SCALAR_RESULT = '''taskId: oc_abc123_def456
+status: done
+exitCode: 0
+message: JEEVES_ROUTE_OK
+narrationTotalChars: 15
+'''
+
+
+def test_parse_axi_message_reads_a_bare_unquoted_scalar():
+    assert jl.parse_axi_message(BARE_SCALAR_RESULT) == "JEEVES_ROUTE_OK"
+
+
+def test_parse_axi_message_bare_scalar_stops_at_end_of_line():
+    """A bare value ends at the newline — it must not swallow the next key."""
+    assert jl.parse_axi_message(
+        "status: done\nmessage: OK\nlogPath: /tmp/x.ndjson\n") == "OK"
+
+
+def test_parse_axi_message_bare_null_is_empty_not_unreadable():
+    """`message: null` is a real answer — there is no message — which is a
+    different diagnosis from "I could not parse this output". Returning None
+    here would send the caller down the "could not read message" path and
+    blame the model for a task that simply produced nothing."""
+    assert jl.parse_axi_message("status: done\nmessage: null\n") == ""
+
+
+def test_parse_axi_message_still_prefers_the_quoted_form():
+    """A quoted value that happens to contain a newline escape must still be
+    unescaped, not truncated at the first line."""
+    assert jl.parse_axi_message(SAMPLE_RESULT) == 'line one "quoted"\nline two'
+
+
 def test_parse_fenced_json():
     txt = 'prose\n```json\n{"a": [1, 2]}\n```\ntrailing'
     assert jl.parse_fenced_json(txt) == {"a": [1, 2]}
