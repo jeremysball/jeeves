@@ -273,7 +273,26 @@ FENCE_RE = re.compile(r"```json\s*\n(.*?)```", re.S)
 
 
 def parse_axi_message(result_text: str):
-    """Extract message: "..." from taskferry result output, quote-aware."""
+    """Extract the `message` field from taskferry result output.
+
+    Two encodings, because TOON only quotes a scalar it has to: a value with
+    newlines or special characters arrives quoted and escaped, while a plain
+    one-line answer arrives bare. Anchoring on the quote alone read every
+    bare message as "no message present", so `ferry()` reported "could not
+    read message from result output" for tasks that had plainly succeeded —
+    then retried against the fallback route, which "failed" the same way, so
+    the log blamed two healthy models instead of this parser.
+
+    Returns the message on success, `""` when the field is present but holds
+    nothing (`null`, or an empty string), and `None` only when the field is
+    genuinely absent or malformed. The caller distinguishes all three: `None`
+    is the one that means "I could not read this."
+    """
+    bare = re.search(r"^message: (?!\")(.*)$", result_text, re.M)
+    if bare:
+        val = bare.group(1).strip()
+        return "" if val == "null" else val
+
     m = re.search(r'^message: "', result_text, re.M)
     if not m:
         return None
