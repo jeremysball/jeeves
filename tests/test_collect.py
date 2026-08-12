@@ -995,3 +995,164 @@ def test_an_unreadable_transcript_is_not_reported_as_vanished(tmp_path, monkeypa
         cc.run_once()
     log = tmp_path / "state" / "collect.log"
     assert "vanished" not in (log.read_text().lower() if log.exists() else "")
+GOOD_SYNTH = ('```markdown\n# jeeves digest — D\n**Shipped**\n- thing\n```\n'
+              '```json\n[]\n```\nStatus: DONE')
+
+
+def _synth_sequence(monkeypatch, *replies):
+    """Drive extraction normally and hand the synthesis dispatch a scripted
+    sequence of replies, one per call."""
+    pending = list(replies)
+    seen = []
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:
+            (Path(directory) / "summary-ses1.json").write_text(json.dumps(
+                {"session": "ses1", "shipped": [], "oversaw": [], "loose_ends": [],
+                 "tangents": [], "overlooked": [], "failures": [], "shape": "s"}))
+            return {"ok": True, "task_id": "oc_x", "error": "", "message": "Status: DONE"}
+        seen.append(prompt)
+        return {"ok": True, "task_id": "oc_s", "error": "",
+                "message": pending.pop(0) if pending else ""}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    monkeypatch.setattr(cc, "tf_diff", lambda: "(test notes)")
+    return seen
+
+
+def test_parse_synthesis_reports_which_half_is_missing():
+    """"malformed" alone never said whether the digest or the mutation array
+    was the part that failed, so eleven historical rejections were all logged
+    identically."""
+    d, m = cc.parse_synthesis(GOOD_SYNTH)
+    assert d is not None and m == []
+    assert cc.describe_contract_miss(d, m) == "none"
+
+    d, m = cc.parse_synthesis("```markdown\n# jeeves digest — D\n- x\n```\n")
+    assert d is not None and m is None
+    assert cc.describe_contract_miss(d, m) == "no mutation array"
+
+    d, m = cc.parse_synthesis("```json\n[]\n```\n")
+    assert d is None and m == []
+    assert cc.describe_contract_miss(d, m) == "no digest markdown"
+
+    # A JSON object is not a mutation list; treating it as one used to reach
+    # the ledger writer with a dict.
+    d, m = cc.parse_synthesis('```markdown\n# jeeves digest — D\n```\n```json\n{"op": "add"}\n```')
+    assert m is None
+
+
+def test_malformed_synthesis_is_retried_once_and_the_digest_still_lands(tmp_path, monkeypatch):
+    """The contract miss is non-deterministic: the same prompt on the same
+    route came back well-formed on a standalone re-run minutes after a cron
+    run had been rejected. Discarding an hour of extraction over one bad
+    formatting roll is the wrong trade."""
+    _env(tmp_path, monkeypatch)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["did the thing"])
+    seen = _synth_sequence(monkeypatch, "here is your digest, no fences at all", GOOD_SYNTH)
+
+    counts = cc.run_once()
+
+    assert counts["digest"] == 1
+    assert (tmp_path / "state" / "digests").glob("*.md")
+    assert len(seen) == 2
+    assert cc.CONTRACT_REMINDER in seen[1]
+    assert cc.CONTRACT_REMINDER not in seen[0]
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "retrying once" in log
+    assert "no digest markdown, no mutation array" in log
+
+
+def test_a_synthesis_reply_that_fails_the_contract_twice_is_kept_on_disk(tmp_path, monkeypatch):
+    """The rejected text was unrecoverable the moment run_once returned, so
+    the shape of a malformed reply could never be examined after the fact."""
+    _env(tmp_path, monkeypatch)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["did the thing"])
+    _synth_sequence(monkeypatch, "first bad reply", "second bad reply")
+
+    counts = cc.run_once()
+
+    assert counts["digest"] == 0
+    raw = sorted((tmp_path / "state" / "synthesis-raw").glob("*.txt"))
+    assert len(raw) == 2
+    assert [p.read_text() for p in raw] == ["first bad reply", "second bad reply"]
+    assert raw[0].name.endswith("attempt1.txt")
+    assert raw[1].name.endswith("attempt2.txt")
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "malformed after retry" in log
+    assert str(raw[1]) in log  # the log points at the file, not just at itself
+
+
+def test_synthesis_raw_dir_keeps_only_the_last_20(tmp_path, monkeypatch):
+    """An unbounded dump directory is a slow leak in a dir that never gets
+    looked at."""
+    _env(tmp_path, monkeypatch)
+    for i in range(25):
+        cc.save_raw_synthesis("2026-08-12", f"body {i:02d}", f"t{i:02d}")
+    kept = sorted((tmp_path / "state" / "synthesis-raw").glob("*.txt"))
+    assert len(kept) == 20
+    assert kept[-1].read_text() == "body 24"
+
+
+def test_a_hard_synthesis_failure_is_not_retried(tmp_path, monkeypatch):
+    """A dispatch that never returned a message is a route problem, not a
+    formatting one — `ferry()` already ran its own fallback, and re-asking
+    pays a second full timeout for the same answer."""
+    _env(tmp_path, monkeypatch)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["did the thing"])
+    calls = []
+
+    def fake_ferry(prompt, model, wait_s=420, directory=""):
+        if directory:
+            (Path(directory) / "summary-ses1.json").write_text(json.dumps(
+                {"session": "ses1", "shipped": [], "oversaw": [], "loose_ends": [],
+                 "tangents": [], "overlooked": [], "failures": [], "shape": "s"}))
+            return {"ok": True, "task_id": "oc_x", "error": "", "message": "Status: DONE"}
+        calls.append(prompt)
+        return {"ok": False, "task_id": "", "error": "route down", "message": ""}
+
+    monkeypatch.setattr(jl, "ferry", fake_ferry)
+    monkeypatch.setattr(cc, "tf_diff", lambda: "(test notes)")
+
+    counts = cc.run_once()
+
+    assert counts["digest"] == 0
+    assert len(calls) == 1
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "synthesis failed: route down" in log
+    assert not (tmp_path / "state" / "synthesis-raw").exists()
+
+
+def test_the_retry_is_skipped_when_the_run_has_already_eaten_its_slot(tmp_path, monkeypatch):
+    """collect.py runs at 13 past the hour and main() takes a non-blocking
+    flock, so an overrun does not queue the next run, it drops it. A second
+    600s synthesis dispatch is worth one digest, never the next hour's whole
+    collection."""
+    _env(tmp_path, monkeypatch)
+    _mk_session(tmp_path / "projects", "-home-x-proj1", "ses1", ["did the thing"])
+    seen = _synth_sequence(monkeypatch, "no fences here", GOOD_SYNTH)
+
+    clock = iter([0.0] + [cc.RUN_BUDGET_S - 60.0] * 8)
+    monkeypatch.setattr(cc.time, "time", lambda: next(clock))
+
+    counts = cc.run_once()
+
+    assert counts["digest"] == 0
+    assert len(seen) == 1  # the retry never went out
+    log = (tmp_path / "state" / "collect.log").read_text()
+    assert "skipping the retry to leave the next run its slot" in log
+    assert "malformed after retry" not in log
+    # the rejected reply is still kept, and the log still points at it
+    raw = sorted((tmp_path / "state" / "synthesis-raw").glob("*.txt"))
+    assert len(raw) == 1 and raw[0].name.endswith("attempt1.txt")
+    assert str(raw[0]) in log
+
+
+def test_contract_reminder_keeps_the_status_line_the_prompt_requires():
+    """prompts/synthesis.md tells the model to emit both fences *plus* a
+    Status line. The reminder is appended last, so it is the most specific
+    instruction the model reads — one that said "exactly two fenced blocks"
+    and nothing else would talk it out of the Status line."""
+    template = (cc.PROMPTS / "synthesis.md").read_text()
+    assert "Status: DONE" in template
+    assert "Status: DONE" in cc.CONTRACT_REMINDER
