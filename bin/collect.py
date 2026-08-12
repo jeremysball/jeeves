@@ -498,11 +498,20 @@ def synthesis_prompt(date, github_block, git_state_block) -> str:
 
 CONTRACT_REMINDER = (
     "Your previous reply did not meet the output contract and was discarded.\n"
-    "Reply again with exactly two fenced blocks and nothing else between them:\n"
-    "first a ```markdown block whose first line is `# jeeves digest`, then a "
-    "```json block holding a JSON array (use `[]` if there are no mutations).\n"
-    "Close both fences."
+    "Reply again with two fenced blocks: first a ```markdown block whose first "
+    "line is `# jeeves digest`, then a ```json block holding a JSON array "
+    "(use `[]` if there are no mutations). Close both fences.\n"
+    "Keep the trailing `Status: DONE` line after them, exactly as the "
+    "instructions above specify."
 )
+
+# collect.py runs from cron at 13 past the hour. main() takes a non-blocking
+# flock and skips outright when the previous run is still going, so overrunning
+# the hour does not queue a run, it drops one. A malformed synthesis is worth
+# one retry, but not at the price of the next hour's collection: skip the retry
+# when the run has already spent enough of its slot that a second 600s dispatch
+# could push past the next trigger.
+RUN_BUDGET_S = 45 * 60
 
 
 def parse_synthesis(message: str) -> tuple:
@@ -678,6 +687,7 @@ def collect_cwds(lines) -> set:
 
 
 def run_once() -> dict:
+    run_started = time.time()
     cfg = jl.load_config()
     if not cfg["model"]:
         jl.die("no model pinned — run the jeeves setup (see SKILL.md) first")
@@ -905,8 +915,11 @@ def run_once() -> dict:
         git_state_block = git_state()
         prompt = synthesis_prompt(date, github_block, git_state_block)
         res = jl.ferry(prompt, cfg["model"], wait_s=600)
+        digest_md = muts = None
+        retried = False
         if res["ok"]:
             digest_md, muts = parse_synthesis(res["message"])
+            miss = describe_contract_miss(digest_md, muts)
             if digest_md is None or muts is None:
                 # One corrective retry. The two-fence contract is a formatting
                 # requirement the model meets most of the time and misses
@@ -914,24 +927,33 @@ def run_once() -> dict:
                 # against the same route came back well-formed minutes after
                 # a cron run had been rejected. Re-asking with the specific
                 # miss named is cheaper than discarding an hour of extraction.
-                save_raw_synthesis(date, res["message"], "attempt1")
-                jl.log(f"synthesis output malformed ({describe_contract_miss(digest_md, muts)}); retrying once")
-                res = jl.ferry(prompt + "\n\n" + CONTRACT_REMINDER,
-                               cfg["model"], wait_s=600)
-                if res["ok"]:
-                    digest_md, muts = parse_synthesis(res["message"])
+                raw = save_raw_synthesis(date, res["message"], "attempt1")
+                spent = time.time() - run_started
+                if spent + 600 > RUN_BUDGET_S:
+                    jl.log(f"synthesis output malformed ({miss}); "
+                           f"{spent / 60:.0f}m spent, skipping the retry to "
+                           f"leave the next run its slot; "
+                           f"digest not refreshed; raw output at {raw}")
+                else:
+                    retried = True
+                    jl.log(f"synthesis output malformed ({miss}); retrying once")
+                    res = jl.ferry(prompt + "\n\n" + CONTRACT_REMINDER,
+                                   cfg["model"], wait_s=600)
+                    digest_md = muts = None
+                    if res["ok"]:
+                        digest_md, muts = parse_synthesis(res["message"])
         if not res["ok"]:
-            digest_md = muts = None
             jl.log(f"synthesis failed: {res['error']} — digest not refreshed")
-        if res["ok"]:
+        else:
             if digest_md is None or muts is None:
                 # Keep the rejected text. Eleven malformed runs before this
                 # left nothing on disk to look at, so the shape of the miss
                 # was never knowable after the fact.
-                raw = save_raw_synthesis(date, res["message"], "attempt2")
-                jl.log(f"synthesis output malformed after retry "
-                       f"({describe_contract_miss(digest_md, muts)}); "
-                       f"digest not refreshed; raw output at {raw}")
+                if retried:
+                    raw = save_raw_synthesis(date, res["message"], "attempt2")
+                    jl.log(f"synthesis output malformed after retry "
+                           f"({describe_contract_miss(digest_md, muts)}); "
+                           f"digest not refreshed; raw output at {raw}")
             else:
                 digest_md, flagged = _flag_unverified_refs(digest_md)
                 if flagged:
