@@ -945,3 +945,53 @@ def test_fallback_path_content_is_redacted(tmp_path, monkeypatch):
     cc.run_once()
     assert captured["prompt"] is not None
     assert "ghp_abcdefghijklmnopqrstuvwxyz01" not in captured["prompt"]
+
+
+def test_seed_offsets_survives_a_transcript_that_vanishes_mid_walk(tmp_path, monkeypatch):
+    """seed_offsets() had the identical unguarded read_delta + stat pair that
+    run_once() was fixed for, and it sits ahead of the single offsets_save().
+    One removed worktree therefore lost the whole seed, not one row — and a
+    seed that saves nothing means the next collect run treats every
+    transcript in history as unread and extracts all of it."""
+    _env(tmp_path, monkeypatch)
+    root = tmp_path / "projects"
+    doomed = _mk_session(root, "-workspace-proj--worktrees-gone", "ses_gone", ["work a"])
+    live = _mk_session(root, "-home-x-proj1", "ses_live", ["work b"])
+
+    real_discover = cc.discover_sessions
+
+    def discover_then_delete():
+        found = real_discover()
+        doomed.unlink(missing_ok=True)
+        return found
+
+    monkeypatch.setattr(cc, "discover_sessions", discover_then_delete)
+
+    n = cc.seed_offsets()  # must not raise
+
+    assert n == 1
+    offs = cc.offsets_load()
+    assert str(live) in offs
+    assert offs[str(live)]["offset"] == live.stat().st_size
+    assert str(doomed) not in offs
+    assert "vanished during seed" in (tmp_path / "state" / "collect.log").read_text()
+
+
+def test_an_unreadable_transcript_is_not_reported_as_vanished(tmp_path, monkeypatch):
+    """`vanished` is a specific claim about a specific cause. Catching all of
+    OSError made a permissions or I/O fault print that claim too, which is the
+    plausible-but-wrong diagnosis CLAUDE.md's fail-fast rule exists to stop.
+    Only FileNotFoundError is the vanished case; anything else propagates."""
+    _env(tmp_path, monkeypatch)
+    root = tmp_path / "projects"
+    _mk_session(root, "-home-x-proj1", "ses_live", ["work b"])
+
+    def unreadable(path, offset):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(jl, "read_delta", unreadable)
+
+    with pytest.raises(PermissionError):
+        cc.run_once()
+    log = tmp_path / "state" / "collect.log"
+    assert "vanished" not in (log.read_text().lower() if log.exists() else "")

@@ -642,9 +642,12 @@ def run_once() -> dict:
         # `discover_sessions()` globbed this path, but a worktree removal can
         # delete it before the read reaches it. Skip the session rather than
         # letting the whole run die on one dead path.
+        # Catch only the vanished case. A permissions or I/O error on a
+        # transcript that is still there is a real fault, and logging it as
+        # "vanished" would hand back a confident wrong diagnosis.
         try:
             lines, new_off, status = jl.read_delta(path, off)
-        except OSError:
+        except FileNotFoundError:
             jl.log(f"transcript vanished before read, skipping: {key}")
             continue
         if status == "rotated":
@@ -827,7 +830,7 @@ def run_once() -> dict:
             # missing transcript as one that has stopped growing.
             try:
                 size = Path(s["path"]).stat().st_size
-            except OSError:
+            except FileNotFoundError:
                 jl.log(f"transcript vanished mid-run, dropping its offset: {s['path']}")
                 counts["extracted"] += 1
                 continue
@@ -900,8 +903,19 @@ def seed_offsets() -> int:
         key = str(path)
         if key in offs:
             continue
-        lines, new_off, _ = jl.read_delta(path, 0)
-        offs[key] = {"offset": new_off, "size": path.stat().st_size}
+        # Same vanishing-transcript race as run_once: discover_sessions()
+        # globbed this path, and a worktree removal can delete it before
+        # either the read or the stat lands. Unguarded, one dead path
+        # aborted the whole seed before offsets_save() ran, so every
+        # transcript already walked was seeded again from zero on the next
+        # attempt — the first run then re-extracted all of history.
+        try:
+            lines, new_off, _ = jl.read_delta(path, 0)
+            size = path.stat().st_size
+        except FileNotFoundError:
+            jl.log(f"transcript vanished during seed, skipping: {key}")
+            continue
+        offs[key] = {"offset": new_off, "size": size}
         n += 1
     offsets_save(offs)
     jl.log(f"seeded offsets for {n} transcripts")
