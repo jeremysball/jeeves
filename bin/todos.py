@@ -109,13 +109,6 @@ def apply_dismiss(query: str) -> str:
     return dismissed
 
 
-# Trailing prose is the norm, not the exception: the synthesis ferry writes
-# "commit 3c33869 reset" and "PR #419 merged", never a bare ref. Anchoring
-# these on $ meant every real PR check fell through to False and queued in
-# pending.json forever.
-HEX_RE = re.compile(r"^commit ([0-9a-f]{7,40})\b", re.I)
-PR_RE = re.compile(r"^PR #(\d+)\b", re.I)
-ISSUE_RE = re.compile(r"^issue #(\d+)\b", re.I)
 FILE_RE = re.compile(r"^file (.+)$", re.I)
 
 # The single-ref anchored forms above are what the extraction ferry is *asked*
@@ -592,6 +585,20 @@ def _push_pending(mut: dict, reason: str) -> None:
     save_pending(items)
 
 
+def _apply_check_gate(line: str, evidence: str, repo: str, seen: jl.SeenStore) -> bool:
+    """Verify evidence and apply check mutation to ledger and seen store.
+
+    Returns True if evidence verified and check was applied.
+    Returns False if evidence failed verification.
+    Raises AmbiguousMatch if evidence verified but ledger match was not unique/found.
+    """
+    if not verify_evidence(evidence, repo):
+        return False
+    apply_check(line, evidence or "verified")
+    seen.set_status(jl.line_hash(line), "done")
+    return True
+
+
 def apply_mutations(muts: list) -> dict:
     """Apply ferry-emitted mutations with all gates. Never raises on content —
     failures demote to pending or dedup, logged either way."""
@@ -623,15 +630,15 @@ def apply_mutations(muts: list) -> dict:
                 counts["failed"] += 1
                 jl.log(f"duplicate_of: existing line unknown: {mut}")
         elif op == "check":
-            if not verify_evidence(mut.get("evidence", ""), mut.get("repo")):
-                _push_pending(mut, "evidence did not verify")
-                counts["pending"] += 1
-                jl.log(f"check demoted to pending (evidence): {mut}")
-                continue
+            evidence = mut.get("evidence", "")
+            repo = mut.get("repo")
             try:
-                apply_check(line, mut.get("evidence", "verified"))
-                seen.set_status(h, "done")
-                counts["applied"] += 1
+                if _apply_check_gate(line, evidence, repo, seen):
+                    counts["applied"] += 1
+                else:
+                    _push_pending(mut, "evidence did not verify")
+                    counts["pending"] += 1
+                    jl.log(f"check demoted to pending (evidence): {mut}")
             except AmbiguousMatch:
                 _push_pending(mut, "no unique ledger match")
                 counts["pending"] += 1
@@ -713,16 +720,16 @@ def prune_pending() -> dict:
             counts["moot" if known else "stale"] += 1
             jl.log(f"prune-pending: dropped ({'moot' if known else 'stale'}): {line}")
             continue
-        if not verify_evidence(row.get("evidence", ""), row.get("repo")):
-            kept.append(row)
-            counts["kept"] += 1
-            continue
+        evidence = row.get("evidence", "")
+        repo = row.get("repo")
         try:
-            apply_check(line, row.get("evidence", "verified"))
-            seen.set_status(jl.line_hash(line), "done")
-            counts["applied"] += 1
-            jl.log(f"prune-pending: applied: {line}")
-            sections = parse_ledger(ledger_path().read_text())
+            if _apply_check_gate(line, evidence, repo, seen):
+                counts["applied"] += 1
+                jl.log(f"prune-pending: applied: {line}")
+                sections = parse_ledger(ledger_path().read_text())
+            else:
+                kept.append(row)
+                counts["kept"] += 1
         except AmbiguousMatch:
             kept.append(row)
             counts["kept"] += 1
