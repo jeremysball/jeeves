@@ -41,6 +41,21 @@ done-vs-remaining card (orient-quick).
    `working-report.md`'s Standing rules first — the free tier is
    suspended by standing directive as of 2026-08-05, so `model` needs a
    paid Token Plan / `opencode-go` route, not an `opencode/*-free` id).
+   **Liveness alone isn't the whole check: before writing a pick to
+   `config`, confirm it doesn't violate a *provider-scoped* standing rule**
+   (e.g. "on the ollama provider it is flash and nothing else, do not fall
+   back to another ollama/* model" — `working-report.md`, tightened
+   2026-08-08/09). "Different provider than the primary" satisfies the
+   failover-diversity goal but does not by itself clear a provider's own
+   rule once the pick lands *on* that provider.
+   — *2026-08-11 incident: this config's `fallback_model` was set to
+   `ollama/kimi-k2.7-code` on the strength of "sits on a different provider
+   than the OpenRouter primary... failover diversity," citing a
+   `cheat-sheet.md` that doesn't exist in `choosing-a-model/`. It violated
+   the ollama-flash-only rule (already standing at the time) and fired on
+   every primary failure for over a week before being caught and unset
+   2026-08-19. One incident so far — if it recurs on a different rule, promote
+   this to a general cross-check step rather than a provider-specific note.*
    Also pick a `fallback_model` on a *different* provider than `model`, so
    an account-wide outage on one provider doesn't take down both routes —
    and check whether either needs `--executor opencode` (`openai/*`,
