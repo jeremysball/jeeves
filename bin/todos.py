@@ -14,6 +14,45 @@ from pathlib import Path
 
 import jeeves_lib as jl
 
+# AXI — Agent eXperience Interface constants
+BIN_PATH = str(Path(__file__).resolve()).replace(str(Path.home()), "~")
+DESCRIPTION = "Jeeves todo ledger — local-first grounding for agentic work"
+
+def _toon_escape(s: str) -> str:
+    if s is None:
+        return '""'
+    s = str(s)
+    # TOON quoting: only when needed (newline, comma, quote, colon, bracket)
+    if any(c in s for c in ['\n', '"', ',', ':', '[', ']', '{', '}']) or s.strip() != s or s == "":
+        return '"' + s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n') + '"'
+    return s
+
+def _toon_row(values, fields):
+    parts = []
+    for v, f in zip(values, fields):
+        if f in ("evidence", "line", "repo", "body"):
+            # truncate long text fields in default view
+            sv = str(v) if v is not None else ""
+            if len(sv) > 500:
+                sv = sv[:500] + f" ... (truncated, {len(str(v))} chars total)"
+            parts.append(_toon_escape(sv))
+        else:
+            parts.append(_toon_escape(v))
+    return ",".join(parts)
+
+def _emit_toon_header(name, count, fields):
+    # e.g. pending[3]{line,state}:
+    if fields:
+        return f"{name}[{count}]{{{','.join(fields)}}}:"
+    return f"{name}[{count}]:"
+
+def _print_axi_error(msg: str, help_hint: str = "", exit_code: int = 2):
+    # Structured errors to stdout per AXI 6.2, exit 2 for usage, 1 for error
+    print(f"error: {msg}")
+    if help_hint:
+        print(f"help: {help_hint}")
+    sys.exit(exit_code)
+
 SKELETON = "# jeeves todo ledger\n\n## open\n\n## done\n\n## dismissed\n"
 SECTIONS = ("open", "done", "dismissed")
 
@@ -878,8 +917,161 @@ def ingest_repo_todos(dirs) -> dict:
     return counts
 
 
+class AxiParser(argparse.ArgumentParser):
+    def error(self, message):
+        # AXI 6: help always passes, even with unknown flags; stdout is structured, exit 2 for usage
+        if "-h" in sys.argv or "--help" in sys.argv:
+            print(_axi_help_text(self.prog))
+            sys.exit(0)
+        m = re.search(r"unrecognized arguments: (.+)", message)
+        if m:
+            flags = m.group(1).strip()
+            valid = ", ".join(a.option_strings[0] for a in self._actions if a.option_strings)
+            print(f"error: unknown flag {flags} for `{self.prog}`")
+            print(f"help: valid flags for `{self.prog}`: {valid} (--help always allowed)")
+            sys.exit(2)
+        # missing value, e.g. "argument --add: expected one argument"
+        if "expected one argument" in message or "expected at least one argument" in message:
+            print(f"error: {message}")
+            print(f"help: Run `{self.prog} --help` for details")
+            sys.exit(2)
+        print(f"error: {message}")
+        print(f"help: Run `{self.prog} --help` for details")
+        sys.exit(2)
+    def print_help(self, file=None):
+        # Override to emit AXI help with bin/description
+        if file is None:
+            file = sys.stdout
+        print(_axi_help_text(self.prog), file=file)
+
+def _axi_help_text(prog="todos.py"):
+    return "\n".join([
+        f"bin: {BIN_PATH}",
+        f"description: {DESCRIPTION}",
+        f"usage: {prog} [options]",
+        "options:",
+        "  --add <text>                 Add a new todo (requires --kind/--source)",
+        "  --dismiss <query>            Dismiss an open todo by normalized match",
+        "  --delta                      Show ledger counts (open/done/dismissed/pending)",
+        "  --pending                    List pending checks with live evidence state",
+        "  --prune-pending              Re-verify pending queue and drain resolved",
+        "  --wake                       Mark wake time",
+        "  --reconcile                  Reconcile ledger with SeenStore",
+        "  --apply-mutations <file>     Apply ferry mutations JSON",
+        "  --fields <a,b,c>             Limit output fields (delta/pending)",
+        "  --limit <n>                  Limit pending rows shown (default 30)",
+        "  --full                       Show complete evidence without truncation",
+        "  --format <toon|json>         Output format (default toon)",
+        "  -h, --help                   Show this help",
+        "examples:",
+        "  todos.py                     # dashboard (content first)",
+        "  todos.py --delta --fields open,pending",
+        "  todos.py --pending --limit 10 --fields line,state",
+        "  todos.py --dismiss \"fix auth bug\"",
+    ])
+
+def _print_delta(data, fields=None, fmt="toon"):
+    if fmt == "json":
+        print(json.dumps(data, indent=1))
+        return
+    print(f"bin: {BIN_PATH}")
+    print(f"description: {DESCRIPTION}")
+    # Handle filtered fields: only print what was requested
+    if fields:
+        parts = []
+        for k in ["open", "done", "dismissed", "pending"]:
+            if k in data:
+                parts.append(f"{data[k]} {k}")
+        if parts:
+            print(f"ledger: {', '.join(parts)}")
+        if "top_recurrence" in data and data.get("top_recurrence"):
+            print(_emit_toon_header("top", len(data["top_recurrence"]), ["line", "count"]))
+            for line, cnt in data["top_recurrence"]:
+                sv = line[:120] + (" ... (truncated)" if len(line) > 120 else "")
+                print(f"  {_toon_escape(sv)},{cnt}")
+    else:
+        print(f"ledger: {data['open']} open, {data['done']} done, {data['dismissed']} dismissed, {data['pending']} pending")
+        if data.get("top_recurrence"):
+            print(_emit_toon_header("top", len(data["top_recurrence"]), ["line", "count"]))
+            for line, cnt in data["top_recurrence"]:
+                sv = line[:120] + (" ... (truncated)" if len(line) > 120 else "")
+                print(f"  {_toon_escape(sv)},{cnt}")
+        if data.get("pending", 0) > 0:
+            print("help[2]:")
+            print("  Run `todos.py --pending --limit 10` for details")
+            print("  Run `todos.py --pending --full` to see complete evidence")
+        elif data.get("top_recurrence"):
+            # still show help even when pending 0 but top exists
+            pass
+    # help when filtered but pending still >0
+    if fields and data.get("pending", 0) > 0:
+        print("help[2]:")
+        print("  Run `todos.py --pending --limit 10` for details")
+
+def _print_pending(rows, fields=None, limit=30, full=False, fmt="toon"):
+    if fmt == "json":
+        print(json.dumps(rows, indent=1))
+        return
+    # definitive empty state per AXI 5
+    if not rows:
+        print("pending: 0 pending checks found")
+        print(f"bin: {BIN_PATH}")
+        return
+    # aggregates
+    total = len(rows)
+    show = rows[:limit] if limit else rows
+    # minimal schema per AXI 2: default 4 fields
+    default_fields = ["line", "state", "repo", "evidence"]
+    use_fields = fields.split(",") if fields else default_fields
+    # normalize field names
+    use_fields = [f.strip() for f in use_fields if f.strip()]
+    # emit header
+    print(f"bin: {BIN_PATH}")
+    print(f"description: {DESCRIPTION}")
+    print(f"count: {len(show)} of {total} total")
+    print(_emit_toon_header("pending", len(show), use_fields))
+    for r in show:
+        vals = []
+        for f in use_fields:
+            v = r.get(f, "")
+            if not full and f in ("line", "evidence") and isinstance(v, str) and len(v) > 500:
+                v = v[:500] + f" ... (truncated, {len(r.get(f,''))} chars total)"
+            vals.append(v)
+        print(f"  {_toon_row(vals, use_fields)}")
+    # help hints
+    if total > len(show):
+        print(f"help: showing {len(show)} of {total}; Run `todos.py --pending --limit {total}` for all")
+    if any(not full and len(str(r.get("evidence",""))) > 500 for r in show):
+        print("help: Run `todos.py --pending --full` to see complete evidence")
+    print("help[2]:")
+    print("  Run `todos.py --delta` for ledger counts")
+    print("  Run `todos.py --dismiss \"<line>\"` to dismiss")
+
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="todos.py")
+    # Content first per AXI 8: no args shows dashboard (not help)
+    if len(sys.argv) == 1:
+        # Dashboard: live counts + digest preview
+        data = delta_summary()
+        print(f"bin: {BIN_PATH}")
+        print(f"description: {DESCRIPTION}")
+        print(f"ledger: {data['open']} open, {data['done']} done, {data['dismissed']} dismissed, {data['pending']} pending")
+        if data["pending"] > 0:
+            rows = [{**r, "state": classify_evidence(r.get("evidence", ""), r.get("repo"))} for r in load_pending()[:3]]
+            if rows:
+                print(_emit_toon_header("pending", len(rows), ["line", "state"]))
+                for r in rows:
+                    line = r["line"][:80] + ("..." if len(r["line"]) > 80 else "")
+                    print(f"  {_toon_escape(line)},{r['state']}")
+        elif data["open"] == 0:
+            print("pending: 0 pending checks found — ledger clean")
+        print("help[3]:")
+        print("  Run `todos.py --delta` for full counts")
+        print("  Run `todos.py --pending` for pending checks")
+        print("  Run `todos.py --help` for all commands")
+        sys.exit(0)
+
+    ap = AxiParser(prog="todos.py", add_help=False)
+    ap.add_argument("-h", "--help", action="store_true")
     ap.add_argument("--add")
     ap.add_argument("--kind", default="manual")
     ap.add_argument("--source", default="user")
@@ -890,30 +1082,123 @@ def main() -> None:
     ap.add_argument("--delta", action="store_true")
     ap.add_argument("--pending", action="store_true")
     ap.add_argument("--prune-pending", action="store_true")
-    a = ap.parse_args()
-    if a.add:
-        print(apply_add(a.add, a.kind, a.source))
-    elif a.dismiss:
-        print(apply_dismiss(a.dismiss))
-    elif a.apply_mutations:
-        muts = json.loads(Path(a.apply_mutations).read_text())
-        print(json.dumps(apply_mutations(muts)))
-    elif a.reconcile:
-        print(json.dumps(reconcile()))
-    elif a.wake:
-        wake()
-    elif a.delta:
-        print(json.dumps(delta_summary(), indent=1))
-    elif a.prune_pending:
-        print(json.dumps(prune_pending(), indent=1))
-    elif a.pending:
-        # Annotate each row with its live evidence state so a caller can tell a
-        # merged PR from an unmerged branch commit without re-deriving it by hand.
-        rows = [{**r, "state": classify_evidence(r.get("evidence", ""), r.get("repo"))}
-                for r in load_pending()]
-        print(json.dumps(rows, indent=1))
-    else:
-        ap.print_help()
+    ap.add_argument("--fields")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--full", action="store_true")
+    ap.add_argument("--format", choices=["toon", "json"], default="toon")
+    # manually handle --help always passes per AXI 6
+    args = None
+    try:
+        args = ap.parse_args()
+    except SystemExit as e:
+        # AxiParser already printed structured error and exited; propagate
+        sys.exit(e.code)
+    if args.help:
+        print(_axi_help_text())
+        sys.exit(0)
+    # dispatch with AXI output channels: stdout structured, stderr diagnostics
+    try:
+        if args.add:
+            # validate required
+            if not args.add.strip():
+                _print_axi_error("--add requires a non-empty value", "todos.py --add \"<text>\" --kind loose-end --source myproj", 2)
+            res = apply_add(args.add, args.kind, args.source)
+            if args.format == "json":
+                print(json.dumps({"result": res}))
+            else:
+                print(f"todo: added \"{args.add}\" (no-op if already open)" if "already" in res else f"todo: {res}")
+                print("help: Run `todos.py --delta` to see counts")
+            sys.exit(0)
+        elif args.dismiss:
+            try:
+                res = apply_dismiss(args.dismiss)
+            except AmbiguousMatch as e:
+                # structured error to stdout per AXI 6, exit 1 (intent cannot be satisfied) vs 2 for usage
+                print(f"error: {e}")
+                print("help: Run `todos.py --pending --fields line` to see matching lines")
+                sys.exit(1)
+            if args.format == "json":
+                print(json.dumps({"result": res}))
+            else:
+                print(f"todo: dismissed \"{args.dismiss}\"")
+                # idempotent no-op already handled by find_match raising; dismissed is success
+            sys.exit(0)
+        elif args.apply_mutations:
+            muts = json.loads(Path(args.apply_mutations).read_text())
+            out = apply_mutations(muts)
+            if args.format == "json":
+                print(json.dumps(out, indent=1))
+            else:
+                print(f"mutations: {out.get('applied',0)} applied, {out.get('pending',0)} pending, {out.get('deduped',0)} deduped")
+                if out.get("pending"):
+                    print("help: Run `todos.py --pending` to see pending")
+            sys.exit(0)
+        elif args.reconcile:
+            out = reconcile()
+            if args.format == "json":
+                print(json.dumps(out, indent=1))
+            else:
+                print(f"reconcile: {out.get('registered',0)} registered, {out.get('dismissed',0)} dismissed")
+            sys.exit(0)
+        elif args.wake:
+            wake()
+            if args.format != "json":
+                print("wake: marked")
+            sys.exit(0)
+        elif args.delta:
+            data = delta_summary()
+            # --fields filtering for delta
+            if args.fields:
+                allowed = {"open","done","dismissed","pending","top_recurrence"}
+                req = [f.strip() for f in args.fields.split(",")]
+                filtered = {k: v for k, v in data.items() if k in req}
+                # also handle invalid fields
+                invalid = [f for f in req if f not in allowed]
+                if invalid:
+                    print(f"error: unknown field {invalid[0]} for --delta")
+                    print(f"help: valid fields for --delta: {', '.join(sorted(allowed))}")
+                    sys.exit(2)
+                data = filtered
+            _print_delta(data, fields=args.fields, fmt=args.format)
+            sys.exit(0)
+        elif args.prune_pending:
+            out = prune_pending()
+            if args.format == "json":
+                print(json.dumps(out, indent=1))
+            else:
+                # aggregates
+                print(f"prune: {out.get('applied',0)} applied, {out.get('moot',0)} moot, {out.get('stale',0)} stale, {out.get('kept',0)} kept")
+                if out.get("kept",0) == 0 and out.get("applied",0) == 0:
+                    print("pending: 0 pending checks found")
+                else:
+                    print("help: Run `todos.py --pending` to see remaining")
+            sys.exit(0)
+        elif args.pending:
+            rows = [{**r, "state": classify_evidence(r.get("evidence", ""), r.get("repo"))} for r in load_pending()]
+            limit = args.limit if args.limit is not None else 30
+            # --fields validation
+            if args.fields:
+                valid = {"line","evidence","repo","state","op","reason","queued","kind","source"}
+                req = [f.strip() for f in args.fields.split(",")]
+                invalid = [f for f in req if f not in valid]
+                if invalid:
+                    print(f"error: unknown field {invalid[0]} for --pending")
+                    print(f"help: valid fields for --pending: {', '.join(sorted(valid))}")
+                    sys.exit(2)
+            _print_pending(rows, fields=args.fields, limit=limit, full=args.full, fmt=args.format)
+            sys.exit(0)
+        else:
+            # no recognized flag but not no-args (e.g. only --kind)
+            print(_axi_help_text())
+            sys.exit(0)
+    except AmbiguousMatch as e:
+        print(f"error: {e}")
+        print("help: Run `todos.py --help` for valid flags")
+        sys.exit(1)
+    except Exception as e:
+        # never leak stack trace per AXI 6
+        print(f"error: {e}")
+        print("help: Run `todos.py --help` for details")
         sys.exit(1)
 
 
