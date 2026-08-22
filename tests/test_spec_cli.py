@@ -83,7 +83,7 @@ def test_prune_pending_flag_drains_queue_and_prints_counts_json(tmp_path, monkey
         _row("moot thing", "commit 0000000", str(repo)),
         _row("stale thing", "commit 0000000", str(repo)),
     ])
-    r = subprocess.run([sys.executable, str(TODOS_PY), "--prune-pending"],
+    r = subprocess.run([sys.executable, str(TODOS_PY), "--prune-pending", "--format", "json"],
                        capture_output=True, text=True, env=_env(tmp_path))
     assert r.returncode == 0
     counts = json.loads(r.stdout.strip())
@@ -100,7 +100,7 @@ def test_prune_pending_flag_drains_queue_and_prints_counts_json(tmp_path, monkey
 def test_prune_pending_empty_queue_prints_zero_counts(tmp_path, monkeypatch):
     _ledger(tmp_path, monkeypatch)
     td.save_pending([])
-    r = subprocess.run([sys.executable, str(TODOS_PY), "--prune-pending"],
+    r = subprocess.run([sys.executable, str(TODOS_PY), "--prune-pending", "--format", "json"],
                        capture_output=True, text=True, env=_env(tmp_path))
     assert r.returncode == 0
     counts = json.loads(r.stdout.strip())
@@ -118,7 +118,7 @@ def test_pending_flag_prints_each_row_with_state_key(tmp_path, monkeypatch):
         _row("unknown thing", "commit deadbeef00", str(repo)),
         _row("no repo thing", "commit abc1234", None),
     ])
-    r = subprocess.run([sys.executable, str(TODOS_PY), "--pending"],
+    r = subprocess.run([sys.executable, str(TODOS_PY), "--pending", "--format", "json"],
                        capture_output=True, text=True, env=_env(tmp_path))
     assert r.returncode == 0
     out = json.loads(r.stdout.strip())
@@ -141,7 +141,7 @@ def test_pending_flag_does_not_drain_the_queue(tmp_path, monkeypatch):
         _row("landed thing", f"commit {h[:10]}", str(repo)),
         _row("kept thing", "commit deadbeef00", str(repo)),
     ])
-    r = subprocess.run([sys.executable, str(TODOS_PY), "--pending"],
+    r = subprocess.run([sys.executable, str(TODOS_PY), "--pending", "--format", "json"],
                        capture_output=True, text=True, env=_env(tmp_path))
     assert r.returncode == 0
     after = td.load_pending()
@@ -155,14 +155,14 @@ def test_prune_pending_and_pending_are_distinct_flags(tmp_path, monkeypatch):
     _ledger(tmp_path, monkeypatch)
     env = _env(tmp_path)
     td.save_pending([_row("kept thing", "commit deadbeef00", str(repo))])
-    r1 = subprocess.run([sys.executable, str(TODOS_PY), "--prune-pending"],
+    r1 = subprocess.run([sys.executable, str(TODOS_PY), "--prune-pending", "--format", "json"],
                         capture_output=True, text=True, env=env)
     assert r1.returncode == 0
     counts = json.loads(r1.stdout.strip())
     assert isinstance(counts, dict)
     assert set(counts) == {"applied", "moot", "stale", "kept"}
     td.save_pending([_row("kept thing", "commit deadbeef00", str(repo))])
-    r2 = subprocess.run([sys.executable, str(TODOS_PY), "--pending"],
+    r2 = subprocess.run([sys.executable, str(TODOS_PY), "--pending", "--format", "json"],
                         capture_output=True, text=True, env=env)
     assert r2.returncode == 0
     rows = json.loads(r2.stdout.strip())
