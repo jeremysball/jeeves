@@ -148,6 +148,22 @@ def test_pending_flag_does_not_drain_the_queue(tmp_path, monkeypatch):
     assert [row["line"] for row in after] == ["landed thing", "kept thing"]
 
 
+def test_pending_fields_accepts_seen(tmp_path, monkeypatch):
+    # A folded row's re-queue count has to be reachable without the raw json
+    # dump, or the only evidence of recurrence is invisible to a wake card
+    # that reads --pending --fields.
+    repo, _ = _git_repo(tmp_path)
+    _ledger(tmp_path, monkeypatch)
+    td.save_pending([
+        _row("folded row", "commit deadbeef00", str(repo)),
+    ])
+    r = subprocess.run([sys.executable, str(TODOS_PY), "--pending",
+                        "--fields", "line,seen"],
+                       capture_output=True, text=True, env=_env(tmp_path))
+    assert r.returncode == 0
+    assert "{line,seen}:" in r.stdout
+
+
 def test_prune_pending_and_pending_are_distinct_flags(tmp_path, monkeypatch):
     # prune prints a counts object and empties the queue; pending prints the
     # queue rows. A flag wired to the wrong action fails one of the two runs.

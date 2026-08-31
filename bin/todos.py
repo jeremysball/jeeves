@@ -625,10 +625,50 @@ def save_pending(items: list) -> None:
     tmp.replace(pending_path())
 
 
-def _push_pending(mut: dict, reason: str) -> None:
+def _pending_subject(line: str) -> str:
+    """Identity for matching re-queued checks to the row already in the queue.
+
+    Same normalized-equality rule `find_match` applies to ledger lines, minus
+    the checkbox bullet: the one real variance observed between hours is the
+    ferry quoting the same ledger line with and without its leading "- [ ] ".
+    Two subjects that collide here collide in find_match too, so folding them
+    is consistent with how the rest of the ledger treats them."""
+    s = (line or "").strip()
+    for b in ("- [ ] ", "- [ ]", "- [x] ", "- [x]", "- [] "):
+        if s.startswith(b):
+            s = s[len(b):].strip()
+            break
+    return jl.normalize(s)
+
+
+def _push_pending(mut: dict, reason: str) -> str:
+    """Queue a demoted check, folding it into an existing row for the same
+    subject instead of appending a copy.
+
+    The synthesis ferry re-proposes the same check every hour whose slices
+    still show stale-looking evidence, and _push_pending used to append
+    unconditionally. One stuck row reached eight copies in the queue (the
+    taskferry fix-issue checks, 2026-08-14 through 08-19), each paying its
+    own re-verify in prune and each stealing a slot from real signal in
+    --pending's 30-row window. The fold keeps the subject's age (`queued`
+    stays at the first demotion, which is what the card reads as
+    stale-evidence standing), takes the freshest evidence/repo/reason from
+    the latest attempt, and counts attempts in `seen` so the recurrence
+    reads as signal instead of noise."""
     items = load_pending()
-    items.append({**mut, "reason": reason, "queued": jl.now_et().isoformat(timespec="seconds")})
+    op = mut.get("op") or "check"
+    subject = _pending_subject(mut.get("line", ""))
+    for row in items:
+        if (row.get("op") or "check") == op and _pending_subject(row.get("line", "")) == subject:
+            row.update({k: v for k, v in mut.items() if k in ("line", "evidence", "repo", "kind", "source")})
+            row["reason"] = reason
+            row["seen"] = int(row.get("seen", 1)) + 1
+            save_pending(items)
+            return "merged"
+    items.append({**mut, "op": op, "reason": reason, "seen": 1,
+                  "queued": jl.now_et().isoformat(timespec="seconds")})
     save_pending(items)
+    return "new"
 
 
 def apply_mutations(muts: list) -> dict:
@@ -663,8 +703,11 @@ def apply_mutations(muts: list) -> dict:
                 jl.log(f"duplicate_of: existing line unknown: {mut}")
         elif op == "check":
             if not verify_evidence(mut.get("evidence", ""), mut.get("repo")):
-                _push_pending(mut, "evidence did not verify")
-                counts["pending"] += 1
+                # A re-queue of a subject already in the queue folded the row
+                # instead of growing the queue: count it deduped, like the add
+                # op's re-ad of a known line, so `pending` tracks queue length.
+                outcome = _push_pending(mut, "evidence did not verify")
+                counts["pending" if outcome == "new" else "deduped"] += 1
                 jl.log(f"check demoted to pending (evidence): {mut}")
                 continue
             try:
@@ -672,8 +715,8 @@ def apply_mutations(muts: list) -> dict:
                 seen.set_status(h, "done")
                 counts["applied"] += 1
             except AmbiguousMatch:
-                _push_pending(mut, "no unique ledger match")
-                counts["pending"] += 1
+                outcome = _push_pending(mut, "no unique ledger match")
+                counts["pending" if outcome == "new" else "deduped"] += 1
                 jl.log(f"check demoted to pending (match): {mut}")
         else:
             counts["failed"] += 1
@@ -685,17 +728,22 @@ def apply_mutations(muts: list) -> dict:
 def prune_pending() -> dict:
     """Re-run the gates over the pending queue and drain what no longer belongs.
 
-    pending.json is otherwise append-only: _push_pending adds, and before this
-    existed nothing ever removed, so a check queued against a since-merged PR
-    sat in the queue forever and every wake re-reported it as a live loose end.
+    pending.json is append-only in spirit: _push_pending folds a re-queued
+    subject into its existing row rather than adding a second, and before this
+    existed nothing ever removed anything, so a check queued against a
+    since-merged PR sat in the queue forever and every wake re-reported it as
+    a live loose end.
 
-    Each row resolves one of four ways:
+    Each row resolves one of five ways:
       applied  - evidence now shows LANDED and the ledger line is still open,
                  so the check it was demoted from finally goes through
       moot     - the ledger line is no longer open (checked or dismissed since),
                  so there is nothing left for this row to do
       stale    - the line was never in the ledger at all
       kept     - still genuinely pending; evidence has not landed yet
+      merged   - a kept row's same-subject sibling, folded into that survivor
+                 (present as a count only while any coalescing actually fired;
+                 kept + merged together still equals the kept rows drained in)
     """
     AMBIGUOUS = object()
 
@@ -766,7 +814,31 @@ def prune_pending() -> dict:
             kept.append(row)
             counts["kept"] += 1
     seen.save()
-    save_pending(kept)
+    # Survivors fold down to one row per subject; the live pre-fold queue
+    # reached eight copies of the same 2026-08-17 taskferry check, each
+    # paying its own re-verify and each eating a --pending display slot.
+    # The newest row in file order wins as the base (freshest evidence), the
+    # first demotion's `queued` survives (age is the stale-evidence signal),
+    # and `seen` sums the attempts.
+    survivors: list = []
+    slot: dict = {}
+    merged = 0
+    for row in kept:
+        key = (row.get("op") or "check", _pending_subject(row.get("line", "")))
+        if key in slot:
+            prev = survivors[slot[key]]
+            row["seen"] = int(prev.get("seen", 1)) + int(row.get("seen", 1))
+            if prev.get("queued"):
+                row["queued"] = prev["queued"]
+            survivors[slot[key]] = row
+            merged += 1
+        else:
+            slot[key] = len(survivors)
+            survivors.append(row)
+    counts["kept"] = len(survivors)
+    if merged:
+        counts["merged"] = merged
+    save_pending(survivors)
     jl.log(f"prune-pending: {counts}")
     return counts
 
@@ -954,7 +1026,7 @@ def _axi_help_text(prog="todos.py"):
         "  --dismiss <query>            Dismiss an open todo by normalized match",
         "  --delta                      Show ledger counts (open/done/dismissed/pending)",
         "  --pending                    List pending checks with live evidence state",
-        "  --prune-pending              Re-verify pending queue and drain resolved",
+        "  --prune-pending              Re-verify pending queue, drain resolved, coalesce duplicates",
         "  --wake                       Mark wake time",
         "  --reconcile                  Reconcile ledger with SeenStore",
         "  --apply-mutations <file>     Apply ferry mutations JSON",
@@ -1167,7 +1239,11 @@ def main() -> None:
                 print(json.dumps(out, indent=1))
             else:
                 # aggregates
-                print(f"prune: {out.get('applied',0)} applied, {out.get('moot',0)} moot, {out.get('stale',0)} stale, {out.get('kept',0)} kept")
+                out_str = (f"prune: {out.get('applied',0)} applied, {out.get('moot',0)} moot, "
+                           f"{out.get('stale',0)} stale, {out.get('kept',0)} kept")
+                if out.get("merged"):
+                    out_str += f" ({out['merged']} merged)"
+                print(out_str)
                 if out.get("kept",0) == 0 and out.get("applied",0) == 0:
                     print("pending: 0 pending checks found")
                 else:
@@ -1178,7 +1254,7 @@ def main() -> None:
             limit = args.limit if args.limit is not None else 30
             # --fields validation
             if args.fields:
-                valid = {"line","evidence","repo","state","op","reason","queued","kind","source"}
+                valid = {"line","evidence","repo","state","op","reason","queued","seen","kind","source"}
                 req = [f.strip() for f in args.fields.split(",")]
                 invalid = [f for f in req if f not in valid]
                 if invalid:

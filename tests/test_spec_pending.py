@@ -197,3 +197,89 @@ def test_prune_mixed_queue_drains_each_outcome_in_one_call(tmp_path, monkeypatch
     assert len(applied) == 1
     assert applied[0].startswith("- [x]")
     assert td.load_pending() == [rows[4]]
+
+
+# --- re-queue folding (the eight-copies failure mode) ---------------------
+# The same check can be re-proposed by synthesis every hour its evidence
+# still looks stale. Pushed through _push_pending unconditionally -- as
+# before this fix -- one queue row accreted eight copies spanning
+# 2026-08-14 to 08-19, each paying its own re-verify at prune and each
+# stealing a row of the 30-row --pending window from other subjects.
+
+def _frozen_now(monkeypatch, when):
+    monkeypatch.setattr(jl, "now_et", lambda: when)
+
+
+def test_push_folds_requeue_of_same_subject_across_bullet_variance(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    _ledger(tmp_path, monkeypatch)
+    t0 = datetime(2026, 8, 31, 9, 0, 0, tzinfo=timezone.utc)
+    _frozen_now(monkeypatch, t0)
+    first = {"op": "check", "line": "taskferry fix-issue ferries unverified",
+             "evidence": "scan 2026-08-17: branches in main ancestry", "repo": "/taskferry"}
+    assert td._push_pending(dict(first), "evidence did not verify") == "new"
+    _frozen_now(monkeypatch, t0 + timedelta(days=5))
+    later = {"op": "check", "line": "- [ ] TASKFERRY fix-issue ferries unverified",
+             "evidence": "fix/issue-369/420/439/458/460 merged into main ancestry",
+             "repo": "/taskferry"}
+    assert td._push_pending(dict(later), "no unique ledger match") == "merged"
+    items = td.load_pending()
+    assert len(items) == 1
+    row = items[0]
+    assert row["seen"] == 2
+    assert row["evidence"] == later["evidence"]         # freshest attempt wins
+    assert row["reason"] == "no unique ledger match"
+    assert row["queued"] == "2026-08-31T09:00:00+00:00"  # age from the first demotion
+
+
+def test_push_keeps_distinct_subjects_apart(tmp_path, monkeypatch):
+    _ledger(tmp_path, monkeypatch)
+    a = {"op": "check", "line": "row a", "evidence": "commit aaa111", "repo": None}
+    b = {"op": "check", "line": "row b", "evidence": "commit bbb222", "repo": None}
+    assert td._push_pending(dict(a), "evidence did not verify") == "new"
+    assert td._push_pending(dict(b), "evidence did not verify") == "new"
+    assert len(td.load_pending()) == 2
+
+
+def test_requeue_of_known_subject_counts_deduped_not_pending(tmp_path, monkeypatch):
+    _ledger(tmp_path, monkeypatch,
+            "# jeeves todo ledger\n\n## open\n- [ ] fix the parser\n\n## done\n\n## dismissed\n")
+    mut = {"op": "check", "line": "fix the parser",
+           "evidence": "commit deadbeef00", "repo": "/nonexistent"}
+    res1 = td.apply_mutations([dict(mut)])
+    assert res1["pending"] == 1 and res1["deduped"] == 0
+    res2 = td.apply_mutations([dict(mut)])
+    assert res2["pending"] == 0 and res2["deduped"] == 1
+    items = td.load_pending()
+    assert len(items) == 1 and items[0]["seen"] == 2
+
+
+def test_prune_coalesces_pre_fold_survivor_duplicates(tmp_path, monkeypatch):
+    repo, _, unlanded = _git_repo(tmp_path)
+    _ledger(tmp_path, monkeypatch,
+            "# jeeves todo ledger\n\n## open\n- [ ] still open item\n\n## done\n\n## dismissed\n")
+    rows = [
+        _row("still open item", f"scan 2026-08-10: commit {unlanded[:10]}", repo),
+        _row("- [ ] still open item", f"scan 2026-08-15: commit {unlanded[:10]}", repo),
+        _row("still open item", f"scan 2026-08-17: commit {unlanded[:10]}", repo),
+    ]
+    td.save_pending(rows)
+    counts = td.prune_pending()
+    assert counts == {"applied": 0, "moot": 0, "stale": 0, "kept": 1, "merged": 2}
+    items = td.load_pending()
+    assert len(items) == 1
+    assert items[0]["seen"] == 3
+    assert items[0]["evidence"] == rows[-1]["evidence"]  # latest attempt wins
+    assert items[0]["queued"] == rows[0]["queued"]      # oldest age survives
+
+
+def test_prune_without_duplicates_reports_no_merged_count(tmp_path, monkeypatch):
+    # Existing exact-dict assertions across this suite stay green only because
+    # `merged` is conditional; pin that explicitly for the one-row run.
+    repo, _, unlanded = _git_repo(tmp_path)
+    _ledger(tmp_path, monkeypatch,
+            "# jeeves todo ledger\n\n## open\n- [ ] one item\n\n## done\n\n## dismissed\n")
+    td.save_pending([_row("one item", f"commit {unlanded[:10]}", repo)])
+    counts = td.prune_pending()
+    assert counts == {"applied": 0, "moot": 0, "stale": 0, "kept": 1}
+
