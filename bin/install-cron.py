@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Idempotent crontab entry for jeeves' hourly collection run."""
 import argparse
-import shutil
+import os
 import subprocess
 from pathlib import Path
 
@@ -11,22 +11,43 @@ BEGIN, END = "# BEGIN jeeves", "# END jeeves"
 COLLECT = Path(__file__).resolve().parent / "collect.py"
 
 
-def _cron_path() -> str:
-    """PATH for the cron environment. Cron defaults to /usr/bin:/bin, which
-    lacks user-installed binaries the collector shells out to (taskferry,
-    gh) — resolve their directories at install time rather than hardcoding
-    any of them.
+def _shims_dir() -> Path:
+    """Where mise keeps its shim farm. Honors MISE_DATA_DIR and
+    XDG_DATA_HOME, plus a JEEVES_MISE_SHIMS override for tests/odd layouts."""
+    ovr = os.environ.get("JEEVES_MISE_SHIMS")
+    if ovr:
+        return Path(ovr)
+    data = os.environ.get("MISE_DATA_DIR")
+    if not data:
+        xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+        data = str(Path(xdg) / "mise")
+    return Path(data) / "shims"
 
-    `fd` matters as much as the rest: scan-active.sh does all repo discovery
-    through it, so a cron PATH without it reports every workspace as empty."""
+
+def _cron_path() -> str:
+    """PATH for the cron environment.
+
+    Every entry here must be a *stable directory*: one that survives tool
+    upgrades untouched. Resolving each tool through `shutil.which` at
+    install time instead bakes the mise shim's resolved *versioned* install
+    dir (e.g. `.../installs/fd/latest/fd-v10.4.2-.../`) into the crontab,
+    and the next `mise upgrade` deletes that directory out from under cron.
+    That is how the git-state scan silently reported `fd not found on PATH`
+    for days after fd moved 10.4.2 → 10.5.0 (and gh's versioned dir sat
+    stale in the same entry), unnoticed until a manual read of the
+    snapshot's error line.
+
+    The mise-native answer for a fixed `PATH` is the shims directory:
+    `fd`, `gh`, and `python3` resolve through it to whatever version is
+    current, forever, with no reinstall. ~/.local/bin carries the
+    non-mise user binaries taskferry and gh-axi (and mise itself, the
+    shims' symlink target); /usr/{local/,}bin and /bin are the fallback
+    floor for git, bash, and the system python3. `fd` belongs on PATH as
+    much as gh: scan-active.sh does all repo discovery through it, so a
+    PATH without it reports every workspace as empty."""
     dirs = []
-    for tool in ("taskferry", "gh", "gh-axi", "fd", "git", "bash"):
-        p = shutil.which(tool)
-        if p:
-            d = str(Path(p).parent)
-            if d not in dirs:
-                dirs.append(d)
-    for d in ("/usr/local/bin", "/usr/bin", "/bin"):
+    for d in (str(Path.home() / ".local" / "bin"), str(_shims_dir()),
+              "/usr/local/bin", "/usr/bin", "/bin"):
         if d not in dirs:
             dirs.append(d)
     return ":".join(dirs)

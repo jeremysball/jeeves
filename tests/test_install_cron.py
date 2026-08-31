@@ -45,6 +45,39 @@ def test_status():
     assert ic.has_jeeves(EXISTING) is False
 
 
+def test_cron_path_bakes_no_versioned_dirs():
+    # The crontab PATH must survive `mise upgrade` untouched: resolving fd/gh
+    # through shutil.which at install time used to bake the shim's *resolved*
+    # versioned install dir (e.g. .../installs/fd/latest/fd-v10.4.2-.../) into
+    # the entry, and the next version bump silently deleted that dir out from
+    # under cron (the `fd not found on PATH` git-scan failure). If the entry
+    # never contains a versioned segment, it cannot go stale on upgrade.
+    path = ic._cron_path()
+    assert "/installs/" not in path
+    dirs = path.split(":")
+    assert str(Path.home() / ".local" / "bin") in dirs  # taskferry, gh-axi
+    for d in ("/usr/bin", "/bin"):  # git, bash
+        assert d in dirs
+
+
+def test_cron_path_resolves_mise_tools_through_shims(monkeypatch, tmp_path):
+    shims = tmp_path / "mise-shims"
+    monkeypatch.setenv("JEEVES_MISE_SHIMS", str(shims))
+    assert str(shims) in ic._cron_path().split(":")
+
+
+def test_cron_path_honors_env_overrides(monkeypatch, tmp_path):
+    monkeypatch.delenv("JEEVES_MISE_SHIMS", raising=False)
+    monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "data"))
+    assert ic._cron_path().split(":") == [
+        str(Path.home() / ".local" / "bin"),
+        str(tmp_path / "data" / "shims"),
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ]
+
+
 def test_cli_roundtrip_file_mode(tmp_path):
     ct = tmp_path / "crontab"
     ct.write_text(EXISTING)
