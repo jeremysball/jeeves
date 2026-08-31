@@ -349,7 +349,7 @@ def test_prune_pending_survives_duplicate_ledger_lines(tmp_path, monkeypatch):
 
 def test_prune_pending_empty_queue_is_a_noop(tmp_path, monkeypatch):
     _ledger(tmp_path, monkeypatch)
-    assert td.prune_pending() == {"applied": 0, "moot": 0, "stale": 0, "kept": 0}
+    assert td.prune_pending() == {"applied": 0, "moot": 0, "stale": 0, "kept": 0, "merged": 0}
 
 
 def test_extract_refs_handles_multi_ref_evidence():
