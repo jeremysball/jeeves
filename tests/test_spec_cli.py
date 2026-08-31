@@ -39,7 +39,8 @@ def _sections(body):
 
 def _row(line, evidence, repo, reason="verify failed"):
     return {"op": "check", "line": line, "evidence": evidence,
-            "repo": repo, "reason": reason, "queued": "2026-08-09T00:00:00Z"}
+            "repo": repo, "reason": reason, "queued": "2026-08-09T00:00:00Z",
+            "seen": 1}
 
 
 def _git_repo(tmp_path, name="repo"):
@@ -87,8 +88,8 @@ def test_prune_pending_flag_drains_queue_and_prints_counts_json(tmp_path, monkey
                        capture_output=True, text=True, env=_env(tmp_path))
     assert r.returncode == 0
     counts = json.loads(r.stdout.strip())
-    assert set(counts) == {"applied", "moot", "stale", "kept"}
-    assert counts == {"applied": 1, "moot": 1, "stale": 1, "kept": 1}
+    assert set(counts) == {"applied", "moot", "stale", "kept", "merged"}
+    assert counts == {"applied": 1, "moot": 1, "stale": 1, "kept": 1, "merged": 0}
     after = td.load_pending()
     assert [row["line"] for row in after] == ["kept thing"]
     secs = _sections((tmp_path / "todo.md").read_text())
@@ -104,7 +105,7 @@ def test_prune_pending_empty_queue_prints_zero_counts(tmp_path, monkeypatch):
                        capture_output=True, text=True, env=_env(tmp_path))
     assert r.returncode == 0
     counts = json.loads(r.stdout.strip())
-    assert set(counts) == {"applied", "moot", "stale", "kept"}
+    assert set(counts) == {"applied", "moot", "stale", "kept", "merged"}
     assert all(v == 0 for v in counts.values())
 
 
@@ -176,7 +177,7 @@ def test_prune_pending_and_pending_are_distinct_flags(tmp_path, monkeypatch):
     assert r1.returncode == 0
     counts = json.loads(r1.stdout.strip())
     assert isinstance(counts, dict)
-    assert set(counts) == {"applied", "moot", "stale", "kept"}
+    assert set(counts) == {"applied", "moot", "stale", "kept", "merged"}
     td.save_pending([_row("kept thing", "commit deadbeef00", str(repo))])
     r2 = subprocess.run([sys.executable, str(TODOS_PY), "--pending", "--format", "json"],
                         capture_output=True, text=True, env=env)
