@@ -67,6 +67,14 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("session-hook") {
         return run_session_hook();
     }
+    if std::env::args().nth(1).as_deref() == Some("sessions") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return ExitCode::from(orient::sessions::run(&args));
+    }
+    if std::env::args().nth(1).as_deref() == Some("checkin-lint") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return ExitCode::from(orient::lint::run(&args));
+    }
     if std::env::args().nth(1).as_deref() == Some("git-state") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         return ExitCode::from(orient::gitstate::run(&args));

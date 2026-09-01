@@ -1,9 +1,11 @@
 //! Golden parity for the three small orient commands.
 
 use serde_json::json;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -74,6 +76,23 @@ fn run_rust(command: &str, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+fn run_with_stdin(program: &Path, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 fn assert_stdout_parity(reference: &Output, rust: &Output, label: &str) {
@@ -408,6 +427,134 @@ fn session_tail_filters_truncates_and_matches_reference() {
     let rust = run_rust("session-tail", &[&missing_arg]);
     assert_stdout_parity(&reference, &rust, "session-tail missing file");
     assert_eq!(rust.status.code(), Some(1));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sessions_newest_claude_file_and_empty_case_match_reference() {
+    let dir = scratch_dir("sessions");
+    let home = dir.join("home");
+    let project_dir = dir.join("project");
+    let projects = home.join(".claude/projects");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let slug: String = project_dir
+        .to_string_lossy()
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() {
+                byte as char
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let claude_project = projects.join(slug);
+    std::fs::create_dir_all(&claude_project).unwrap();
+    let older = claude_project.join("older.jsonl");
+    let newer = claude_project.join("newer.jsonl");
+    std::fs::write(&older, "older\n").unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    std::fs::write(&newer, "newer\n").unwrap();
+
+    let project_arg = project_dir.to_string_lossy().into_owned();
+    let opencode_available = Command::new("sh")
+        .args(["-c", "command -v opencode >/dev/null 2>&1"])
+        .status()
+        .unwrap()
+        .success();
+    let scan = if opencode_available { "0" } else { "12" };
+    if opencode_available {
+        eprintln!("note: opencode found; OpenCode session pass is disabled for parity test");
+    } else {
+        eprintln!("note: opencode absent; OpenCode session pass is skipped");
+    }
+
+    let reference = Command::new("bash")
+        .arg(ref_script("session-discover.sh"))
+        .arg(&project_arg)
+        .env("HOME", &home)
+        .env("ORIENT_OPENCODE_SCAN", scan)
+        .env("JEEVES_ORIENT_OPENCODE_SCAN", scan)
+        .output()
+        .unwrap();
+    let rust = Command::new(env!("CARGO_BIN_EXE_jeeves"))
+        .arg("sessions")
+        .arg(&project_arg)
+        .env("HOME", &home)
+        .env("ORIENT_OPENCODE_SCAN", scan)
+        .env("JEEVES_ORIENT_OPENCODE_SCAN", scan)
+        .output()
+        .unwrap();
+    assert_stdout_parity(&reference, &rust, "sessions newest Claude file");
+    assert_eq!(rust.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&rust.stdout),
+        format!("CLAUDE_JSONL={}\n", newer.display())
+    );
+    assert!(!String::from_utf8_lossy(&rust.stdout).contains("OPENCODE_SESSION="));
+
+    let missing = dir.join("missing");
+    let missing_arg = missing.to_string_lossy().into_owned();
+    let reference = Command::new("bash")
+        .arg(ref_script("session-discover.sh"))
+        .arg(&missing_arg)
+        .env("HOME", &home)
+        .env("ORIENT_OPENCODE_SCAN", "0")
+        .env("JEEVES_ORIENT_OPENCODE_SCAN", "0")
+        .output()
+        .unwrap();
+    let rust = Command::new(env!("CARGO_BIN_EXE_jeeves"))
+        .arg("sessions")
+        .arg(&missing_arg)
+        .env("HOME", &home)
+        .env("ORIENT_OPENCODE_SCAN", "0")
+        .env("JEEVES_ORIENT_OPENCODE_SCAN", "0")
+        .output()
+        .unwrap();
+    assert_stdout_parity(&reference, &rust, "sessions no matching Claude file");
+    assert_eq!(rust.status.code(), Some(0));
+    assert!(rust.stdout.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn checkin_lint_stdin_and_file_golden_match_reference() {
+    let dir = scratch_dir("checkin-lint");
+    let long_body = "x".repeat(119);
+    let markdown = format!(
+        "# status\n\nA non-bullet line, with commas, **bold**, and no linting.\n\n- clean bullet\n  * clean, with two commas, okay\n- {long_body}\n* one, two, three, four\n- **first** and **second**\n- {long_body}, one, two, three, **first** and **second**\nnot a bullet - still untouched\n"
+    );
+
+    let script = ref_script("lint-checkin.py");
+    let script_arg = script.to_string_lossy().into_owned();
+    let reference = run_with_stdin(Path::new("python3"), &[&script_arg], &markdown);
+    let rust = run_with_stdin(
+        Path::new(env!("CARGO_BIN_EXE_jeeves")),
+        &["checkin-lint"],
+        &markdown,
+    );
+    assert_stdout_parity(&reference, &rust, "checkin-lint stdin");
+    assert_eq!(rust.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&rust.stdout).contains("non-bullet"));
+
+    let clean = dir.join("clean.md");
+    let clean_markdown = "A paragraph, with commas, is untouched.\n- clean\n* one, two\n";
+    std::fs::write(&clean, clean_markdown).unwrap();
+    let reference = Command::new("python3")
+        .arg(script)
+        .arg(&clean)
+        .output()
+        .unwrap();
+    let rust = Command::new(env!("CARGO_BIN_EXE_jeeves"))
+        .arg("checkin-lint")
+        .arg(&clean)
+        .output()
+        .unwrap();
+    assert_stdout_parity(&reference, &rust, "checkin-lint clean file");
+    assert_eq!(rust.status.code(), Some(0));
+    assert_eq!(rust.stdout, b"OK: all bullets pass.\n");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
