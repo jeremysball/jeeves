@@ -40,6 +40,11 @@ fn init_repo(dir: &Path) -> PathBuf {
     repo
 }
 
+fn ref_session_hook() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".superpowers/crispy/rust-rewrite/ref/session-hook.sh")
+}
+
 fn run_hook(process_dir: &Path, payload: &str, state_dir: &Path) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_jeeves"))
         .arg("session-hook")
@@ -47,6 +52,30 @@ fn run_hook(process_dir: &Path, payload: &str, state_dir: &Path) -> Output {
         .env("JEEVES_STATE_DIR", state_dir)
         .env("JEEVES_AUDIT_INFLIGHT_SECS", "0")
         .env("WORKTREE_AUDIT_INFLIGHT_SECS", "0")
+        .env("JEEVES_HOOK_TIMEOUT", "0")
+        .env("WORKTREE_AUDIT_HOOK_TIMEOUT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn run_ref_hook(process_dir: &Path, payload: &str, state_dir: &Path) -> Output {
+    let mut child = Command::new("bash")
+        .arg(ref_session_hook())
+        .current_dir(process_dir)
+        .env("JEEVES_STATE_DIR", state_dir)
+        .env("JEEVES_AUDIT_INFLIGHT_SECS", "0")
+        .env("WORKTREE_AUDIT_INFLIGHT_SECS", "0")
+        .env("JEEVES_HOOK_TIMEOUT", "0")
+        .env("WORKTREE_AUDIT_HOOK_TIMEOUT", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -71,10 +100,14 @@ fn repo_hook_emits_ordered_json_context_for_drift() {
     git(&repo, &["checkout", "-q", "main"]);
     let payload = serde_json::json!({"cwd": repo}).to_string();
 
-    let output = run_hook(&dir, &payload, &dir.join("state"));
+    let state_dir = dir.join("state");
+    let reference = run_ref_hook(&repo, &payload, &state_dir);
+    let output = run_hook(&repo, &payload, &state_dir);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let prefix = "{\n  \"hookSpecificOutput\": {\n    \"hookEventName\": \"SessionStart\",\n    \"additionalContext\": \"";
+    assert_eq!(reference.status.code(), Some(0));
     assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, reference.stdout, "hook output mismatch");
     assert!(
         stdout.starts_with(prefix),
         "unexpected hook output: {stdout}"
@@ -84,6 +117,57 @@ fn repo_hook_emits_ordered_json_context_for_drift() {
         .as_str()
         .unwrap();
     assert!(context.contains("Worktree drift"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalid_state_dir_with_valid_stdin_is_silent_success() {
+    let dir = scratch_dir();
+    let payload = serde_json::json!({"cwd": dir}).to_string();
+
+    let output = run_hook(&dir, &payload, Path::new("/dev/null/jeeves-hook-state"));
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn linked_worktree_repo_mode_is_silent_when_audit_has_no_repo() {
+    let dir = scratch_dir();
+    let repo = init_repo(&dir);
+    git(&repo, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "feature"]);
+    git(&repo, &["checkout", "-q", "main"]);
+
+    let worktree = dir.join("linked-worktree");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            &worktree.to_string_lossy(),
+            "feature",
+        ],
+    );
+    let payload = serde_json::json!({"cwd": worktree}).to_string();
+    let state_dir = dir.join("state");
+    let reference = run_ref_hook(&worktree, &payload, &state_dir);
+    let output = run_hook(&worktree, &payload, &state_dir);
+
+    assert_eq!(reference.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(0));
+    assert!(reference.stdout.is_empty());
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, reference.stdout);
+
+    git(
+        &repo,
+        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -49,6 +49,29 @@ fn commit(repo: &Path, fname: &str, content: &str, msg: &str) {
     git(repo, &["commit", "-qm", msg]);
 }
 
+fn commit_at(repo: &Path, fname: &str, content: &str, msg: &str, date: &str) {
+    std::fs::write(repo.join(fname), content).unwrap();
+    git(repo, &["add", "."]);
+    let out = Command::new("git")
+        .current_dir(repo)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .args(["commit", "-qm", msg])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn self_start_ticks() -> String {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let fields = stat.rsplit_once(") ").unwrap().1;
+    fields.split_whitespace().nth(19).unwrap().to_string()
+}
+
 /// Audit knobs, identical on both sides of every comparison. `None`
 /// threshold means the env var is left unset (default 95 on both sides).
 struct Knobs {
@@ -76,7 +99,11 @@ fn apply_env(cmd: &mut Command, knobs: &Knobs, scratch: &Path) {
         .env("AUDIT_WORKTREES_LIB", ref_lib())
         .env("JEEVES_STATE_DIR", scratch.join("state"));
     if let Some(t) = knobs.content_merge_threshold {
-        cmd.env("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD", t);
+        cmd.env("JEEVES_AUDIT_CONTENT_MERGE_THRESHOLD", t)
+            .env("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD", t);
+    } else {
+        cmd.env_remove("JEEVES_AUDIT_CONTENT_MERGE_THRESHOLD")
+            .env_remove("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD");
     }
 }
 
@@ -90,6 +117,30 @@ fn run_ref(repo_parent: &Path, knobs: &Knobs) -> Output {
 fn run_rust(repo_parent: &Path, knobs: &Knobs) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jeeves"));
     cmd.arg("audit").arg(repo_parent);
+    apply_env(&mut cmd, knobs, repo_parent);
+    cmd.output().unwrap()
+}
+
+fn run_ref_no_content(repo_parent: &Path, knobs: &Knobs, before_root: bool) -> Output {
+    let mut cmd = Command::new("bash");
+    cmd.arg(ref_audit_worktrees());
+    if before_root {
+        cmd.arg("--no-content").arg(repo_parent);
+    } else {
+        cmd.arg(repo_parent).arg("--no-content");
+    }
+    apply_env(&mut cmd, knobs, repo_parent);
+    cmd.output().unwrap()
+}
+
+fn run_rust_no_content(repo_parent: &Path, knobs: &Knobs, before_root: bool) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_jeeves"));
+    cmd.arg("audit");
+    if before_root {
+        cmd.arg("--no-content").arg(repo_parent);
+    } else {
+        cmd.arg(repo_parent).arg("--no-content");
+    }
     apply_env(&mut cmd, knobs, repo_parent);
     cmd.output().unwrap()
 }
@@ -119,6 +170,27 @@ fn assert_parity(repo_parent: &Path, knobs: &Knobs) {
         String::from_utf8_lossy(&rust.stdout),
         String::from_utf8_lossy(&reference.stdout),
         "audit report mismatch"
+    );
+}
+
+fn assert_no_content_parity(repo_parent: &Path, knobs: &Knobs, before_root: bool) {
+    let reference = run_ref_no_content(repo_parent, knobs, before_root);
+    let rust = run_rust_no_content(repo_parent, knobs, before_root);
+    assert_eq!(
+        reference.status.code(),
+        Some(0),
+        "reference exited nonzero: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    assert_eq!(
+        rust.status.code(),
+        Some(0),
+        "rust exited nonzero: {}",
+        String::from_utf8_lossy(&rust.stderr)
+    );
+    assert_eq!(
+        rust.stdout, reference.stdout,
+        "--no-content report mismatch"
     );
 }
 
@@ -290,5 +362,157 @@ fn inflight_only_repo_prints_nothing() {
         "reference must print nothing, got: {}",
         String::from_utf8_lossy(&reference.stdout)
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn all_audit_buckets_match_in_one_repo() {
+    let dir = scratch_dir();
+    let repo = init_repo(&dir);
+    let old = "2000-01-01T00:00:00Z";
+
+    commit_at(&repo, "base.txt", "base\n", "base", old);
+
+    git(&repo, &["checkout", "-q", "-b", "triage"]);
+    commit_at(&repo, "triage.txt", "triage\n", "triage", old);
+    git(&repo, &["checkout", "-q", "main"]);
+    git(
+        &repo,
+        &["merge", "-q", "--no-ff", "triage", "-m", "merge triage"],
+    );
+    let triage_worktree = dir.join("triage-worktree");
+    let triage_path = triage_worktree.to_string_lossy().into_owned();
+    git(&repo, &["worktree", "add", "-q", &triage_path, "triage"]);
+    let triage_file = triage_worktree.join("uncommitted.txt");
+    std::fs::write(&triage_file, "triage\n").unwrap();
+    std::fs::File::open(&triage_file)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(946684800))
+        .unwrap();
+
+    git(&repo, &["checkout", "-q", "-b", "archaeology"]);
+    commit_at(
+        &repo,
+        "archaeology.txt",
+        "archaeology\n",
+        "archaeology",
+        old,
+    );
+    git(&repo, &["checkout", "-q", "main"]);
+
+    git(&repo, &["checkout", "-q", "-b", "content"]);
+    commit_at(&repo, "content.txt", "already shipped\n", "content", old);
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["merge", "-q", "--squash", "content"]);
+    commit_at(
+        &repo,
+        "main-extra.txt",
+        "main extra\n",
+        "squash content",
+        old,
+    );
+
+    git(&repo, &["checkout", "-q", "-b", "safe"]);
+    commit_at(&repo, "safe.txt", "safe\n", "safe", old);
+    git(&repo, &["checkout", "-q", "main"]);
+    git(
+        &repo,
+        &["merge", "-q", "--no-ff", "safe", "-m", "merge safe"],
+    );
+    let safe_worktree = dir.join("safe-worktree");
+    let safe_path = safe_worktree.to_string_lossy().into_owned();
+    git(&repo, &["worktree", "add", "-q", &safe_path, "safe"]);
+
+    git(&repo, &["checkout", "-q", "-b", "hands"]);
+    commit_at(&repo, "hands.txt", "hands\n", "hands", old);
+    git(&repo, &["checkout", "-q", "main"]);
+    let hands_worktree = dir.join("hands-worktree");
+    let hands_path = hands_worktree.to_string_lossy().into_owned();
+    git(&repo, &["worktree", "add", "-q", &hands_path, "hands"]);
+    git(
+        &repo,
+        &["worktree", "lock", "--reason", "garbage lock", &hands_path],
+    );
+
+    git(&repo, &["checkout", "-q", "-b", "inflight"]);
+    git(&repo, &["checkout", "-q", "main"]);
+
+    let knobs = Knobs {
+        inflight_secs: "7200",
+        archaeology_secs: "0",
+        content_merge_threshold: Some("95"),
+    };
+    assert_parity(&dir, &knobs);
+    let report = stdout_of(&run_rust(&dir, &knobs));
+    assert!(report.contains("  safe-to-clean (merged, clean):"));
+    assert!(report.contains("  needs-triage:"));
+    assert!(report.contains("  archaeology (older than 0m"));
+    assert!(report.contains("  likely-content-merged"));
+    assert!(report.contains("  hands-off"));
+    assert!(report.contains("  (1 in flight, active within 2h — hidden)"));
+
+    git(&repo, &["worktree", "unlock", &hands_path]);
+    git(&repo, &["worktree", "remove", "--force", &hands_path]);
+    git(&repo, &["worktree", "remove", "--force", &safe_path]);
+    git(&repo, &["worktree", "remove", "--force", &triage_path]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_content_flag_matches_reference_before_and_after_root() {
+    let dir = scratch_dir();
+    let repo = init_repo(&dir);
+    commit(&repo, "a.txt", "a\n", "init");
+    git(&repo, &["checkout", "-q", "-b", "content"]);
+    commit(&repo, "content.txt", "already shipped\n", "content");
+    git(&repo, &["checkout", "-q", "main"]);
+    commit(&repo, "b.txt", "b\n", "unrelated main commit");
+    git(&repo, &["merge", "-q", "--squash", "content"]);
+    commit(&repo, "extra.txt", "extra\n", "squash content");
+
+    let knobs = Knobs {
+        inflight_secs: "0",
+        archaeology_secs: "7776000",
+        content_merge_threshold: Some("95"),
+    };
+    assert_no_content_parity(&dir, &knobs, false);
+    assert_no_content_parity(&dir, &knobs, true);
+    let report = stdout_of(&run_rust_no_content(&dir, &knobs, false));
+    assert!(report.contains("  needs-triage:"));
+    assert!(!report.contains("likely-content-merged"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn live_lock_is_hands_off_in_reference_and_rust() {
+    let dir = scratch_dir();
+    let repo = init_repo(&dir);
+    commit(&repo, "base.txt", "base\n", "base");
+    git(&repo, &["checkout", "-q", "-b", "live"]);
+    commit(&repo, "live.txt", "live\n", "live");
+    git(&repo, &["checkout", "-q", "main"]);
+
+    let worktree = dir.join("live-worktree");
+    let worktree_path = worktree.to_string_lossy().into_owned();
+    git(&repo, &["worktree", "add", "-q", &worktree_path, "live"]);
+    let gitdir = git(&worktree, &["rev-parse", "--absolute-git-dir"]);
+    std::fs::write(
+        Path::new(&gitdir).join("locked"),
+        format!("pid {} start {}\n", std::process::id(), self_start_ticks()),
+    )
+    .unwrap();
+
+    let knobs = Knobs {
+        inflight_secs: "0",
+        archaeology_secs: "7776000",
+        content_merge_threshold: None,
+    };
+    assert_parity(&dir, &knobs);
+    let report = stdout_of(&run_rust(&dir, &knobs));
+    assert!(report.contains("  hands-off"));
+    assert!(report.contains("[lock: live]"));
+
+    git(&repo, &["worktree", "unlock", &worktree_path]);
+    git(&repo, &["worktree", "remove", "--force", &worktree_path]);
     let _ = std::fs::remove_dir_all(&dir);
 }

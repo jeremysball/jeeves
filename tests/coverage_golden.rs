@@ -320,12 +320,17 @@ fn usage_errors_match_reference() {
         "error: usage: coverage-score <repo> <base> <branch>"
     );
 
+    let missing = dir.join("missing-repo");
+    let missing_arg = missing.to_string_lossy().into_owned();
     let out = Command::new(bin)
-        .args(["coverage", "/nonexistent", "main", "feature"])
+        .args(["coverage", &missing_arg, "main", "feature"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert_eq!(stdout_of(&out), "error: not a directory: /nonexistent");
+    assert_eq!(
+        stdout_of(&out),
+        format!("error: not a directory: {missing_arg}")
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
