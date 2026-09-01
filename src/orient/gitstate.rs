@@ -15,12 +15,14 @@ pub fn run(args: &[String]) -> u8 {
     };
 
     // Unlike a failed git command, a failed `cd` is a user-visible refusal.
-    if !dir.is_dir() {
+    // `is_dir` alone is insufficient: an existing directory may not be
+    // enterable because one of its path components denies search permission.
+    if std::env::set_current_dir(&dir).is_err() {
         println!("error: cannot cd to {dir_display}");
         return 1;
     }
 
-    let Some(root_output) = git(&dir, &["rev-parse", "--show-toplevel"]) else {
+    let Some(root_output) = git(Path::new("."), &["rev-parse", "--show-toplevel"]) else {
         println!("repo: none (not a git repository)");
         println!("dir: {dir_display}");
         return 0;

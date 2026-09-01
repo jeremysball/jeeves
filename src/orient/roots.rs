@@ -39,6 +39,7 @@ pub fn run(args: &[String]) -> u8 {
     let default_file = state_home.join("jeeves/roots.txt");
     let roots_file = std::env::var_os("JEEVES_ROOTS_FILE")
         .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("ORIENT_ROOTS_FILE").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| default_file.clone());
 
@@ -47,8 +48,7 @@ pub fn run(args: &[String]) -> u8 {
         if !root.is_dir() {
             continue;
         }
-        let mut git_entries = Vec::new();
-        collect_git_entries(&root, 0, &mut git_entries);
+        let mut git_entries = git_entries(&root);
         git_entries.sort();
         for git_entry in git_entries {
             let Some(repo_path) = git_entry.parent() else {
@@ -122,30 +122,38 @@ fn print_usage() {
     println!("usage: discover-roots.sh [root ...]");
     println!();
     println!("arguments:");
-    println!("  [root]   dirs to scan for git repos; defaults to $ORIENT_ROOT_CANDIDATES");
-    println!("           (space/colon separated), else /workspace $HOME/.claude $HOME/.dotfiles");
+    println!("  [root]   dirs to scan for git repos; defaults to $JEEVES_ROOT_CANDIDATES");
+    println!("           then $ORIENT_ROOT_CANDIDATES (space/colon separated), else");
+    println!("           /workspace $HOME/.claude $HOME/.dotfiles");
     println!();
     println!("flags:");
     println!("  --help   show this reference");
     println!();
     println!("environment:");
-    println!("  ORIENT_ROOT_CANDIDATES   dirs to scan when no [root] is given");
-    println!("  ORIENT_ROOTS_FILE        where to persist the discovered roots");
-    println!("                           (default $XDG_STATE_HOME/orient/roots.txt)");
+    println!("  JEEVES_ROOT_CANDIDATES   canonical dirs to scan when no [root] is given");
+    println!("  ORIENT_ROOT_CANDIDATES   legacy dirs to scan when no [root] is given");
+    println!("  JEEVES_ROOTS_FILE        canonical roots-file path");
+    println!("  ORIENT_ROOTS_FILE        legacy roots-file path");
+    println!("                           (default $XDG_STATE_HOME/jeeves/roots.txt)");
 }
 
 fn candidate_roots_from_env() -> Vec<PathBuf> {
-    let value = nonempty_env("ORIENT_ROOT_CANDIDATES")
-        .or_else(|| nonempty_env("JEEVES_ROOT_CANDIDATES"))
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_default();
-            format!("/workspace {home}/.claude {home}/.dotfiles")
-        });
-    value
-        .split([':', ' '])
-        .filter(|part| !part.is_empty())
-        .map(PathBuf::from)
-        .collect()
+    if let Some(value) =
+        nonempty_env("JEEVES_ROOT_CANDIDATES").or_else(|| nonempty_env("ORIENT_ROOT_CANDIDATES"))
+    {
+        return value
+            .split([':', ' '])
+            .filter(|part| !part.is_empty())
+            .map(PathBuf::from)
+            .collect();
+    }
+
+    let mut roots = vec![PathBuf::from("/workspace")];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".claude"));
+        roots.push(home.join(".dotfiles"));
+    }
+    roots
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
@@ -162,30 +170,31 @@ fn state_home() -> PathBuf {
         })
 }
 
-fn collect_git_entries(dir: &Path, depth: usize, output: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+fn git_entries(root: &Path) -> Vec<PathBuf> {
+    let Ok(output) = Command::new("fd")
+        .args([
+            "-t",
+            "d",
+            "-d",
+            "4",
+            "-H",
+            "-E",
+            "node_modules",
+            "-E",
+            ".cache",
+            "^\\.git$",
+        ])
+        .arg(root)
+        .output()
+    else {
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if (name == "node_modules" || name == ".cache") && file_type.is_dir() {
-            continue;
-        }
-        if name == ".git" && depth < 4 {
-            if file_type.is_dir() || file_type.is_file() {
-                output.push(path);
-            }
-            continue;
-        }
-        if file_type.is_dir() && depth < 3 {
-            collect_git_entries(&path, depth + 1, output);
-        }
-    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn origin_of(repo: &Path) -> Option<String> {

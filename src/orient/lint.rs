@@ -25,6 +25,7 @@ pub fn run(args: &[String]) -> u8 {
     // Python text streams apply universal-newline translation before
     // `readlines()` returns the input.
     let input = input.replace("\r\n", "\n").replace('\r', "\n");
+    // The reference counts each reported problem, not each failed bullet.
     let mut failures = 0;
     for (line_number, line) in input.split_inclusive('\n').enumerate() {
         if !is_bullet(line) {

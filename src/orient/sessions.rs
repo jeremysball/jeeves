@@ -34,13 +34,47 @@ pub fn run(args: &[String]) -> u8 {
 }
 
 fn resolved_dir(raw_dir: &str) -> String {
-    if Path::new(raw_dir).is_dir() {
-        std::fs::canonicalize(raw_dir)
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| raw_dir.to_string())
-    } else {
+    let original = std::env::current_dir().ok();
+    let logical_cwd = logical_current_dir(original.as_deref());
+    if std::env::set_current_dir(raw_dir).is_err() {
         raw_dir.to_string()
+    } else {
+        let path = if Path::new(raw_dir).is_absolute() {
+            PathBuf::from(raw_dir)
+        } else {
+            logical_cwd.join(raw_dir)
+        };
+        let resolved = normalize_logical_path(path);
+        if let Some(original) = original {
+            let _ = std::env::set_current_dir(original);
+        }
+        resolved.to_string_lossy().into_owned()
     }
+}
+
+fn logical_current_dir(fallback: Option<&Path>) -> PathBuf {
+    std::env::var_os("PWD")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .or_else(|| fallback.map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn normalize_logical_path(path: PathBuf) -> PathBuf {
+    let is_absolute = path.is_absolute();
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() && !is_absolute {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn claude_projects_dir() -> PathBuf {

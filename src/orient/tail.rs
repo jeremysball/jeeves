@@ -1,11 +1,13 @@
 //! Human-readable tails of Claude Code JSONL sessions.
 
 use serde_json::Value;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 /// Runs `session-tail` with the reference-compatible positional arguments.
 pub fn run(args: &[String]) -> u8 {
     let Some(file_arg) = args.first() else {
-        println!("usage: session-tail.sh <jsonl> [since-iso] [max]");
+        eprintln!("usage: session-tail.sh <jsonl> [since-iso] [max]");
         return 1;
     };
     if !std::path::Path::new(file_arg).is_file() {
@@ -21,15 +23,18 @@ pub fn run(args: &[String]) -> u8 {
         .map(String::as_str)
         .filter(|value| !value.is_empty())
         .unwrap_or("40");
-    let Ok(max) = max_arg.parse::<i64>() else {
-        return 1;
-    };
 
     let mut entries = Vec::new();
+    let mut jq_failed = false;
     for line in input.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+        if line.trim().is_empty() {
             continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            jq_failed = true;
+            break;
         };
+        jq_failed = false;
         let Some(timestamp) = value.get("timestamp").filter(|value| !value.is_null()) else {
             continue;
         };
@@ -48,7 +53,10 @@ pub fn run(args: &[String]) -> u8 {
             continue;
         };
         let content = message.get("content");
-        let text = content_text(content);
+        let Ok(text) = content_text(content) else {
+            jq_failed = true;
+            continue;
+        };
         if text.is_empty() {
             continue;
         }
@@ -61,11 +69,24 @@ pub fn run(args: &[String]) -> u8 {
         ));
     }
 
-    let entries = tail_entries(entries, max);
-    if !entries.is_empty() {
-        println!("{}", entries.join("\n"));
+    // The reference's jq-unavailable branch cannot occur here: serde_json is
+    // the parser replacement, so the fallback line is unreachable by design.
+    let rendered = if entries.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", entries.join("\n"))
+    };
+    let Some(tail_status) = run_tail(&rendered, max_arg) else {
+        return 1;
+    };
+    if tail_status != 0 {
+        return tail_status;
     }
-    0
+    if jq_failed {
+        5
+    } else {
+        0
+    }
 }
 
 fn timestamp_is_at_or_after(timestamp: &Value, since: &str) -> bool {
@@ -78,25 +99,32 @@ fn timestamp_is_at_or_after(timestamp: &Value, since: &str) -> bool {
     }
 }
 
-fn content_text(content: Option<&Value>) -> String {
-    let Some(content) = content.filter(|value| !value.is_null()) else {
-        return String::new();
+fn content_text(content: Option<&Value>) -> Result<String, ()> {
+    let Some(content) = content else {
+        return Ok(String::new());
     };
     match content {
-        Value::Array(parts) => parts
-            .iter()
-            .filter(|part| part.get("type") == Some(&Value::String("text".to_string())))
-            .map(|part| part.get("text").map_or_else(String::new, jq_join_text))
-            .collect::<Vec<_>>()
-            .join(" "),
-        other => jq_text(other),
+        Value::Null | Value::Bool(false) => Ok(String::new()),
+        Value::Array(parts) => {
+            let mut text_parts = Vec::new();
+            for part in parts {
+                if part.get("type") != Some(&Value::String("text".to_string())) {
+                    continue;
+                }
+                let text = part.get("text").unwrap_or(&Value::Null);
+                text_parts.push(jq_join_text(text)?);
+            }
+            Ok(text_parts.join(" "))
+        }
+        other => Ok(jq_text(other)),
     }
 }
 
-fn jq_join_text(value: &Value) -> String {
+fn jq_join_text(value: &Value) -> Result<String, ()> {
     match value {
-        Value::Null => String::new(),
-        _ => jq_text(value),
+        Value::Null => Ok(String::new()),
+        Value::Array(_) | Value::Object(_) => Err(()),
+        _ => Ok(jq_text(value)),
     }
 }
 
@@ -110,13 +138,34 @@ fn jq_text(value: &Value) -> String {
     }
 }
 
-fn tail_entries(entries: Vec<String>, max: i64) -> Vec<String> {
-    if max >= 0 {
-        let keep = max as usize;
-        let start = entries.len().saturating_sub(keep);
-        entries[start..].to_vec()
-    } else {
-        let skip = max.unsigned_abs() as usize;
-        entries[skip.min(entries.len())..].to_vec()
-    }
+fn run_tail(input: &str, max: &str) -> Option<u8> {
+    let mut child = Command::new("tail")
+        .args(["-n", max])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let write_failed = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(input.as_bytes()).is_err())
+        .unwrap_or(false);
+    let output = child.wait_with_output().ok()?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    let status = output.status.code().unwrap_or(1);
+    Some(
+        if status == 0 && (write_failed || is_zero_tail_limit(max) && !input.is_empty()) {
+            // GNU tail -n 0 closes the pipe before jq can finish writing, so the
+            // reference pipeline reports jq's SIGPIPE status (141).
+            141
+        } else {
+            status as u8
+        },
+    )
+}
+
+fn is_zero_tail_limit(max: &str) -> bool {
+    let max = max.trim();
+    let digits = max.strip_prefix('-').unwrap_or(max);
+    !digits.is_empty() && digits.chars().all(|character| character == '0')
 }
