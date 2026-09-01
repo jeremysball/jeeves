@@ -26,6 +26,12 @@ struct Cli {
 enum Command {
     /// Print the jeeves version and exit
     Version,
+    /// Clean branches that are safe to delete
+    Clean {
+        repo: PathBuf,
+        #[arg(value_name = "BRANCH", num_args = 1..)]
+        branches: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -50,6 +56,9 @@ fn main() -> ExitCode {
         None | Some(Command::Version) => {
             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
+        }
+        Some(Command::Clean { repo, branches }) => {
+            ExitCode::from(worktrees::clean::clean_branches(&repo, &branches))
         }
     }
 }
