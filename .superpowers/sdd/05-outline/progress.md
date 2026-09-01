@@ -11,3 +11,5 @@ Note: mise gate fails in sandbox on trusted-config symlink (RO state dir) - manu
 Task 2: review round 1: spec fail - linked-worktree objects path (controller-reproduced: rust UNKNOWN merge-conflict vs ref SCORED 0 on /tmp/covchk/wt). Root cause: execution-error.
 Task 2: minor (deferred): main.rs bad-dir-vs-count error ordering differs from ref cd semantics (same exit-2 family).
 Task 2: fix round 1/5 dispatched (oc_mti7h3iq, worktree jeeves-rust-fix2).
+Task 2: fix round 1/5 (2 addressed, 0 open; commits 95bd97e..de89052)
+Task 2: complete (commits 2af03f4..de89052, review clean after round 1)
