@@ -21,3 +21,5 @@ Ruling: model route switched to openai/gpt-5.6-luna (max) after 6 silent provide
 Task 3: review pending after 3c.
 Task 3: review round 1: 6 Important + 3 Minor findings (hook panic path, clean empty-args no-op, update-ref stdout swallowed, two knobs off-resolver, hook repo-mode divergence, missing reference-comparison tests). Controller spot-verified: hook rc 101 vs ref rc 0; findings CONFIRMED real.
 Task 3: fix round 1 unit A (impl) dispatched oc_mtie2jds.
+Task 3: fix round 1/5 (5 addressed, 2 open: F2 wording, F6 bucket coverage).
+Task 3: RULING on F2 — usage prose (not a refusal string) may carry the new program name; the binding constraint is the exit-code family + refusal-message parity, both met. Parked. Ruling: costs nothing if wrong (usage text only), reversible in one line.
