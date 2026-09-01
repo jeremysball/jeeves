@@ -16,3 +16,6 @@ Task 2: complete (commits 2af03f4..de89052, review clean after round 1)
 Task 3a: 3-dispatch split (core/tests/hook) after two context-death attempts on the monolithic brief.
 Task 3a-1: core landed (host-verified 62 tests, clippy clean). Note: audit.rs carries 14 em-dashes mirroring the reference report strings; inherited convention, flag at final review.
 Task 3a: done in 3 units (core/collapse/golden) - byte parity on all 5 buckets.
+Task 3 split further: 3a done (core+collapse+golden), 3b-i archive, 3b-ii clean, 3c tests+hook in flight.
+Ruling: model route switched to openai/gpt-5.6-luna (max) after 6 silent provider deaths on ollama flash for >100-turn-scale writes; ollama still fine for short units/reviews.
+Task 3: review pending after 3c.
