@@ -167,7 +167,7 @@ fn merged_and_outstanding() {
 
     let b = init_repo(&dir, "b");
     commit(&b, "a.txt", "a\n", "init");
-    git(&b, &["checkout", "-q", "-b", "feature"]);
+    git(&b, &["checkout", "-q", "-b", "wip"]);
     commit(&b, "feat.txt", "feature work\n", "add feat");
     commit(&b, "feat2.txt", "more work\n", "add feat2");
     git(&b, &["checkout", "-q", "main"]);
@@ -212,6 +212,7 @@ fn content_merged() {
     commit(&repo, "e1.txt", "e1\n", "extra main commit 1");
     commit(&repo, "e2.txt", "e2\n", "extra main commit 2");
     commit(&repo, "e3.txt", "e3\n", "extra main commit 3");
+    commit(&repo, "e4.txt", "e4\n", "extra main commit 4");
 
     assert_parity(&dir, "10 years ago");
     let _ = std::fs::remove_dir_all(&dir);

@@ -763,10 +763,34 @@ fn session_tail_gnu_max_forms_and_diagnostics_match_reference() {
     std::fs::write(&session, format!("{}\n", lines.join("\n"))).unwrap();
     let session_arg = session.to_string_lossy().into_owned();
 
+    // SIGPIPE race: for max=0 the reference pipeline's jq is killed by
+    // `tail -n 0` closing stdin (141/None), while GNU tail exits 0.
+    fn norm_status(code: Option<i32>) -> Option<i32> {
+        match code {
+            Some(0) | Some(141) | None => Some(0),
+            other => other,
+        }
+    }
+    fn assert_parity_norm(reference: &Output, rust: &Output, label: &str) {
+        assert_eq!(
+            norm_status(reference.status.code()),
+            norm_status(rust.status.code()),
+            "{label} exit status differs: ref stderr: {} / rust stderr: {}",
+            String::from_utf8_lossy(&reference.stderr),
+            String::from_utf8_lossy(&rust.stderr)
+        );
+        assert_eq!(
+            rust.stdout,
+            reference.stdout,
+            "{label} stdout differs\nreference:\n{}\nrust:\n{}",
+            String::from_utf8_lossy(&reference.stdout),
+            String::from_utf8_lossy(&rust.stdout)
+        );
+    }
     for max in ["+2", "-2", "2", "0"] {
         let reference = run_ref("session-tail.sh", &[&session_arg, "", max]);
         let rust = run_rust("session-tail", &[&session_arg, "", max]);
-        assert_stdout_parity(&reference, &rust, &format!("session-tail max {max}"));
+        assert_parity_norm(&reference, &rust, &format!("session-tail max {max}"));
     }
 
     let reference = run_ref("session-tail.sh", &[]);
