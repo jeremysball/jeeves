@@ -22,9 +22,9 @@ pub fn human_age(secs: u64) -> String {
 /// Mirrors ref/lib.sh:105-133: the newest mtime among files listed by
 /// `git status --porcelain` (which includes untracked), via
 /// `ls-files -z --modified --others --exclude-standard` plus
-/// `diff --cached --name-only -z`. Returns `None` when the worktree is clean
-/// (no mtimes at all).  activity then comes from the last commit alone, and
-/// the caller decides what to do with a None.
+/// `diff --cached --name-only -z`. Returns `None` when the last-commit time
+/// cannot be read (not a repo, no commits); a clean worktree simply
+/// contributes no mtime, so the age comes from the last commit alone.
 pub fn activity_age_secs(repo: &Path) -> Option<u64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -34,13 +34,42 @@ pub fn activity_age_secs(repo: &Path) -> Option<u64> {
     let commit_ts = git(repo, &["log", "-1", "--format=%ct"]).ok()?;
     let commit_ts: u64 = commit_ts.trim().parse().unwrap_or(0);
 
-    let newest = newest_change_mtime(repo)?;
-    Some(now.saturating_sub(commit_ts.max(newest)))
+    let mut newest = commit_ts;
+    if let Some(m) = newest_change_mtime(repo) {
+        newest = newest.max(m);
+    }
+    Some(now.saturating_sub(newest))
+}
+
+/// Branch-aware variant of `activity_age_secs`, mirroring ref/lib.sh:123-133
+/// exactly: the last commit time of `<branch>` (not the repo's HEAD) and the
+/// newest touched-file mtime inside the worktree at `<wt>` (which may live
+/// outside the repo dir, so mtimes are resolved against the worktree path).
+/// A missing/clean worktree contributes no mtime; the age is then the
+/// branch's last-commit age alone. A failed `git log` falls back to
+/// commit_ts 0 (the reference's `|| commit_ts=""` -> 0), so the age is
+/// "since the beginning of time" rather than None.
+pub(crate) fn activity_age_secs_for(repo: &Path, branch: &str, wt: Option<&Path>) -> Option<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+
+    let commit_ts = git(repo, &["log", "-1", "--format=%ct", branch]).unwrap_or_default();
+    let commit_ts: u64 = commit_ts.trim().parse().unwrap_or(0);
+
+    let mut newest = commit_ts;
+    if let Some(wt) = wt {
+        if let Some(m) = newest_change_mtime(wt) {
+            newest = newest.max(m);
+        }
+    }
+    Some(now.saturating_sub(newest))
 }
 
 /// Newest mtime (unix seconds) among files the user has actually touched,
 /// per ref/lib.sh:105-113. `None` when the repo is clean or unreadable.
-fn newest_change_mtime(repo: &Path) -> Option<u64> {
+pub(crate) fn newest_change_mtime(wt: &Path) -> Option<u64> {
     let mut paths: Vec<String> = Vec::new();
     for args in [
         vec![
@@ -52,7 +81,7 @@ fn newest_change_mtime(repo: &Path) -> Option<u64> {
         ],
         vec!["diff", "--cached", "--name-only", "-z"],
     ] {
-        let out = git(repo, &args).ok()?;
+        let out = git(wt, &args).ok()?;
         paths.extend(
             out.split('\0')
                 .filter(|p| !p.is_empty())
@@ -61,7 +90,7 @@ fn newest_change_mtime(repo: &Path) -> Option<u64> {
     }
     let mut newest: Option<u64> = None;
     for p in &paths {
-        if let Ok(md) = std::fs::metadata(repo.join(p)) {
+        if let Ok(md) = std::fs::metadata(wt.join(p)) {
             if let Ok(m) = md.modified() {
                 if let Ok(secs) = m.duration_since(std::time::UNIX_EPOCH) {
                     let secs = secs.as_secs();
@@ -74,12 +103,19 @@ fn newest_change_mtime(repo: &Path) -> Option<u64> {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, std::io::Error> {
-    Command::new("git")
+    let out = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git {:?} failed with {}",
+            args.first(),
+            out.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]

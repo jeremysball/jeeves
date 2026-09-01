@@ -3,6 +3,7 @@
 // gate runs with -D warnings, so this must be explicit, not incidental).
 #![allow(dead_code)]
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -34,12 +35,41 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("coverage") {
         return run_coverage();
     }
+    // `jeeves audit` likewise parses its own args: --no-content is accepted
+    // in ANY position (mirroring ref/audit-worktrees.sh:22-27), which clap
+    // would reject as a misplaced flag.
+    if std::env::args().nth(1).as_deref() == Some("audit") {
+        return run_audit();
+    }
     match Cli::parse().command {
         None | Some(Command::Version) => {
             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
     }
+}
+
+fn run_audit() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+
+    // --no-content is accepted in any position; everything else is a root
+    // dir (ref/audit-worktrees.sh:22-27). The first positional wins, extra
+    // positionals are ignored, and the default root is the cwd.
+    let mut no_content = false;
+    let mut root: Option<PathBuf> = None;
+    for arg in &args {
+        if arg == "--no-content" {
+            no_content = true;
+        } else if root.is_none() {
+            root = Some(PathBuf::from(arg));
+        }
+    }
+    let root =
+        root.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let opts = worktrees::audit::resolve_opts(no_content);
+    print!("{}", worktrees::audit::audit_sweep(&[root], &opts));
+    ExitCode::SUCCESS
 }
 
 fn run_coverage() -> ExitCode {

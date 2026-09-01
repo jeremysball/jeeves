@@ -20,6 +20,19 @@ pub enum LockStatus {
     Unknown,
 }
 
+impl std::fmt::Display for LockStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Lowercase, matching the reference's `lock_status` echoes
+        // (ref/lib.sh:64-77) which audit-worktrees.sh prints verbatim.
+        let s = match self {
+            LockStatus::Live => "live",
+            LockStatus::Stale => "stale",
+            LockStatus::Unknown => "unknown",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// Reads `/proc/<pid>/stat` and extracts the starttime (field 22; the shell
 /// original reads field 20 after stripping `(comm)` via `${stat##*) }`).
 /// Returns `None` when procfs is unusable or the stat is malformed.
