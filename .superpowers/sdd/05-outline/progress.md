@@ -34,3 +34,4 @@ Task 4: fix round 1 dispatched.
 Task 4: fix round 1/5 (7 addressed, 0 open; commits 384e1f1..4148455)
 Task 4: complete (commits 15b586c..4148455, review clean after round 1)
 Task 5: gate caught orient_golden::max-0 flake. ROOT CAUSE (measured): ref pipeline exits 0 or 141 nondeterministically (jq SIGPIPE race vs `tail -n 0`); Rust deterministically 141. Ruling: statuses are GNU-equivalent (tail says 0); test must normalize {0,141}->0 for BOTH sides with a comment naming the race. Plan-error (test brief said "match exact status" for a nondeterministic reference).
+Task 5: review round 1: 2 findings (Important fd-preflight missing - controller reproduced silent 0-of-0 vs ref exit 2; Minor --flag only checked at args[0]). Root cause: execution-error (brief listed fd-missing path; part-1 brief pointed at wrong line range).
