@@ -217,9 +217,22 @@ def git_state() -> str:
     from the retired orient-global skill), persisted to state so invocation-
     time reads stay local-only. Honest about failure rather than skipping."""
     scan = Path.home() / ".claude/skills/orient/bin/scan-active.sh"
+    discover = Path.home() / ".claude/skills/orient/bin/discover-roots.sh"
     since = os.environ.get("SINCE", "yesterday 00:00")
     out = "(git scan unavailable: scan-active.sh missing)"
     if scan.exists():
+        # Refresh the discovered-roots file first so the scan deduplicates
+        # clones of the same remote (a stale clone otherwise reports its own
+        # commits as shipped work). Best-effort: a missing discover-roots.sh
+        # or a failed discovery leaves the previous roots file in place, and
+        # scan-active.sh falls back to ORIENT_ROOTS//workspace when the file
+        # is absent or empty.
+        if discover.exists():
+            try:
+                subprocess.run(["bash", str(discover)],
+                               capture_output=True, text=True, timeout=180)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                jl.log(f"root discovery failed: {e}")
         try:
             p = subprocess.run(["bash", str(scan), since],
                                capture_output=True, text=True, timeout=180)
