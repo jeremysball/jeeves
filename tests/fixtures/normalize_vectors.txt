@@ -1,0 +1,43 @@
+# normalize()/line_hash() vectors generated from bin/jeeves_lib.py:155-174 on 2026-09-01, BEFORE any deletion.
+# Format: python-repr line, normalized output, sha256 hex, "---". Reproduce with uv run python importing jeeves_lib.
+# NOTE the port quirk to replicate: lstrip("- [x] ") and lstrip("- [ ] ") are CHARACTER-SET strips, not prefixes.
+'- [ ] fix the scan (jeeves: open, session abc, 2026-08-30)'
+fix the scan
+84d08e625a0b540380f642d6e88a225ba3a411e09899326bf3ec95a14dc4da81
+---
+'- [ ] FIX the SCAN (jeeves: open, session abc, 2026-08-30) (dismissed 2026-08-31)'
+fix the scan
+84d08e625a0b540380f642d6e88a225ba3a411e09899326bf3ec95a14dc4da81
+---
+'  - [x]   spaced   out\twords  '
+spaced out words
+1e93a1e4d281f67f7b7fd1eba5647f6acda5daa6c0c5deaef8aab88fde963f7d
+---
+'- [ ] café naïve ẛ trömîne (unicode NFKC check)'
+café naïve ṡ trömîne (unicode nfkc check)
+95c6a5f832370da787bde38112119fdcf442acf7d1756f33784a1d3bd129b40e
+---
+'- plain bullet no checkbox'
+plain bullet no checkbox
+1e742bdca034706224dd676c349ab42078e4affdd40389b9c1ada7353e613186
+---
+'* star bullet (jeeves: kind, source, date)'
+* star bullet
+2e8d544401aafbf564ec33a2a7951f1ceb785b236c2df9e2b9d797be01bcba46
+---
+'- [ ] **bold** thing with **two** bolds'
+**bold** thing with **two** bolds
+48bd934f57c136c0352522dc9c2c40c4347a657a10f0270f2457b0772032a719
+---
+'- [ ] trailing (jeeves: nested (parens) tag)'
+trailing (jeeves: nested (parens) tag)
+c999851f0b5cc4d3cd0eff141dc88c0923dd594e8b14e8e9d2fb6364f9dcf269
+---
+''
+
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+---
+'- [ ] FULLWIDTH ｗｉｄｔｈ ｃｈａｒｓ'
+fullwidth width chars
+3520c54c6876851a6a661fd7408ead49e3ed66ae6bcec8dff974178cf82d79c3
+---
