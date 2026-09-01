@@ -1,12 +1,14 @@
-//! Active-repo scan (part 1): repo discovery + per-repo branch/tree
-//! classification, mirroring ref/scan-active.sh. Output formatting (the TOON
-//! emitter) is part 2, and consumes the pub types declared here.
+//! Active-repo scan: repo discovery + per-repo branch/tree classification and
+//! the content-coverage pass, mirroring ref/scan-active.sh, plus the TOON
+//! emitter that renders the report.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::core::git;
+use crate::core::toon::{toon_str, toon_table, Cell};
+use crate::worktrees::coverage;
 
 /// One commit row from `git log --branches --since=<since>`.
 #[derive(Debug, Clone)]
@@ -55,16 +57,284 @@ pub struct ScanStats {
     pub active: usize,
 }
 
-/// TODO (next unit): the content-coverage pass. The reference
-/// (scan-active.sh:291-319) runs `coverage_score` against the resolved
-/// base_ref for branches still unmerged after the exact passes, reclassifying
-/// SCORED pct >= threshold as content-merged. Takes `&mut` results so part 2's
-/// caller can apply the verdicts in place.
-#[allow(clippy::needless_pass_by_value)]
-pub fn score_pass(_results: &mut [RepoScan]) {}
+/// The content-coverage pass, mirroring scan-active.sh:291-319 + 326-352.
+/// Skips when content scoring is off (JEEVES_ORIENT_CONTENT_SCORING, then
+/// legacy ORIENT_CONTENT_SCORING; "0" disables). For branches still unmerged
+/// after the exact passes, runs the in-repo coverage verdict against the
+/// resolved base; SCORED pct >= threshold reclassifies as content-merged with
+/// detail `content: N% of its lines already in <base>`. UNSCORED/UNKNOWN
+/// verdicts leave rows untouched. After scoring, the proved-beats-scored
+/// closure runs once more so descendants of a freshly scored branch are
+/// caught too.
+pub fn score_pass(results: &mut [RepoScan], cfg: &ScoreCfg) {
+    if !cfg.content_scoring {
+        return;
+    }
+    for repo in results {
+        let (base_branch, base_ref) = detect_base(&repo.path);
+        let Some(base_ref) = base_ref else {
+            continue;
+        };
+        let base_branch = base_branch.unwrap_or_else(|| base_ref.clone());
+        for b in &mut repo.branches {
+            if b.classification != Classification::PotentiallyOutstanding {
+                continue;
+            }
+            let Ok(verdict) = coverage::coverage_score(&repo.path, &base_ref, &b.name) else {
+                continue;
+            };
+            let Some(pct) = verdict.strip_prefix("SCORED ") else {
+                continue;
+            };
+            let Ok(pct) = pct.parse::<u64>() else {
+                continue;
+            };
+            if pct >= cfg.threshold {
+                b.classification = Classification::ContentMerged;
+                b.state = format!("content: {pct}% of its lines already in {base_branch}");
+            }
+        }
+        proved_beats_scored(repo, Some(&base_branch));
+        repo.alerts = repo
+            .branches
+            .iter()
+            .filter(|b| b.classification == Classification::PotentiallyOutstanding)
+            .count();
+    }
+}
 
-/// Runs `scan-active <since> [root ...]`: prints the one-line summary
-/// `scan: <active> of <scanned> repos` (the real TOON emitter is next unit).
+/// The proved-beats-scored transitive closure, mirroring scan-active.sh:326-352
+/// (the same rule as part 1's first closure, scan-active.sh:261-289): a branch
+/// that is an ancestor of a proved-merged branch is proved, and one that is
+/// only an ancestor of a content-scored branch is content-scored too.
+fn proved_beats_scored(repo: &mut RepoScan, base_branch: Option<&str>) {
+    let mut iter = 0;
+    let mut changed = true;
+    while changed && iter < 20 {
+        changed = false;
+        iter += 1;
+        for i in 0..repo.branches.len() {
+            if Some(repo.branches[i].name.as_str()) == base_branch {
+                continue;
+            }
+            if repo.branches[i].classification != Classification::PotentiallyOutstanding {
+                continue;
+            }
+            let mut scored_ancestor: Option<usize> = None;
+            let mut proved = false;
+            for j in 0..repo.branches.len() {
+                if repo.branches[j].classification == Classification::PotentiallyOutstanding {
+                    continue;
+                }
+                if is_ancestor(&repo.path, &repo.branches[i].name, &repo.branches[j].name) {
+                    if repo.branches[j].classification == Classification::ContentMerged {
+                        if scored_ancestor.is_none() {
+                            scored_ancestor = Some(j);
+                        }
+                    } else {
+                        let detail = format!(
+                            "ancestor of {} ({})",
+                            repo.branches[j].name, repo.branches[j].state
+                        );
+                        repo.branches[i].classification = Classification::Merged;
+                        repo.branches[i].state = detail;
+                        changed = true;
+                        proved = true;
+                        break;
+                    }
+                }
+            }
+            if !proved {
+                if let Some(j) = scored_ancestor {
+                    let detail = format!(
+                        "ancestor of {} ({})",
+                        repo.branches[j].name, repo.branches[j].state
+                    );
+                    repo.branches[i].classification = Classification::ContentMerged;
+                    repo.branches[i].state = detail;
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+/// Knobs for the content-coverage pass, resolved from env like
+/// scan-active.sh:122-144.
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreCfg {
+    pub content_scoring: bool,
+    pub threshold: u64,
+}
+
+/// Resolves the scoring knobs: JEEVES_ORIENT_CONTENT_SCORING then legacy
+/// ORIENT_CONTENT_SCORING ("0" skips), and the threshold via
+/// JEEVES_CONTENT_MERGE_THRESHOLD then legacy
+/// WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD, default 95. Invalid or 0 threshold
+/// warns on stderr exactly like scan-active.sh:137-143 and falls back to 95.
+pub fn resolve_score_cfg() -> ScoreCfg {
+    let scoring = std::env::var("JEEVES_ORIENT_CONTENT_SCORING")
+        .ok()
+        .or_else(|| std::env::var("ORIENT_CONTENT_SCORING").ok())
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let mut threshold = std::env::var("JEEVES_CONTENT_MERGE_THRESHOLD")
+        .ok()
+        .or_else(|| std::env::var("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD").ok())
+        .unwrap_or_else(|| "95".to_string());
+    if threshold == "0" || !is_valid_pct(&threshold) {
+        eprintln!(
+            "warning: WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD must be an integer 1-100 with no leading zero, got '{threshold}'; using 95"
+        );
+        threshold = "95".to_string();
+    }
+    ScoreCfg {
+        content_scoring: scoring,
+        threshold: threshold.parse().unwrap_or(95),
+    }
+}
+
+/// Strict decimal percentage check, mirroring ref/lib.sh:254-268: rejects
+/// non-digits, leading zeros (octal-looking), and anything longer than 3
+/// digits (would wrap modulo 2^64 in the shell's arithmetic read).
+fn is_valid_pct(val: &str) -> bool {
+    if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if val.len() > 1 && val.starts_with('0') {
+        return false;
+    }
+    if val.len() > 3 {
+        return false;
+    }
+    let n: u64 = val.parse().unwrap_or(0);
+    n <= 100
+}
+
+/// Renders the TOON report, mirroring scan-active.sh:423-468.
+pub fn emit(stats: &ScanStats, repos: &[RepoScan], since: &str, self_path: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("bin: {}\n", self_display(self_path)));
+    out.push_str("description: Git repos with local commits in a window, with per-branch push and merge state\n");
+    out.push_str(&format!("window: {}\n", toon_str(since)));
+
+    if repos.is_empty() {
+        out.push_str(&format!(
+            "repos: 0 of {} scanned repos have commits since {}\n",
+            stats.scanned,
+            toon_str(since)
+        ));
+        out.push_str("help[1]:\n");
+        out.push_str("  Run `scan-active.sh \"1 week ago\"` to widen the window\n");
+        return out;
+    }
+
+    out.push_str(&format!(
+        "count: {} of {} scanned repos active\n",
+        repos.len(),
+        stats.scanned
+    ));
+    out.push('\n');
+    let rows: Vec<Vec<Cell>> = repos
+        .iter()
+        .map(|r| {
+            vec![
+                Cell::Str(r.path.to_string_lossy().into_owned()),
+                Cell::Str(r.branch.clone()),
+                Cell::Bare(r.tree.clone()),
+                Cell::Bare(r.alerts.to_string()),
+            ]
+        })
+        .collect();
+    out.push_str(&toon_table(
+        "repos",
+        &["path", "branch", "tree", "alerts"],
+        &rows,
+    ));
+    out.push('\n');
+
+    for repo in repos {
+        out.push('\n');
+        out.push_str(&format!(
+            "repo: {}\n",
+            toon_str(&repo.path.to_string_lossy())
+        ));
+        if repo.branches.is_empty() {
+            out.push_str("  branches: 0 non-base branches\n");
+        } else {
+            out.push_str(&format!(
+                "  branches[{}]{{name,classification,detail}}:\n",
+                repo.branches.len()
+            ));
+            for b in &repo.branches {
+                out.push_str(&format!(
+                    "    {},{},{}\n",
+                    toon_str(&b.name),
+                    toon_str(classification_str(b.classification)),
+                    toon_str(&b.state)
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "  commits_all_branches: {} of {} in window\n",
+            repo.commits.len(),
+            repo.total
+        ));
+        out.push_str(&format!(
+            "  commits_all_branches[{}]{{sha,subject,age}}:\n",
+            repo.commits.len()
+        ));
+        for c in &repo.commits {
+            out.push_str(&format!(
+                "    {},{},{}\n",
+                c.sha,
+                toon_str(&c.subject),
+                toon_str(&c.age)
+            ));
+        }
+        if repo.commits.len() < repo.total {
+            out.push_str("  help[1]:\n");
+            out.push_str(&format!(
+                "    Run `ORIENT_COMMIT_LIMIT={} scan-active.sh` to see all {}\n",
+                repo.total, repo.total
+            ));
+        }
+    }
+
+    out.push('\n');
+    out.push_str("help[3]:\n");
+    out.push_str(
+        "  Read the branches table, not the branch field, before claiming a repo is pushed\n",
+    );
+    out.push_str("  Treat content-merged as landed but scored, not proved: archive it with `archive-branch.sh --strict`, never `clean-safe.sh`\n");
+    out.push_str("  Run `git -C <path> rev-list --left-right --count main...origin/main` to confirm a DIVERGED repo\n");
+    out
+}
+
+fn classification_str(c: Classification) -> &'static str {
+    match c {
+        Classification::Merged => "merged",
+        Classification::ContentMerged => "content-merged",
+        Classification::PotentiallyOutstanding => "potentially outstanding",
+    }
+}
+
+/// Collapses $HOME to ~ for the bin: line (AXI §10), mirroring
+/// scan-active.sh:6-8 and roots.rs's self_display.
+fn self_display(self_path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() {
+        if self_path == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = self_path.strip_prefix(&(home.clone() + "/")) {
+            return format!("~/{rest}");
+        }
+    }
+    self_path.to_string()
+}
+
+/// Runs `scan-active <since> [root ...]`: prints the TOON report.
 pub fn run(args: &[String]) -> u8 {
     let Some(since) = args.first() else {
         eprintln!("error: <since> is required");
@@ -92,8 +362,12 @@ pub fn run(args: &[String]) -> u8 {
         .unwrap_or(15);
 
     let (stats, mut results) = scan(roots, since, commit_limit);
-    score_pass(&mut results);
-    println!("scan: {} of {} repos", stats.active, stats.scanned);
+    let cfg = resolve_score_cfg();
+    score_pass(&mut results, &cfg);
+    let self_path = std::env::args()
+        .next()
+        .unwrap_or_else(|| "jeeves".to_string());
+    print!("{}", emit(&stats, &results, since, &self_path));
     0
 }
 
