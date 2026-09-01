@@ -92,6 +92,32 @@ pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<Option<String>, CliEr
     Ok(Some(base.trim().to_string()))
 }
 
+/// `git rev-parse --path-format=absolute --git-path objects`
+/// (ref/lib.sh:203). `Ok(None)` when git fails or prints nothing, mirroring
+/// the reference's `2>/dev/null` read + empty check -> `UNKNOWN no-object-dir`
+/// (ref/lib.sh:204). Unlike `--absolute-git-dir`, this resolves the actual
+/// object store even from a linked worktree (whose per-worktree gitdir has no
+/// `objects/` directory).
+pub fn objects_dir(repo: &Path) -> Result<Option<String>, CliError> {
+    let out = run(
+        repo,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+    )?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(s))
+}
+
 /// `git rev-parse <ref>` (ref/lib.sh:205). Errors -> refusal.
 pub fn rev_parse(repo: &Path, r: &str) -> Result<String, CliError> {
     Ok(stdout(repo, &["rev-parse", r])?.trim().to_string())

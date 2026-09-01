@@ -255,6 +255,45 @@ fn conflicting_merge_is_unknown_merge_conflict() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// (h) scoring from a LINKED worktree's path: `--git-path objects` must
+/// resolve the real object store (the per-worktree gitdir has no `objects/`),
+/// so Rust's verdict equals the reference's. A squashed-merged branch plus an
+/// extra main commit makes feat genuinely unmerged (SCORED 0 from the main
+/// repo path, reference parity asserted on both).
+#[test]
+fn linked_worktree_path_scores_like_main_repo() {
+    let dir = scratch_dir();
+    let repo = init_repo(&dir);
+    commit(&repo, "a.txt", "a\n", "init");
+    let init_sha = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "-b", "old"]);
+    commit(&repo, "old.txt", "old work\n", "old work");
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["merge", "-q", "--squash", "old"]);
+    git(&repo, &["commit", "-qm", "squash: old (#1)"]);
+    commit(&repo, "extra.txt", "extra\n", "extra main commit");
+
+    git(&repo, &["checkout", "-q", "-b", "feat", &init_sha]);
+    commit(&repo, "feat.txt", "feat work\n", "feat work");
+    git(&repo, &["checkout", "-q", "main"]);
+
+    let wt = dir.join("wt");
+    git(
+        &repo,
+        &["worktree", "add", "-q", &wt.to_string_lossy(), "feat"],
+    );
+
+    assert_parity(&repo, "main", "feat");
+    assert_parity(&wt, "main", "feat");
+    assert_eq!(stdout_of(&run_rust(&wt, "main", "feat")), "SCORED 0");
+
+    git(
+        &repo,
+        &["worktree", "remove", "--force", &wt.to_string_lossy()],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Usage errors mirror ref/coverage-score: exact strings on stdout, exit 2.
 #[test]
 fn usage_errors_match_reference() {

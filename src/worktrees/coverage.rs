@@ -5,7 +5,8 @@
 //! Verdict contract (single line on stdout, exit 0):
 //!   SCORED <0-100>   - percent of the branch's net text lines in base.
 //!   UNSCORED <why>   - binary/mode-only row, O==0, or empty patch.
-//!   UNKNOWN <why>    - criss-cross history, merge conflict, merge-tree error.
+//!   UNKNOWN <why>    - criss-cross history, no object dir, merge conflict,
+//!                     or merge-tree error.
 
 use std::path::Path;
 use std::process::Command;
@@ -95,8 +96,13 @@ pub fn coverage_score(repo: &Path, base: &str, branch: &str) -> Result<String, C
     // SCORED 100: the reference exits 2 from the subshell in that case,
     // which surfaces as rc 2 -> UNKNOWN merge-tree-error (lib.sh:216-221).
     let obj = tempfile_dir()?;
-    let alt = git::rev_parse_abs_git_dir(repo)?;
-    let alt = format!("{alt}/objects");
+    let alt = match git::objects_dir(repo)? {
+        Some(alt) => alt,
+        None => {
+            let _ = std::fs::remove_dir_all(&obj);
+            return Ok("UNKNOWN no-object-dir".to_string());
+        }
+    };
     let base_oid = git::rev_parse(repo, base)?;
     let residual = merge_tree_residual(repo, &obj, &alt, base, branch, &base_oid)?;
     let _ = std::fs::remove_dir_all(&obj);
