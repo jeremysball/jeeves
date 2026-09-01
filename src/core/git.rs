@@ -37,11 +37,11 @@ fn stdout(repo: &Path, args: &[&str]) -> Result<String, CliError> {
 /// or a failed log (repo without commits, unreadable repo, ...) yields an
 /// empty Vec, mirroring the script's `git ... 2>/dev/null; [ -z "$subjects" ] && continue`.
 ///
-/// A record is a run of consecutive `\x1f`-separated fields; a trailing
-/// separator (the format always ends with a field, so the line's final
-/// newline is the only terminator) would produce an empty trailing field and
-/// is dropped so `%h%x1f%s` + newline yields one record of two fields, not a
-/// third empty one.
+/// A record is a line of `\x1f`-separated fields. The raw stdout is split on
+/// `\n` first (dropping only the trailing empty record produced by the final
+/// newline), then each record is split on `\x1f` keeping ALL fields, so an
+/// interior empty field (e.g. an empty subject in `%h%x1f%s%x1f%cr`) is
+/// preserved and records stay aligned.
 pub fn log_units(repo: &Path, args: &[&str]) -> Vec<Vec<String>> {
     let Ok(out) = stdout(repo, args) else {
         return Vec::new();
@@ -49,26 +49,14 @@ pub fn log_units(repo: &Path, args: &[&str]) -> Vec<Vec<String>> {
     if out.is_empty() {
         return Vec::new();
     }
-    let mut records: Vec<Vec<String>> = Vec::new();
-    let mut current: Vec<String> = Vec::new();
-    for field in out.split('\x1f') {
-        if field.is_empty() && !current.is_empty() {
-            // Consecutive separators or trailing separator: only a newline
-            // legitimately ends a record, and it is not part of the format.
-            continue;
-        }
-        current.push(field.to_string());
-        if field.ends_with('\n') {
-            if let Some(last) = current.last_mut() {
-                last.pop();
-            }
-            records.push(std::mem::take(&mut current));
-        }
+    let mut lines: Vec<&str> = out.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
     }
-    if !current.is_empty() {
-        records.push(current);
-    }
-    records
+    lines
+        .iter()
+        .map(|line| line.split('\x1f').map(|f| f.to_string()).collect())
+        .collect()
 }
 
 /// `git rev-parse --absolute-git-dir` (ref/lib.sh:54-56). Errors -> refusal.
@@ -188,6 +176,27 @@ mod tests {
         assert_eq!(rows[0].len(), 3);
         assert!(!rows[0][0].is_empty());
         assert_eq!(rows[0][1], "first commit");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn log_units_keeps_interior_empty_fields() {
+        let d = init_repo();
+        git(
+            &d,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "--allow-empty-message",
+                "-m",
+                "",
+            ],
+        );
+        let rows = log_units(&d, &["log", "--format=%h%x1f%s%x1f%cr"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 3);
+        assert_eq!(rows[0][1], "");
         let _ = std::fs::remove_dir_all(&d);
     }
 
