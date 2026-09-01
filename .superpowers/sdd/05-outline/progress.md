@@ -23,3 +23,6 @@ Task 3: review round 1: 6 Important + 3 Minor findings (hook panic path, clean e
 Task 3: fix round 1 unit A (impl) dispatched oc_mtie2jds.
 Task 3: fix round 1/5 (5 addressed, 2 open: F2 wording, F6 bucket coverage).
 Task 3: RULING on F2 — usage prose (not a refusal string) may carry the new program name; the binding constraint is the exit-code family + refusal-message parity, both met. Parked. Ruling: costs nothing if wrong (usage text only), reversible in one line.
+Task 3: fix round 2/5 (F6 ADDRESSED: prunable + UNKNOWN passthrough both sides byte-equal; unknown-merge bucket shown unreachable for either implementation (is-ancestor rc 1 not >1) - parity preserved by construction).
+Task 3: parked - F2 usage wording (Ruling: program name in usage prose legitimately changes with the rename; binding constraint is exit-code family + refusal strings, both met. Costs nothing if wrong.)
+Task 3: complete (commits 06f7e4c..559a369 + docs, review clean after round 2, 1 parked)
