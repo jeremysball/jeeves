@@ -1,3 +1,7 @@
 # SDD ledger — plan: .superpowers/crispy/rust-rewrite/05-outline.md
 
 Preflight scan: Phases 2..6 share src/worktrees/coverage.rs and src/orient/scan.rs; sequencing fixed by outline order (coverage before scan content pass). Phase 4/6 roots-file default change is read-compatible (legacy fallback). Phase 7 normalize vectors must be generated from Python BEFORE Phase 9 deletion — ordering constraint respected. No task-internal contradictions found.
+
+Task 1: review round 1: spec ❌ (log_units drops interior empty fields — controller-verified vs shell; toon_table missing). Root cause: execution-error.
+Task 1: fix round 1/5 dispatched (resumed session ses_fa4e9604, worktree jeeves-rust-fix1, oc_mti5plnk).
+Task 1: minor (deferred): reviewer could not read sdd artifacts initially (untracked in worktree) — fixed by committing them.
