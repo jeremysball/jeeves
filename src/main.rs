@@ -52,6 +52,15 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("archive") {
         return run_archive();
     }
+    // `jeeves clean` has one reference usage form for both a missing repo and
+    // a missing branch list; handle those before clap emits its own rc-2 text.
+    if std::env::args().nth(1).as_deref() == Some("clean") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if args.len() < 2 {
+            eprintln!("{}", worktrees::clean::USAGE);
+            return ExitCode::from(1);
+        }
+    }
     // `jeeves session-hook` reads a JSON payload from stdin and must remain a
     // silent, always-successful command when the hook cannot report anything.
     if std::env::args().nth(1).as_deref() == Some("session-hook") {
@@ -63,7 +72,12 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Command::Clean { repo, branches }) => {
-            ExitCode::from(worktrees::clean::clean_branches(&repo, &branches))
+            if branches.is_empty() {
+                eprintln!("{}", worktrees::clean::USAGE);
+                ExitCode::from(1)
+            } else {
+                ExitCode::from(worktrees::clean::clean_branches(&repo, &branches))
+            }
         }
     }
 }

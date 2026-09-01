@@ -1,7 +1,8 @@
 //! State/data directory resolution, mirroring bin/jeeves_lib.py:44-60.
 //!
 //! `state_dir`: `$JEEVES_STATE_DIR` else `$XDG_STATE_HOME/jeeves` else
-//! `~/.local/state/jeeves`; created mode 0700 on demand.
+//! `~/.local/state/jeeves`; created mode 0700 on demand. Read-only callers can
+//! use `state_dir_path` to resolve the location without touching the filesystem.
 //! `data_dir`: `$JEEVES_DATA_DIR` else `$XDG_DATA_HOME/jeeves` else
 //! `~/.local/share/jeeves`; created on demand. The Python original chmods
 //! only the state dir (0700), not the data dir.  mirrored exactly.
@@ -11,15 +12,22 @@ use std::path::PathBuf;
 /// `$JEEVES_STATE_DIR` if set, else `$XDG_STATE_HOME/jeeves`, else
 /// `~/.local/state/jeeves`. Creates the directory (mode 0700) on demand.
 pub fn state_dir() -> PathBuf {
-    let d = dir_override("JEEVES_STATE_DIR")
-        .or_else(|| xdg_join("XDG_STATE_HOME", "jeeves"))
-        .unwrap_or_else(|| home_join(".local/state/jeeves"));
+    let d = state_dir_path();
     match std::fs::create_dir_all(&d) {
         Ok(()) => {}
         Err(e) => panic!("cannot create state dir {}: {e}", d.display()),
     }
     let _ = std::fs::set_permissions(&d, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     d
+}
+
+/// Resolves the state directory without creating it. This is used by
+/// read-only operations such as config loading, including the SessionStart
+/// hook, which must never mutate the filesystem.
+pub fn state_dir_path() -> PathBuf {
+    dir_override("JEEVES_STATE_DIR")
+        .or_else(|| xdg_join("XDG_STATE_HOME", "jeeves"))
+        .unwrap_or_else(|| home_join(".local/state/jeeves"))
 }
 
 /// `$JEEVES_DATA_DIR` if set, else `$XDG_DATA_HOME/jeeves`, else

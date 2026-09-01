@@ -73,7 +73,7 @@ fn repo_hook_emits_ordered_json_context_for_drift() {
 
     let output = run_hook(&dir, &payload, &dir.join("state"));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let prefix = r#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""#;
+    let prefix = "{\n  \"hookSpecificOutput\": {\n    \"hookEventName\": \"SessionStart\",\n    \"additionalContext\": \"";
     assert_eq!(output.status.code(), Some(0));
     assert!(
         stdout.starts_with(prefix),

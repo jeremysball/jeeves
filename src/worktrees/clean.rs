@@ -8,9 +8,15 @@ use crate::core::proc::{lock_status, LockStatus};
 use crate::core::time::{activity_age_secs_for, human_age};
 
 const DEFAULT_IN_FLIGHT_SECS: u64 = 7_200;
+pub const USAGE: &str = "usage: jeeves clean <repo-path> <branch> [<branch>...]";
 
 /// Clean each named local branch, returning one when any branch is refused.
 pub fn clean_branches(repo: &Path, branches: &[String]) -> u8 {
+    if branches.is_empty() {
+        eprintln!("{USAGE}");
+        return 1;
+    }
+
     let Some(root) = repo_root(repo) else {
         eprintln!(
             "refusing: can't determine base branch for {}",

@@ -19,3 +19,5 @@ Task 3a: done in 3 units (core/collapse/golden) - byte parity on all 5 buckets.
 Task 3 split further: 3a done (core+collapse+golden), 3b-i archive, 3b-ii clean, 3c tests+hook in flight.
 Ruling: model route switched to openai/gpt-5.6-luna (max) after 6 silent provider deaths on ollama flash for >100-turn-scale writes; ollama still fine for short units/reviews.
 Task 3: review pending after 3c.
+Task 3: review round 1: 6 Important + 3 Minor findings (hook panic path, clean empty-args no-op, update-ref stdout swallowed, two knobs off-resolver, hook repo-mode divergence, missing reference-comparison tests). Controller spot-verified: hook rc 101 vs ref rc 0; findings CONFIRMED real.
+Task 3: fix round 1 unit A (impl) dispatched oc_mtie2jds.

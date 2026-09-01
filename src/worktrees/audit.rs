@@ -54,7 +54,10 @@ pub fn resolve_opts(no_content: bool) -> AuditOpts {
     .unwrap_or(7776000);
     let mut threshold = config::resolve(
         &None,
-        &["WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD"],
+        &[
+            "JEEVES_AUDIT_CONTENT_MERGE_THRESHOLD",
+            "WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD",
+        ],
         &config,
         "95",
     );

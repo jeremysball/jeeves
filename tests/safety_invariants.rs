@@ -91,7 +91,9 @@ fn archive_tags_then_deletes_branch_and_worktree() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        format!("  archived feature -> archive/feature ({short_tip})\n")
+        format!(
+            "start: ok\nprepare: ok\ncommit: ok\n  archived feature -> archive/feature ({short_tip})\n"
+        )
     );
     assert_eq!(git(&repo, &["rev-parse", "refs/tags/archive/feature"]), tip);
     assert!(!git_success(

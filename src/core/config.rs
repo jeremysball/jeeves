@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::core::paths::state_dir;
+use crate::core::paths::state_dir_path;
 
 /// Resolves a setting: flag, then canonical env, then legacy env aliases in
 /// order, then config key, then the built-in default.
@@ -63,7 +63,7 @@ pub fn parse_config(text: &str) -> HashMap<String, String> {
 pub fn read_config(state_dir_override: Option<&Path>) -> HashMap<String, String> {
     let dir = match state_dir_override {
         Some(d) => d.to_path_buf(),
-        None => state_dir(),
+        None => state_dir_path(),
     };
     let file = dir.join("config");
     match std::fs::read_to_string(&file) {

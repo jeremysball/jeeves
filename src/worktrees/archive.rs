@@ -11,12 +11,14 @@ use crate::core::time::{activity_age_secs_for, human_age};
 const DEFAULT_IN_FLIGHT_SECS: u64 = 7_200;
 const DEFAULT_ARCHIVE_PREFIX: &str = "archive";
 const WIP_MESSAGE: &str = "wip: archived with uncommitted changes";
+const USAGE: &str = "usage: jeeves archive <repo-path> <branch> [<branch>...]";
+const LIST_USAGE: &str = "usage: jeeves archive --list <repo-path>";
 
 /// Parse and execute the `archive` subcommand arguments.
 pub fn run(args: &[String]) -> u8 {
     if args.first().map(String::as_str) == Some("--list") {
         let Some(repo) = args.get(1) else {
-            eprintln!("usage: archive-branch.sh --list <repo-path>");
+            eprintln!("{LIST_USAGE}");
             return 1;
         };
         return list(Path::new(repo));
@@ -25,7 +27,7 @@ pub fn run(args: &[String]) -> u8 {
     let strict = args.first().map(String::as_str) == Some("--strict");
     let offset = usize::from(strict);
     if args.len() <= offset + 1 {
-        eprintln!("usage: archive-branch.sh <repo-path> <branch> [<branch>...]");
+        eprintln!("{USAGE}");
         return 1;
     }
 
@@ -60,6 +62,11 @@ pub fn list(repo: &Path) -> u8 {
 
 /// Archive each named local branch, returning one when any branch is refused.
 pub fn archive_branches(repo: &Path, branches: &[String], strict: bool) -> u8 {
+    if branches.is_empty() {
+        eprintln!("{USAGE}");
+        return 1;
+    }
+
     let Some(root) = repo_root(repo) else {
         eprintln!(
             "refusing: can't determine base branch for {}",
@@ -144,7 +151,9 @@ pub fn archive_branches(repo: &Path, branches: &[String], strict: bool) -> u8 {
                     rc = 1;
                     continue;
                 }
-                println!("  {branch}: committing {dirty} uncommitted file(s) before archiving");
+                print_line(&format!(
+                    "  {branch}: committing {dirty} uncommitted file(s) before archiving"
+                ));
                 if !commit_worktree(path) {
                     eprintln!(
                         "refusing {branch}: couldn't commit its uncommitted changes — not deleting anything"
@@ -253,7 +262,7 @@ pub fn archive_branches(repo: &Path, branches: &[String], strict: bool) -> u8 {
         }
 
         let short_tip = rev_parse_short(&root, &tip).unwrap_or_else(|| tip.clone());
-        println!("  archived {branch} -> {tag} ({short_tip})");
+        print_line(&format!("  archived {branch} -> {tag} ({short_tip})"));
     }
 
     prune(&root);
@@ -370,7 +379,7 @@ fn update_ref(repo: &Path, transaction: &str) -> bool {
         .arg(repo)
         .args(["update-ref", "--stdin"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::inherit())
         .stderr(Stdio::null());
     let Ok(mut child) = command.spawn() else {
         return false;
@@ -414,6 +423,11 @@ where
 fn print_bytes(bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
     print!("{text}");
+}
+
+fn print_line(line: &str) {
+    println!("{line}");
+    let _ = std::io::stdout().flush();
 }
 
 fn print_bytes_to_stderr(bytes: &[u8]) {
