@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# CLI entry point for the coverage_score function in lib.sh, for consumers
+# that cannot source a Bash script (e.g. Python callers). Scores how much of a
+# branch's work is already in base and prints the verdict on stdout:
+#   SCORED <0-100>   - the branch's net text lines that are already in base.
+#   UNSCORED <why>   - binary/mode-only row, O==0, or empty patch.
+#   UNKNOWN <why>    - criss-cross history, merge conflict, merge-tree error.
+#
+# Usage: coverage-score <repo> <base> <branch>
+#   <repo>    path to the git repository.
+#   <base>    the base ref (branch name or commit) to score against.
+#   <branch>  the branch (or ref) to score.
+#
+# The verdict line is the output, not the exit code: an UNSCORED or UNKNOWN
+# verdict is a successful run. Exit 2 on usage error.
+#
+# Examples:
+#   coverage-score "$PWD" main feature
+#   coverage-score /path/to/repo origin/main topic-branch
+
+set -euo pipefail
+
+# shellcheck source=lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+usage() {
+  cat <<'EOF'
+usage: coverage-score <repo> <base> <branch>
+
+Scores how much of <branch>'s work is already in <base>, printing one line:
+  SCORED <0-100>   - percent of the branch's text lines already in base.
+  UNSCORED <why>   - binary/mode-only row, O==0, or empty patch.
+  UNKNOWN <why>    - criss-cross history, merge conflict, merge-tree error.
+Exit 0 on every successful run (including UNSCORED/UNKNOWN verdicts);
+exit 2 on usage error.
+
+examples:
+  coverage-score "$PWD" main feature
+  coverage-score /path/to/repo origin/main topic-branch
+EOF
+}
+
+if [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    -*)
+      echo "error: unknown flag $arg"
+      exit 2
+      ;;
+  esac
+done
+[ "$#" -eq 3 ] || {
+  echo "error: usage: coverage-score <repo> <base> <branch>"
+  exit 2
+}
+
+# lib.sh's merge-base read runs in the current working directory, so resolve
+# <repo> to an absolute path and enter it before scoring. A relative path is
+# resolved against the caller's cwd, before any cd. The cd's own error must
+# not leak to stderr — this is a usage error reported on stdout.
+REPO=$(cd -- "$1" 2>/dev/null && pwd) || {
+  echo "error: not a directory: $1"
+  exit 2
+}
+cd "$REPO"
+
+coverage_score "$REPO" "$2" "$3"
