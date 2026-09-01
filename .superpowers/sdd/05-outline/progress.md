@@ -33,3 +33,4 @@ Task 4: RULING on finding 8 - default candidate list /workspace + $HOME-derived 
 Task 4: fix round 1 dispatched.
 Task 4: fix round 1/5 (7 addressed, 0 open; commits 384e1f1..4148455)
 Task 4: complete (commits 15b586c..4148455, review clean after round 1)
+Task 5: gate caught orient_golden::max-0 flake. ROOT CAUSE (measured): ref pipeline exits 0 or 141 nondeterministically (jq SIGPIPE race vs `tail -n 0`); Rust deterministically 141. Ruling: statuses are GNU-equivalent (tail says 0); test must normalize {0,141}->0 for BOTH sides with a comment naming the race. Plan-error (test brief said "match exact status" for a nondeterministic reference).
