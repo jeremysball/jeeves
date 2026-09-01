@@ -1,0 +1,2988 @@
+# Review package: a2a156b..559a369
+
+## Commits
+559a369 test(audit): all-bucket parity incl. prunable registrations and UNKNOWN passthrough
+a188687 docs(sdd): ledger task 3 round 1 + F2 ruling
+
+## Files changed
+ .superpowers/sdd/05-outline/progress.md            |    2 +
+ .../sdd/05-outline/review-79364af..a2a156b.diff    | 2899 ++++++++++++++++++++
+ tests/audit_golden.rs                              |   16 +-
+ 3 files changed, 2916 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/.superpowers/sdd/05-outline/progress.md b/.superpowers/sdd/05-outline/progress.md
+index 85d4893..0694645 100644
+--- a/.superpowers/sdd/05-outline/progress.md
++++ b/.superpowers/sdd/05-outline/progress.md
+@@ -14,10 +14,12 @@ Task 2: fix round 1/5 dispatched (oc_mti7h3iq, worktree jeeves-rust-fix2).
+ Task 2: fix round 1/5 (2 addressed, 0 open; commits 95bd97e..de89052)
+ Task 2: complete (commits 2af03f4..de89052, review clean after round 1)
+ Task 3a: 3-dispatch split (core/tests/hook) after two context-death attempts on the monolithic brief.
+ Task 3a-1: core landed (host-verified 62 tests, clippy clean). Note: audit.rs carries 14 em-dashes mirroring the reference report strings; inherited convention, flag at final review.
+ Task 3a: done in 3 units (core/collapse/golden) - byte parity on all 5 buckets.
+ Task 3 split further: 3a done (core+collapse+golden), 3b-i archive, 3b-ii clean, 3c tests+hook in flight.
+ Ruling: model route switched to openai/gpt-5.6-luna (max) after 6 silent provider deaths on ollama flash for >100-turn-scale writes; ollama still fine for short units/reviews.
+ Task 3: review pending after 3c.
+ Task 3: review round 1: 6 Important + 3 Minor findings (hook panic path, clean empty-args no-op, update-ref stdout swallowed, two knobs off-resolver, hook repo-mode divergence, missing reference-comparison tests). Controller spot-verified: hook rc 101 vs ref rc 0; findings CONFIRMED real.
+ Task 3: fix round 1 unit A (impl) dispatched oc_mtie2jds.
++Task 3: fix round 1/5 (5 addressed, 2 open: F2 wording, F6 bucket coverage).
++Task 3: RULING on F2 — usage prose (not a refusal string) may carry the new program name; the binding constraint is the exit-code family + refusal-message parity, both met. Parked. Ruling: costs nothing if wrong (usage text only), reversible in one line.
+diff --git a/.superpowers/sdd/05-outline/review-79364af..a2a156b.diff b/.superpowers/sdd/05-outline/review-79364af..a2a156b.diff
+new file mode 100644
+index 0000000..ee9b983
+--- /dev/null
++++ b/.superpowers/sdd/05-outline/review-79364af..a2a156b.diff
+@@ -0,0 +1,2899 @@
++# Review package: 79364af..a2a156b
++
++## Commits
++a2a156b test(worktrees): reference-parity coverage for hook, audit buckets, and archive
++0a44815 fix(worktrees): fail-closed hook, reference-compatible archive output and usage guards
++
++## Files changed
++ .superpowers/sdd/05-outline/progress.md            |    2 +
++ .../sdd/05-outline/review-7ee2ad3..79364af.diff    | 1355 ++++++++++++++++++++
++ .superpowers/sdd/05-outline/task-3-review.md       |  130 ++
++ src/core/config.rs                                 |    4 +-
++ src/core/paths.rs                                  |   16 +-
++ src/main.rs                                        |   16 +-
++ src/worktrees/archive.rs                           |   24 +-
++ src/worktrees/audit.rs                             |    5 +-
++ src/worktrees/clean.rs                             |    6 +
++ src/worktrees/hook.rs                              |  115 +-
++ tests/audit_golden.rs                              |  226 +++-
++ tests/coverage_golden.rs                           |    9 +-
++ tests/hook_contract.rs                             |   88 +-
++ tests/safety_invariants.rs                         |  182 ++-
++ 14 files changed, 2109 insertions(+), 69 deletions(-)
++
++## Diff
++diff --git a/.superpowers/sdd/05-outline/progress.md b/.superpowers/sdd/05-outline/progress.md
++index 3724d57..85d4893 100644
++--- a/.superpowers/sdd/05-outline/progress.md
+++++ b/.superpowers/sdd/05-outline/progress.md
++@@ -12,10 +12,12 @@ Task 2: review round 1: spec fail - linked-worktree objects path (controller-rep
++ Task 2: minor (deferred): main.rs bad-dir-vs-count error ordering differs from ref cd semantics (same exit-2 family).
++ Task 2: fix round 1/5 dispatched (oc_mti7h3iq, worktree jeeves-rust-fix2).
++ Task 2: fix round 1/5 (2 addressed, 0 open; commits 95bd97e..de89052)
++ Task 2: complete (commits 2af03f4..de89052, review clean after round 1)
++ Task 3a: 3-dispatch split (core/tests/hook) after two context-death attempts on the monolithic brief.
++ Task 3a-1: core landed (host-verified 62 tests, clippy clean). Note: audit.rs carries 14 em-dashes mirroring the reference report strings; inherited convention, flag at final review.
++ Task 3a: done in 3 units (core/collapse/golden) - byte parity on all 5 buckets.
++ Task 3 split further: 3a done (core+collapse+golden), 3b-i archive, 3b-ii clean, 3c tests+hook in flight.
++ Ruling: model route switched to openai/gpt-5.6-luna (max) after 6 silent provider deaths on ollama flash for >100-turn-scale writes; ollama still fine for short units/reviews.
++ Task 3: review pending after 3c.
+++Task 3: review round 1: 6 Important + 3 Minor findings (hook panic path, clean empty-args no-op, update-ref stdout swallowed, two knobs off-resolver, hook repo-mode divergence, missing reference-comparison tests). Controller spot-verified: hook rc 101 vs ref rc 0; findings CONFIRMED real.
+++Task 3: fix round 1 unit A (impl) dispatched oc_mtie2jds.
++diff --git a/.superpowers/sdd/05-outline/review-7ee2ad3..79364af.diff b/.superpowers/sdd/05-outline/review-7ee2ad3..79364af.diff
++new file mode 100644
++index 0000000..d611947
++--- /dev/null
+++++ b/.superpowers/sdd/05-outline/review-7ee2ad3..79364af.diff
++@@ -0,0 +1,1355 @@
+++# Review package: 7ee2ad3..79364af
+++
+++## Commits
+++79364af feat(worktrees): port session-hook contract with in-process audits and safety tests
+++185c8b6 docs(sdd): ledger 3b route ruling
+++4a95157 feat(worktrees): port clean with re-verify-before-delete
+++a2aab1d feat(worktrees): port archive with tag-before-destroy invariants
+++06f7e4c docs(sdd): ledger 3a
+++
+++## Files changed
+++ .superpowers/sdd/05-outline/progress.md |   4 +
+++ src/main.rs                             |  29 +++
+++ src/worktrees/archive.rs                | 422 ++++++++++++++++++++++++++++++++
+++ src/worktrees/clean.rs                  | 274 +++++++++++++++++++++
+++ src/worktrees/hook.rs                   | 165 +++++++++++++
+++ src/worktrees/mod.rs                    |   3 +
+++ tests/hook_contract.rs                  |  98 ++++++++
+++ tests/safety_invariants.rs              | 221 +++++++++++++++++
+++ 8 files changed, 1216 insertions(+)
+++
+++## Diff
+++diff --git a/.superpowers/sdd/05-outline/progress.md b/.superpowers/sdd/05-outline/progress.md
+++index f1355ec..3724d57 100644
+++--- a/.superpowers/sdd/05-outline/progress.md
++++++ b/.superpowers/sdd/05-outline/progress.md
+++@@ -8,10 +8,14 @@ Task 1: minor (deferred): reviewer could not read sdd artifacts initially (untra
+++ Task 1: fix round 1/5 (2 addressed, 0 open; commits dbe7a93..776efa8)
+++ Task 1: complete (commits fe4daad..776efa8, review clean after round 1)
+++ Note: mise gate fails in sandbox on trusted-config symlink (RO state dir) - manual host verification + --force is the standing workaround this migration.
+++ Task 2: review round 1: spec fail - linked-worktree objects path (controller-reproduced: rust UNKNOWN merge-conflict vs ref SCORED 0 on /tmp/covchk/wt). Root cause: execution-error.
+++ Task 2: minor (deferred): main.rs bad-dir-vs-count error ordering differs from ref cd semantics (same exit-2 family).
+++ Task 2: fix round 1/5 dispatched (oc_mti7h3iq, worktree jeeves-rust-fix2).
+++ Task 2: fix round 1/5 (2 addressed, 0 open; commits 95bd97e..de89052)
+++ Task 2: complete (commits 2af03f4..de89052, review clean after round 1)
+++ Task 3a: 3-dispatch split (core/tests/hook) after two context-death attempts on the monolithic brief.
+++ Task 3a-1: core landed (host-verified 62 tests, clippy clean). Note: audit.rs carries 14 em-dashes mirroring the reference report strings; inherited convention, flag at final review.
++++Task 3a: done in 3 units (core/collapse/golden) - byte parity on all 5 buckets.
++++Task 3 split further: 3a done (core+collapse+golden), 3b-i archive, 3b-ii clean, 3c tests+hook in flight.
++++Ruling: model route switched to openai/gpt-5.6-luna (max) after 6 silent provider deaths on ollama flash for >100-turn-scale writes; ollama still fine for short units/reviews.
++++Task 3: review pending after 3c.
+++diff --git a/src/main.rs b/src/main.rs
+++index 8137ffc..e24afa9 100644
+++--- a/src/main.rs
++++++ b/src/main.rs
+++@@ -19,40 +19,59 @@ mod worktrees;
+++ )]
+++ struct Cli {
+++     #[command(subcommand)]
+++     command: Option<Command>,
+++ }
+++ 
+++ #[derive(Subcommand)]
+++ enum Command {
+++     /// Print the jeeves version and exit
+++     Version,
++++    /// Clean branches that are safe to delete
++++    Clean {
++++        repo: PathBuf,
++++        #[arg(value_name = "BRANCH", num_args = 1..)]
++++        branches: Vec<String>,
++++    },
+++ }
+++ 
+++ fn main() -> ExitCode {
+++     // `jeeves coverage` parses its own args: the verdict contract publishes
+++     // exact error strings on stdout (mirroring ref/coverage-score:43-69),
+++     // which clap's error rendering would not reproduce.
+++     if std::env::args().nth(1).as_deref() == Some("coverage") {
+++         return run_coverage();
+++     }
+++     // `jeeves audit` likewise parses its own args: --no-content is accepted
+++     // in ANY position (mirroring ref/audit-worktrees.sh:22-27), which clap
+++     // would reject as a misplaced flag.
+++     if std::env::args().nth(1).as_deref() == Some("audit") {
+++         return run_audit();
+++     }
++++    // `jeeves archive` follows the reference command's positional parsing:
++++    // --list and --strict are recognized only in the first argument slot.
++++    if std::env::args().nth(1).as_deref() == Some("archive") {
++++        return run_archive();
++++    }
++++    // `jeeves session-hook` reads a JSON payload from stdin and must remain a
++++    // silent, always-successful command when the hook cannot report anything.
++++    if std::env::args().nth(1).as_deref() == Some("session-hook") {
++++        return run_session_hook();
++++    }
+++     match Cli::parse().command {
+++         None | Some(Command::Version) => {
+++             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
+++             ExitCode::SUCCESS
+++         }
++++        Some(Command::Clean { repo, branches }) => {
++++            ExitCode::from(worktrees::clean::clean_branches(&repo, &branches))
++++        }
+++     }
+++ }
+++ 
+++ fn run_audit() -> ExitCode {
+++     let args: Vec<String> = std::env::args().skip(2).collect();
+++ 
+++     // --no-content is accepted in any position; everything else is a root
+++     // dir (ref/audit-worktrees.sh:22-27). The first positional wins, extra
+++     // positionals are ignored, and the default root is the cwd.
+++     let mut no_content = false;
+++@@ -65,20 +84,30 @@ fn run_audit() -> ExitCode {
+++         }
+++     }
+++     let root =
+++         root.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+++ 
+++     let opts = worktrees::audit::resolve_opts(no_content);
+++     print!("{}", worktrees::audit::audit_sweep(&[root], &opts));
+++     ExitCode::SUCCESS
+++ }
+++ 
++++fn run_archive() -> ExitCode {
++++    let args: Vec<String> = std::env::args().skip(2).collect();
++++    ExitCode::from(worktrees::archive::run(&args))
++++}
++++
++++fn run_session_hook() -> ExitCode {
++++    worktrees::hook::run();
++++    ExitCode::SUCCESS
++++}
++++
+++ fn run_coverage() -> ExitCode {
+++     let args: Vec<String> = std::env::args().skip(2).collect();
+++ 
+++     // --help as the first argument prints the usage text and exits 0
+++     // (ref/coverage-score:43-46).
+++     if args.first().map(String::as_str) == Some("--help") {
+++         print!("{}", COVERAGE_USAGE);
+++         return ExitCode::SUCCESS;
+++     }
+++ 
+++diff --git a/src/worktrees/archive.rs b/src/worktrees/archive.rs
+++new file mode 100644
+++index 0000000..acc5bdc
+++--- /dev/null
++++++ b/src/worktrees/archive.rs
+++@@ -0,0 +1,422 @@
++++use std::ffi::{OsStr, OsString};
++++use std::io::Write;
++++use std::path::{Path, PathBuf};
++++use std::process::{Command, Output, Stdio};
++++
++++use crate::core::config;
++++use crate::core::git;
++++use crate::core::proc::{lock_status, LockStatus};
++++use crate::core::time::{activity_age_secs_for, human_age};
++++
++++const DEFAULT_IN_FLIGHT_SECS: u64 = 7_200;
++++const DEFAULT_ARCHIVE_PREFIX: &str = "archive";
++++const WIP_MESSAGE: &str = "wip: archived with uncommitted changes";
++++
++++/// Parse and execute the `archive` subcommand arguments.
++++pub fn run(args: &[String]) -> u8 {
++++    if args.first().map(String::as_str) == Some("--list") {
++++        let Some(repo) = args.get(1) else {
++++            eprintln!("usage: archive-branch.sh --list <repo-path>");
++++            return 1;
++++        };
++++        return list(Path::new(repo));
++++    }
++++
++++    let strict = args.first().map(String::as_str) == Some("--strict");
++++    let offset = usize::from(strict);
++++    if args.len() <= offset + 1 {
++++        eprintln!("usage: archive-branch.sh <repo-path> <branch> [<branch>...]");
++++        return 1;
++++    }
++++
++++    let repo = Path::new(&args[offset]);
++++    archive_branches(repo, &args[offset + 1..], strict)
++++}
++++
++++/// List tags below the configured archive prefix.
++++pub fn list(repo: &Path) -> u8 {
++++    let prefix = Settings::load().archive_prefix;
++++    let Some(root) = repo_root(repo) else {
++++        return 1;
++++    };
++++    let tag_prefix = format!("refs/tags/{prefix}");
++++    let Some(output) = git_output(
++++        &root,
++++        [
++++            "for-each-ref",
++++            "--sort=-creatordate",
++++            "--format=%(refname:short)  %(objectname:short)  %(creatordate:short)",
++++            &tag_prefix,
++++        ],
++++    ) else {
++++        return 1;
++++    };
++++    if !output.status.success() {
++++        return 1;
++++    }
++++    print_bytes(&output.stdout);
++++    0
++++}
++++
++++/// Archive each named local branch, returning one when any branch is refused.
++++pub fn archive_branches(repo: &Path, branches: &[String], strict: bool) -> u8 {
++++    let Some(root) = repo_root(repo) else {
++++        eprintln!(
++++            "refusing: can't determine base branch for {}",
++++            repo.display()
++++        );
++++        return 1;
++++    };
++++
++++    let Some(base) = detect_base(&root) else {
++++        eprintln!(
++++            "refusing: can't determine base branch for {}",
++++            root.display()
++++        );
++++        prune(&root);
++++        return 1;
++++    };
++++
++++    let primary = primary_worktree(&root).unwrap_or_default();
++++    let settings = Settings::load();
++++    let mut rc = 0;
++++
++++    for branch in branches {
++++        if branch == &base {
++++            eprintln!("refusing {branch}: this is the base branch");
++++            rc = 1;
++++            continue;
++++        }
++++
++++        let branch_ref = format!("refs/heads/{branch}");
++++        if !git_success(&root, ["show-ref", "--verify", "--quiet", &branch_ref]) {
++++            eprintln!("skip {branch}: no such local branch");
++++            continue;
++++        }
++++
++++        let path = worktree_path_for_branch(&root, branch);
++++        if path.as_deref() == Some(primary.as_str()) && !primary.is_empty() {
++++            eprintln!("refusing {branch}: checked out in the primary worktree ({primary}).");
++++            eprintln!(
++++                "    Archiving it would have to switch that checkout to {base}. Do it by hand if that's what you want."
++++            );
++++            rc = 1;
++++            continue;
++++        }
++++
++++        let path_ref = path.as_deref().map(Path::new);
++++        let age = activity_age_secs_for(&root, branch, path_ref).unwrap_or(0);
++++        if age < settings.in_flight_secs {
++++            eprintln!(
++++                "refusing {branch}: active {} ago, under the {} in-flight threshold",
++++                human_age(age),
++++                human_age(settings.in_flight_secs)
++++            );
++++            rc = 1;
++++            continue;
++++        }
++++
++++        let mut gitdir = None;
++++        if let Some(path) = path_ref {
++++            if let Ok(found) = git::rev_parse_abs_git_dir(path) {
++++                let found = PathBuf::from(found);
++++                let lock = found.join("locked");
++++                if lock.is_file() {
++++                    let status = lock_status(&lock);
++++                    if status != LockStatus::Stale {
++++                        eprintln!(
++++                            "refusing {branch}: worktree lock is {status}, not provably dead"
++++                        );
++++                        rc = 1;
++++                        continue;
++++                    }
++++                }
++++                gitdir = Some(found);
++++            }
++++
++++            let dirty = worktree_dirty_count(path);
++++            if dirty > 0 {
++++                if strict {
++++                    eprintln!(
++++                        "refusing {branch}: strict mode does not archive a dirty worktree ({dirty} uncommitted file(s) in {})",
++++                        path.display()
++++                    );
++++                    rc = 1;
++++                    continue;
++++                }
++++                println!("  {branch}: committing {dirty} uncommitted file(s) before archiving");
++++                if !commit_worktree(path) {
++++                    eprintln!(
++++                        "refusing {branch}: couldn't commit its uncommitted changes — not deleting anything"
++++                    );
++++                    rc = 1;
++++                    continue;
++++                }
++++            }
++++        }
++++
++++        let tag = format!("{}/{}", settings.archive_prefix, branch);
++++        let tag_ref = format!("refs/tags/{tag}");
++++        if git_success(&root, ["show-ref", "--verify", "--quiet", &tag_ref]) {
++++            eprintln!("refusing {branch}: tag {tag} already exists");
++++            rc = 1;
++++            continue;
++++        }
++++
++++        let Some(tip) = git::rev_parse(&root, &branch_ref).ok() else {
++++            rc = 1;
++++            continue;
++++        };
++++
++++        if strict {
++++            let transaction = format!(
++++                "start\nverify {branch_ref} {tip}\ncreate {tag_ref} {tip}\nprepare\ncommit\n"
++++            );
++++            if !update_ref(&root, &transaction) {
++++                eprintln!(
++++                    "refusing {branch}: branch moved during archive (atomic tag aborted) — not deleting"
++++                );
++++                rc = 1;
++++                continue;
++++            }
++++        } else {
++++            let source_ref = format!("refs/heads/{branch}");
++++            if !git_success(&root, ["tag", &tag, &source_ref]) {
++++                rc = 1;
++++                continue;
++++            }
++++            let tag_tip = format!("{tag_ref}^{{commit}}");
++++            if git::rev_parse(&root, &tag_tip).ok().as_deref() != Some(tip.as_str()) {
++++                eprintln!("refusing {branch}: tag {tag} doesn't resolve to {tip} — not deleting");
++++                rc = 1;
++++                continue;
++++            }
++++        }
++++
++++        let current_tip = git::rev_parse(&root, &branch_ref).ok();
++++        if current_tip.as_deref() != Some(tip.as_str()) {
++++            let now = rev_parse_short(&root, &branch_ref).unwrap_or_default();
++++            eprintln!(
++++                "refusing {branch}: branch advanced after tagging (now {now}, expected {tip}) — worktree/branch left in place"
++++            );
++++            rc = 1;
++++            continue;
++++        }
++++
++++        if let Some(path) = path_ref {
++++            if gitdir
++++                .as_deref()
++++                .is_some_and(|gitdir| gitdir.join("locked").is_file())
++++            {
++++                let Some(output) = git_output(
++++                    &root,
++++                    vec![
++++                        OsString::from("worktree"),
++++                        OsString::from("unlock"),
++++                        path.as_os_str().to_os_string(),
++++                    ],
++++                ) else {
++++                    rc = 1;
++++                    continue;
++++                };
++++                if !output.status.success() {
++++                    print_bytes_to_stderr(&output.stderr);
++++                    rc = 1;
++++                    continue;
++++                }
++++            }
++++            let Some(output) = git_output(
++++                &root,
++++                vec![
++++                    OsString::from("worktree"),
++++                    OsString::from("remove"),
++++                    path.as_os_str().to_os_string(),
++++                ],
++++            ) else {
++++                rc = 1;
++++                continue;
++++            };
++++            if !output.status.success() {
++++                print_bytes_to_stderr(&output.stderr);
++++                rc = 1;
++++                continue;
++++            }
++++        }
++++
++++        let transaction = format!("start\ndelete {branch_ref} {tip}\nprepare\ncommit\n");
++++        if !update_ref(&root, &transaction) {
++++            eprintln!(
++++                "refusing {branch}: branch advanced during archive (conditional delete aborted) — tag {tag} kept, branch left in place"
++++            );
++++            rc = 1;
++++            continue;
++++        }
++++
++++        let short_tip = rev_parse_short(&root, &tip).unwrap_or_else(|| tip.clone());
++++        println!("  archived {branch} -> {tag} ({short_tip})");
++++    }
++++
++++    prune(&root);
++++    rc
++++}
++++
++++struct Settings {
++++    in_flight_secs: u64,
++++    archive_prefix: String,
++++}
++++
++++impl Settings {
++++    fn load() -> Self {
++++        let config = config::read_config(None);
++++        let in_flight_secs = config::resolve(
++++            &None,
++++            &["JEEVES_AUDIT_INFLIGHT_SECS", "WORKTREE_AUDIT_INFLIGHT_SECS"],
++++            &config,
++++            "7200",
++++        )
++++        .parse()
++++        .unwrap_or(DEFAULT_IN_FLIGHT_SECS);
++++        let archive_prefix = config::resolve(
++++            &None,
++++            &[
++++                "JEEVES_AUDIT_ARCHIVE_PREFIX",
++++                "WORKTREE_AUDIT_ARCHIVE_PREFIX",
++++            ],
++++            &config,
++++            DEFAULT_ARCHIVE_PREFIX,
++++        );
++++        Self {
++++            in_flight_secs,
++++            archive_prefix,
++++        }
++++    }
++++}
++++
++++fn repo_root(repo: &Path) -> Option<PathBuf> {
++++    git::rev_parse(repo, "--show-toplevel")
++++        .ok()
++++        .map(PathBuf::from)
++++}
++++
++++fn detect_base(repo: &Path) -> Option<String> {
++++    for branch in ["main", "master"] {
++++        let branch_ref = format!("refs/heads/{branch}");
++++        if git_success(repo, ["show-ref", "--verify", "--quiet", &branch_ref]) {
++++            return Some(branch.to_owned());
++++        }
++++    }
++++
++++    let output = git_output(
++++        repo,
++++        ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
++++    )?;
++++    if !output.status.success() {
++++        return None;
++++    }
++++    let symbolic = String::from_utf8_lossy(&output.stdout);
++++    symbolic
++++        .trim()
++++        .strip_prefix("refs/remotes/origin/")
++++        .map(str::to_owned)
++++}
++++
++++fn primary_worktree(repo: &Path) -> Option<String> {
++++    let porcelain = git::porcelain_worktree_list(repo).ok()?;
++++    porcelain
++++        .lines()
++++        .find_map(|line| line.strip_prefix("worktree ").map(str::to_owned))
++++}
++++
++++fn worktree_path_for_branch(repo: &Path, branch: &str) -> Option<String> {
++++    let porcelain = git::porcelain_worktree_list(repo).ok()?;
++++    let branch_line = format!("branch refs/heads/{branch}");
++++    let mut current_path = None;
++++    for line in porcelain.lines() {
++++        if let Some(path) = line.strip_prefix("worktree ") {
++++            current_path = Some(path.to_owned());
++++        } else if line == branch_line {
++++            return current_path;
++++        }
++++    }
++++    None
++++}
++++
++++fn worktree_dirty_count(path: &Path) -> u64 {
++++    let Some(output) = git_output(path, ["status", "--porcelain"]) else {
++++        return 0;
++++    };
++++    if !output.status.success() {
++++        return 0;
++++    }
++++    output.stdout.iter().filter(|byte| **byte == b'\n').count() as u64
++++}
++++
++++fn commit_worktree(path: &Path) -> bool {
++++    git_success(path, ["add", "-A"]) && git_success(path, ["commit", "-q", "-m", WIP_MESSAGE])
++++}
++++
++++fn rev_parse_short(repo: &Path, revision: &str) -> Option<String> {
++++    let output = git_output(repo, ["rev-parse", "--short", revision])?;
++++    if !output.status.success() {
++++        return None;
++++    }
++++    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
++++}
++++
++++fn update_ref(repo: &Path, transaction: &str) -> bool {
++++    let mut command = Command::new("git");
++++    command
++++        .arg("-C")
++++        .arg(repo)
++++        .args(["update-ref", "--stdin"])
++++        .stdin(Stdio::piped())
++++        .stdout(Stdio::null())
++++        .stderr(Stdio::null());
++++    let Ok(mut child) = command.spawn() else {
++++        return false;
++++    };
++++    let write_ok = child
++++        .stdin
++++        .take()
++++        .map(|mut stdin| stdin.write_all(transaction.as_bytes()).is_ok())
++++        .unwrap_or(false);
++++    let status_ok = child.wait().map(|status| status.success()).unwrap_or(false);
++++    write_ok && status_ok
++++}
++++
++++fn prune(repo: &Path) {
++++    let _ = git_success(repo, ["worktree", "prune"]);
++++}
++++
++++fn git_success<I, S>(repo: &Path, args: I) -> bool
++++where
++++    I: IntoIterator<Item = S>,
++++    S: AsRef<OsStr>,
++++{
++++    git_output(repo, args)
++++        .map(|output| output.status.success())
++++        .unwrap_or(false)
++++}
++++
++++fn git_output<I, S>(repo: &Path, args: I) -> Option<Output>
++++where
++++    I: IntoIterator<Item = S>,
++++    S: AsRef<OsStr>,
++++{
++++    Command::new("git")
++++        .arg("-C")
++++        .arg(repo)
++++        .args(args)
++++        .output()
++++        .ok()
++++}
++++
++++fn print_bytes(bytes: &[u8]) {
++++    let text = String::from_utf8_lossy(bytes);
++++    print!("{text}");
++++}
++++
++++fn print_bytes_to_stderr(bytes: &[u8]) {
++++    let text = String::from_utf8_lossy(bytes);
++++    eprint!("{text}");
++++}
+++diff --git a/src/worktrees/clean.rs b/src/worktrees/clean.rs
+++new file mode 100644
+++index 0000000..8410602
+++--- /dev/null
++++++ b/src/worktrees/clean.rs
+++@@ -0,0 +1,274 @@
++++use std::ffi::{OsStr, OsString};
++++use std::path::{Path, PathBuf};
++++use std::process::{Command, Output};
++++
++++use crate::core::config;
++++use crate::core::git;
++++use crate::core::proc::{lock_status, LockStatus};
++++use crate::core::time::{activity_age_secs_for, human_age};
++++
++++const DEFAULT_IN_FLIGHT_SECS: u64 = 7_200;
++++
++++/// Clean each named local branch, returning one when any branch is refused.
++++pub fn clean_branches(repo: &Path, branches: &[String]) -> u8 {
++++    let Some(root) = repo_root(repo) else {
++++        eprintln!(
++++            "refusing: can't determine base branch for {}",
++++            repo.display()
++++        );
++++        return 1;
++++    };
++++
++++    let Some(base) = detect_base(&root) else {
++++        eprintln!(
++++            "refusing: can't determine base branch for {}",
++++            root.display()
++++        );
++++        prune(&root);
++++        return 1;
++++    };
++++
++++    let primary = primary_worktree(&root).unwrap_or_default();
++++    let settings = Settings::load();
++++    let mut rc = 0;
++++
++++    for branch in branches {
++++        if branch == &base {
++++            eprintln!("refusing {branch}: this is the base branch");
++++            rc = 1;
++++            continue;
++++        }
++++
++++        let branch_ref = format!("refs/heads/{branch}");
++++        if !git_success(&root, ["show-ref", "--verify", "--quiet", &branch_ref]) {
++++            eprintln!("skip {branch}: no such local branch");
++++            continue;
++++        }
++++
++++        let merge_rc = git_output(
++++            &root,
++++            [
++++                "merge-base",
++++                "--is-ancestor",
++++                branch.as_str(),
++++                base.as_str(),
++++            ],
++++        )
++++        .and_then(|output| output.status.code())
++++        .unwrap_or(1);
++++        if merge_rc != 0 {
++++            eprintln!(
++++                "refusing {branch}: not confirmed merged into {base} (re-check gave exit {merge_rc}) — do not delete"
++++            );
++++            rc = 1;
++++            continue;
++++        }
++++
++++        let path = worktree_path_for_branch(&root, branch);
++++        if path.as_deref() == Some(primary.as_str()) && !primary.is_empty() {
++++            eprintln!("refusing {branch}: checked out in the primary worktree ({primary})");
++++            rc = 1;
++++            continue;
++++        }
++++
++++        let path_ref = path.as_deref().map(Path::new);
++++        let age = activity_age_secs_for(&root, branch, path_ref).unwrap_or(0);
++++        if age < settings.in_flight_secs {
++++            eprintln!(
++++                "refusing {branch}: active {} ago, under the {} in-flight threshold",
++++                human_age(age),
++++                human_age(settings.in_flight_secs)
++++            );
++++            rc = 1;
++++            continue;
++++        }
++++
++++        if let Some(path) = path_ref {
++++            let dirty = worktree_dirty_count(path);
++++            if dirty > 0 {
++++                eprintln!(
++++                    "refusing {branch}: {dirty} uncommitted file(s) in {} — merged, but these are in no commit and would be lost",
++++                    path.display()
++++                );
++++                rc = 1;
++++                continue;
++++            }
++++        }
++++
++++        if let Some(path) = path_ref {
++++            let gitdir = git::rev_parse_abs_git_dir(path).ok().map(PathBuf::from);
++++            if let Some(gitdir) = gitdir {
++++                let lock = gitdir.join("locked");
++++                if lock.is_file() {
++++                    let status = lock_status(&lock);
++++                    if status != LockStatus::Stale {
++++                        eprintln!(
++++                            "refusing {branch}: worktree lock is {status}, not provably dead — do not delete"
++++                        );
++++                        rc = 1;
++++                        continue;
++++                    }
++++
++++                    let Some(output) = git_output(
++++                        &root,
++++                        vec![
++++                            OsString::from("worktree"),
++++                            OsString::from("unlock"),
++++                            path.as_os_str().to_os_string(),
++++                        ],
++++                    ) else {
++++                        rc = 1;
++++                        continue;
++++                    };
++++                    if !output.status.success() {
++++                        print_bytes_to_stderr(&output.stderr);
++++                        rc = 1;
++++                        continue;
++++                    }
++++                }
++++            }
++++
++++            let Some(output) = git_output(
++++                &root,
++++                vec![
++++                    OsString::from("worktree"),
++++                    OsString::from("remove"),
++++                    path.as_os_str().to_os_string(),
++++                ],
++++            ) else {
++++                rc = 1;
++++                continue;
++++            };
++++            if !output.status.success() {
++++                print_bytes_to_stderr(&output.stderr);
++++                rc = 1;
++++                continue;
++++            }
++++        }
++++
++++        let Some(output) = git_output(&root, ["branch", "-d", branch.as_str()]) else {
++++            rc = 1;
++++            continue;
++++        };
++++        if !output.status.success() {
++++            print_bytes_to_stderr(&output.stderr);
++++            eprintln!(
++++                "refusing {branch}: git branch -d declined (see message above) — worktree removed, branch ref left for manual review"
++++            );
++++            rc = 1;
++++        }
++++    }
++++
++++    prune(&root);
++++    rc
++++}
++++
++++struct Settings {
++++    in_flight_secs: u64,
++++}
++++
++++impl Settings {
++++    fn load() -> Self {
++++        let config = config::read_config(None);
++++        let in_flight_secs = config::resolve(
++++            &None,
++++            &["JEEVES_AUDIT_INFLIGHT_SECS", "WORKTREE_AUDIT_INFLIGHT_SECS"],
++++            &config,
++++            "7200",
++++        )
++++        .parse()
++++        .unwrap_or(DEFAULT_IN_FLIGHT_SECS);
++++        Self { in_flight_secs }
++++    }
++++}
++++
++++fn repo_root(repo: &Path) -> Option<PathBuf> {
++++    git::rev_parse(repo, "--show-toplevel")
++++        .ok()
++++        .map(PathBuf::from)
++++}
++++
++++fn detect_base(repo: &Path) -> Option<String> {
++++    for branch in ["main", "master"] {
++++        let branch_ref = format!("refs/heads/{branch}");
++++        if git_success(repo, ["show-ref", "--verify", "--quiet", &branch_ref]) {
++++            return Some(branch.to_owned());
++++        }
++++    }
++++
++++    let output = git_output(
++++        repo,
++++        ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
++++    )?;
++++    if !output.status.success() {
++++        return None;
++++    }
++++    let symbolic = String::from_utf8_lossy(&output.stdout);
++++    symbolic
++++        .trim()
++++        .strip_prefix("refs/remotes/origin/")
++++        .map(str::to_owned)
++++}
++++
++++fn primary_worktree(repo: &Path) -> Option<String> {
++++    let porcelain = git::porcelain_worktree_list(repo).ok()?;
++++    porcelain
++++        .lines()
++++        .find_map(|line| line.strip_prefix("worktree ").map(str::to_owned))
++++}
++++
++++fn worktree_path_for_branch(repo: &Path, branch: &str) -> Option<String> {
++++    let porcelain = git::porcelain_worktree_list(repo).ok()?;
++++    let branch_line = format!("branch refs/heads/{branch}");
++++    let mut current_path = None;
++++    for line in porcelain.lines() {
++++        if let Some(path) = line.strip_prefix("worktree ") {
++++            current_path = Some(path.to_owned());
++++        } else if line == branch_line {
++++            return current_path;
++++        }
++++    }
++++    None
++++}
++++
++++fn worktree_dirty_count(path: &Path) -> u64 {
++++    let Some(output) = git_output(path, ["status", "--porcelain"]) else {
++++        return 0;
++++    };
++++    if !output.status.success() {
++++        return 0;
++++    }
++++    output.stdout.iter().filter(|byte| **byte == b'\n').count() as u64
++++}
++++
++++fn prune(repo: &Path) {
++++    let _ = git_success(repo, ["worktree", "prune"]);
++++}
++++
++++fn git_success<I, S>(repo: &Path, args: I) -> bool
++++where
++++    I: IntoIterator<Item = S>,
++++    S: AsRef<OsStr>,
++++{
++++    git_output(repo, args)
++++        .map(|output| output.status.success())
++++        .unwrap_or(false)
++++}
++++
++++fn git_output<I, S>(repo: &Path, args: I) -> Option<Output>
++++where
++++    I: IntoIterator<Item = S>,
++++    S: AsRef<OsStr>,
++++{
++++    Command::new("git")
++++        .arg("-C")
++++        .arg(repo)
++++        .args(args)
++++        .output()
++++        .ok()
++++}
++++
++++fn print_bytes_to_stderr(bytes: &[u8]) {
++++    let text = String::from_utf8_lossy(bytes);
++++    eprint!("{text}");
++++}
+++diff --git a/src/worktrees/hook.rs b/src/worktrees/hook.rs
+++new file mode 100644
+++index 0000000..5a3664f
+++--- /dev/null
++++++ b/src/worktrees/hook.rs
+++@@ -0,0 +1,165 @@
++++use std::io::Read;
++++use std::path::{Path, PathBuf};
++++use std::sync::mpsc::{self, RecvTimeoutError};
++++use std::thread;
++++use std::time::Duration;
++++
++++use serde::Serialize;
++++
++++use crate::core::git;
++++use crate::worktrees::audit::{self, AuditOpts};
++++
++++const DEFAULT_TIMEOUT_SECS: u64 = 15;
++++
++++enum AuditMode {
++++    Repo(PathBuf),
++++    Sweep(PathBuf),
++++}
++++
++++#[derive(Serialize)]
++++struct HookPayload<'a> {
++++    #[serde(rename = "hookSpecificOutput")]
++++    hook_specific_output: HookSpecificOutput<'a>,
++++}
++++
++++#[derive(Serialize)]
++++struct HookSpecificOutput<'a> {
++++    #[serde(rename = "hookEventName")]
++++    hook_event_name: &'static str,
++++    #[serde(rename = "additionalContext")]
++++    additional_context: &'a str,
++++}
++++
++++/// Run the SessionStart hook. Every path through this function is successful;
++++/// a hook failure must never prevent a session from starting.
++++pub fn run() {
++++    let mut payload = String::new();
++++    if std::io::stdin().read_to_string(&mut payload).is_err() {
++++        return;
++++    }
++++
++++    let cwd = hook_cwd(&payload);
++++    let (mode, root, repo_mode) = match git::rev_parse(&cwd, "--show-toplevel") {
++++        Ok(root) if !root.is_empty() => (AuditMode::Repo(PathBuf::from(&root)), root, true),
++++        _ => {
++++            let root = cwd.to_string_lossy().into_owned();
++++            (AuditMode::Sweep(cwd), root, false)
++++        }
++++    };
++++
++++    let timeout_secs = resolve_timeout_secs();
++++    let opts = audit::resolve_opts(true);
++++    let report = match audit_with_timeout(mode, opts, timeout_secs) {
++++        Ok(report) => report,
++++        Err(()) => {
++++            emit(&format!(
++++                "Worktree audit exceeded its {timeout_secs}s budget in {} and was skipped. Run the auditing-worktrees skill manually for the full report.",
++++                basename(Path::new(&root))
++++            ));
++++            return;
++++        }
++++    };
++++
++++    let report = report.trim_end_matches('\n');
++++    if report.is_empty() {
++++        return;
++++    }
++++
++++    let body = match mode_for_root(repo_mode, &root, report) {
++++        Some(body) => body,
++++        None => return,
++++    };
++++    emit(&body);
++++}
++++
++++fn hook_cwd(payload: &str) -> PathBuf {
++++    let requested = serde_json::from_str::<serde_json::Value>(payload)
++++        .ok()
++++        .and_then(|value| {
++++            value
++++                .get("cwd")
++++                .and_then(serde_json::Value::as_str)
++++                .map(str::to_owned)
++++        })
++++        .map(PathBuf::from);
++++
++++    let process_cwd = std::env::current_dir().ok();
++++    match requested.filter(|path| path.is_dir()) {
++++        Some(path) if path.is_absolute() => path,
++++        Some(path) => process_cwd
++++            .as_ref()
++++            .map_or(path.clone(), |cwd| cwd.join(path)),
++++        None => process_cwd.unwrap_or_else(|| PathBuf::from(".")),
++++    }
++++}
++++
++++fn resolve_timeout_secs() -> u64 {
++++    let raw = ["JEEVES_HOOK_TIMEOUT", "WORKTREE_AUDIT_HOOK_TIMEOUT"]
++++        .iter()
++++        .find_map(|name| match std::env::var(name) {
++++            Ok(value) if !value.is_empty() => Some(value),
++++            _ => None,
++++        });
++++    raw.and_then(|value| value.parse().ok())
++++        .unwrap_or(DEFAULT_TIMEOUT_SECS)
++++}
++++
++++fn audit_with_timeout(mode: AuditMode, opts: AuditOpts, timeout_secs: u64) -> Result<String, ()> {
++++    if timeout_secs == 0 {
++++        return Err(());
++++    }
++++
++++    let (sender, receiver) = mpsc::channel();
++++    thread::spawn(move || {
++++        let report = match mode {
++++            AuditMode::Repo(root) => audit::audit_repo(&root, &opts),
++++            AuditMode::Sweep(root) => audit::audit_sweep(&[root], &opts),
++++        };
++++        let _ = sender.send(report);
++++    });
++++
++++    match receiver.recv_timeout(Duration::from_secs(timeout_secs)) {
++++        Ok(report) => Ok(report),
++++        Err(RecvTimeoutError::Timeout) => Err(()),
++++        Err(RecvTimeoutError::Disconnected) => Ok(String::new()),
++++    }
++++}
++++
++++fn mode_for_root(repo_mode: bool, root: &str, report: &str) -> Option<String> {
++++    if repo_mode {
++++        let body = format!(
++++            "Worktree drift in {} (from the auditing-worktrees SessionStart hook, report only):\n\n{report}\nNothing here has been changed. To act on it, use the auditing-worktrees skill.",
++++            basename(Path::new(root))
++++        );
++++        return Some(body);
++++    }
++++
++++    let summary = audit::summary_collapse(report);
++++    if summary.is_empty() {
++++        return None;
++++    }
++++    Some(format!(
++++        "Worktree drift across {root} (from the auditing-worktrees SessionStart hook, report only):\n\n{}\nNothing here has been changed. Use the auditing-worktrees skill for detail or to act on it.",
++++        summary.trim_end_matches('\n')
++++    ))
++++}
++++
++++fn basename(path: &Path) -> String {
++++    path.file_name()
++++        .and_then(|name| name.to_str())
++++        .filter(|name| !name.is_empty())
++++        .map(str::to_owned)
++++        .unwrap_or_else(|| path.to_string_lossy().into_owned())
++++}
++++
++++fn emit(body: &str) {
++++    let payload = HookPayload {
++++        hook_specific_output: HookSpecificOutput {
++++            hook_event_name: "SessionStart",
++++            additional_context: body,
++++        },
++++    };
++++    if let Ok(json) = serde_json::to_string(&payload) {
++++        println!("{json}");
++++    }
++++}
+++diff --git a/src/worktrees/mod.rs b/src/worktrees/mod.rs
+++index 7102313..ca5c528 100644
+++--- a/src/worktrees/mod.rs
++++++ b/src/worktrees/mod.rs
+++@@ -1,2 +1,5 @@
++++pub mod archive;
+++ pub mod audit;
++++pub mod clean;
+++ pub mod coverage;
++++pub mod hook;
+++diff --git a/tests/hook_contract.rs b/tests/hook_contract.rs
+++new file mode 100644
+++index 0000000..12862f7
+++--- /dev/null
++++++ b/tests/hook_contract.rs
+++@@ -0,0 +1,98 @@
++++use std::io::Write;
++++use std::path::{Path, PathBuf};
++++use std::process::{Command, Output, Stdio};
++++use std::sync::atomic::{AtomicU64, Ordering};
++++
++++static COUNTER: AtomicU64 = AtomicU64::new(0);
++++
++++fn scratch_dir() -> PathBuf {
++++    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
++++    let dir = std::env::temp_dir().join(format!("jeeves-hook-{}-{n}", std::process::id()));
++++    let _ = std::fs::remove_dir_all(&dir);
++++    std::fs::create_dir_all(&dir).unwrap();
++++    dir
++++}
++++
++++fn git(repo: &Path, args: &[&str]) -> String {
++++    let output = Command::new("git")
++++        .current_dir(repo)
++++        .args(args)
++++        .output()
++++        .unwrap();
++++    assert!(
++++        output.status.success(),
++++        "git {:?} failed: {}",
++++        args,
++++        String::from_utf8_lossy(&output.stderr)
++++    );
++++    String::from_utf8_lossy(&output.stdout).trim().to_string()
++++}
++++
++++fn init_repo(dir: &Path) -> PathBuf {
++++    let repo = dir.join("repo");
++++    std::fs::create_dir_all(&repo).unwrap();
++++    git(&repo, &["init", "-q", "-b", "main"]);
++++    git(&repo, &["config", "user.email", "test@example.com"]);
++++    git(&repo, &["config", "user.name", "Jeeves Test"]);
++++    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
++++    git(&repo, &["add", "."]);
++++    git(&repo, &["commit", "-q", "-m", "base"]);
++++    repo
++++}
++++
++++fn run_hook(process_dir: &Path, payload: &str, state_dir: &Path) -> Output {
++++    let mut child = Command::new(env!("CARGO_BIN_EXE_jeeves"))
++++        .arg("session-hook")
++++        .current_dir(process_dir)
++++        .env("JEEVES_STATE_DIR", state_dir)
++++        .env("JEEVES_AUDIT_INFLIGHT_SECS", "0")
++++        .env("WORKTREE_AUDIT_INFLIGHT_SECS", "0")
++++        .stdin(Stdio::piped())
++++        .stdout(Stdio::piped())
++++        .spawn()
++++        .unwrap();
++++    child
++++        .stdin
++++        .take()
++++        .unwrap()
++++        .write_all(payload.as_bytes())
++++        .unwrap();
++++    child.wait_with_output().unwrap()
++++}
++++
++++#[test]
++++fn repo_hook_emits_ordered_json_context_for_drift() {
++++    let dir = scratch_dir();
++++    let repo = init_repo(&dir);
++++    git(&repo, &["checkout", "-q", "-b", "feature"]);
++++    std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
++++    git(&repo, &["add", "."]);
++++    git(&repo, &["commit", "-q", "-m", "feature"]);
++++    git(&repo, &["checkout", "-q", "main"]);
++++    let payload = serde_json::json!({"cwd": repo}).to_string();
++++
++++    let output = run_hook(&dir, &payload, &dir.join("state"));
++++    let stdout = String::from_utf8_lossy(&output.stdout);
++++    let prefix = r#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""#;
++++    assert_eq!(output.status.code(), Some(0));
++++    assert!(
++++        stdout.starts_with(prefix),
++++        "unexpected hook output: {stdout}"
++++    );
++++    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++++    let context = json["hookSpecificOutput"]["additionalContext"]
++++        .as_str()
++++        .unwrap();
++++    assert!(context.contains("Worktree drift"));
++++    let _ = std::fs::remove_dir_all(&dir);
++++}
++++
++++#[test]
++++fn empty_stdin_in_non_repo_is_silent_success() {
++++    let dir = scratch_dir();
++++    let output = run_hook(&dir, "", &dir.join("state"));
++++
++++    assert_eq!(output.status.code(), Some(0));
++++    assert!(output.stdout.is_empty());
++++    let _ = std::fs::remove_dir_all(&dir);
++++}
+++diff --git a/tests/safety_invariants.rs b/tests/safety_invariants.rs
+++new file mode 100644
+++index 0000000..52c02c8
+++--- /dev/null
++++++ b/tests/safety_invariants.rs
+++@@ -0,0 +1,221 @@
++++use std::path::{Path, PathBuf};
++++use std::process::{Command, Output};
++++use std::sync::atomic::{AtomicU64, Ordering};
++++
++++static COUNTER: AtomicU64 = AtomicU64::new(0);
++++
++++fn scratch_dir() -> PathBuf {
++++    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
++++    let dir = std::env::temp_dir().join(format!("jeeves-safety-{}-{n}", std::process::id()));
++++    let _ = std::fs::remove_dir_all(&dir);
++++    std::fs::create_dir_all(&dir).unwrap();
++++    dir
++++}
++++
++++fn git(repo: &Path, args: &[&str]) -> String {
++++    let output = Command::new("git")
++++        .current_dir(repo)
++++        .args(args)
++++        .output()
++++        .unwrap();
++++    assert!(
++++        output.status.success(),
++++        "git {:?} failed: {}",
++++        args,
++++        String::from_utf8_lossy(&output.stderr)
++++    );
++++    String::from_utf8_lossy(&output.stdout).trim().to_string()
++++}
++++
++++fn git_success(repo: &Path, args: &[&str]) -> bool {
++++    Command::new("git")
++++        .current_dir(repo)
++++        .args(args)
++++        .output()
++++        .unwrap()
++++        .status
++++        .success()
++++}
++++
++++fn init_repo(dir: &Path) -> PathBuf {
++++    let repo = dir.join("repo");
++++    std::fs::create_dir_all(&repo).unwrap();
++++    git(&repo, &["init", "-q", "-b", "main"]);
++++    git(&repo, &["config", "user.email", "test@example.com"]);
++++    git(&repo, &["config", "user.name", "Jeeves Test"]);
++++    commit(&repo, "base.txt", "base\n", "base");
++++    repo
++++}
++++
++++fn commit(repo: &Path, name: &str, contents: &str, message: &str) {
++++    std::fs::write(repo.join(name), contents).unwrap();
++++    git(repo, &["add", "."]);
++++    git(repo, &["commit", "-q", "-m", message]);
++++}
++++
++++fn add_feature_worktree(dir: &Path, repo: &Path) -> PathBuf {
++++    git(repo, &["checkout", "-q", "-b", "feature"]);
++++    commit(repo, "feature.txt", "feature\n", "feature");
++++    git(repo, &["checkout", "-q", "main"]);
++++    let worktree = dir.join("feature-worktree");
++++    let worktree_arg = worktree.to_string_lossy().into_owned();
++++    git(repo, &["worktree", "add", "-q", &worktree_arg, "feature"]);
++++    worktree
++++}
++++
++++fn run_jeeves(args: &[&str], state_dir: &Path, inflight_secs: &str) -> Output {
++++    Command::new(env!("CARGO_BIN_EXE_jeeves"))
++++        .args(args)
++++        .env("JEEVES_STATE_DIR", state_dir)
++++        .env("JEEVES_AUDIT_INFLIGHT_SECS", inflight_secs)
++++        .env("WORKTREE_AUDIT_INFLIGHT_SECS", inflight_secs)
++++        .output()
++++        .unwrap()
++++}
++++
++++fn stderr(output: &Output) -> String {
++++    String::from_utf8_lossy(&output.stderr).into_owned()
++++}
++++
++++#[test]
++++fn archive_tags_then_deletes_branch_and_worktree() {
++++    let dir = scratch_dir();
++++    let repo = init_repo(&dir);
++++    let worktree = add_feature_worktree(&dir, &repo);
++++    let tip = git(&repo, &["rev-parse", "refs/heads/feature"]);
++++    let short_tip = git(&repo, &["rev-parse", "--short", "refs/heads/feature"]);
++++    let repo_arg = repo.to_string_lossy().into_owned();
++++
++++    let output = run_jeeves(&["archive", &repo_arg, "feature"], &dir.join("state"), "0");
++++
++++    assert_eq!(output.status.code(), Some(0));
++++    assert_eq!(
++++        String::from_utf8_lossy(&output.stdout),
++++        format!("  archived feature -> archive/feature ({short_tip})\n")
++++    );
++++    assert_eq!(git(&repo, &["rev-parse", "refs/tags/archive/feature"]), tip);
++++    assert!(!git_success(
++++        &repo,
++++        &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
++++    ));
++++    assert!(!worktree.exists());
++++
++++    let oid = short_tip.as_bytes();
++++    assert!((7..=40).contains(&oid.len()));
++++    assert!(oid.iter().all(u8::is_ascii_hexdigit));
++++    let _ = std::fs::remove_dir_all(&dir);
++++}
++++
++++#[test]
++++fn strict_archive_refuses_dirty_worktree_without_tagging_or_removing() {
++++    let dir = scratch_dir();
++++    let repo = init_repo(&dir);
++++    let worktree = add_feature_worktree(&dir, &repo);
++++    std::fs::write(worktree.join("dirty.txt"), "uncommitted\n").unwrap();
++++    let repo_arg = repo.to_string_lossy().into_owned();
++++
++++    let output = run_jeeves(
++++        &["archive", "--strict", &repo_arg, "feature"],
++++        &dir.join("state"),
++++        "0",
++++    );
++++
++++    assert_eq!(output.status.code(), Some(1));
++++    assert!(stderr(&output).contains("strict mode does not archive a dirty worktree"));
++++    assert!(!git_success(
++++        &repo,
++++        &[
++++            "show-ref",
++++            "--verify",
++++            "--quiet",
++++            "refs/tags/archive/feature"
++++        ]
++++    ));
++++    assert!(worktree.is_dir());
++++    assert!(git_success(
++++        &repo,
++++        &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
++++    ));
++++    let _ = std::fs::remove_dir_all(&dir);
++++}
++++
++++#[test]
++++fn archive_refuses_base_branch() {
++++    let dir = scratch_dir();
++++    let repo = init_repo(&dir);
++++    let repo_arg = repo.to_string_lossy().into_owned();
++++
++++    let output = run_jeeves(&["archive", &repo_arg, "main"], &dir.join("state"), "0");
++++
++++    assert_eq!(output.status.code(), Some(1));
++++    assert!(stderr(&output).contains("this is the base branch"));
++++    let _ = std::fs::remove_dir_all(&dir);
++++}
++++
++++#[test]
++++fn clean_refuses_unmerged_branch_without_deleting_anything() {
++++    let dir = scratch_dir();
++++    let repo = init_repo(&dir);
++++    let worktree = add_feature_worktree(&dir, &repo);
++++    let repo_arg = repo.to_string_lossy().into_owned();
++++
++++    let output = run_jeeves(&["clean", &repo_arg, "feature"], &dir.join("state"), "0");
++++
++++    assert_eq!(output.status.code(), Some(1));
++++    assert!(stderr(&output).contains("not confirmed merged"));
++++    assert!(worktree.is_dir());
++++    assert!(git_success(
++++        &repo,
++++        &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
++++    ));
++++    let _ = std::fs::remove_dir_all(&dir);
++++}
++++
++++#[test]
++++fn clean_removes_merged_idle_clean_worktree_and_branch() {
++++    let dir = scratch_dir();
++++    let repo = init_repo(&dir);
++++    let worktree = add_feature_worktree(&dir, &repo);
++++    git(
++++        &repo,
++++        &["merge", "-q", "--no-ff", "feature", "-m", "merge feature"],
++++    );
++++    let repo_arg = repo.to_string_lossy().into_owned();
++++
++++    let output = run_jeeves(&["clean", &repo_arg, "feature"], &dir.join("state"), "0");
++++
++++    assert_eq!(output.status.code(), Some(0));
++++    assert!(!worktree.exists());
++++    assert!(!git_success(
++++        &repo,
++++        &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
++++    ));
++++    let _ = std::fs::remove_dir_all(&dir);
++++}
++++
++++#[test]
++++fn clean_refuses_in_flight_branch() {
++++    let dir = scratch_dir();
++++    let repo = init_repo(&dir);
++++    let worktree = add_feature_worktree(&dir, &repo);
++++    git(
++++        &repo,
++++        &["merge", "-q", "--no-ff", "feature", "-m", "merge feature"],
++++    );
++++    let repo_arg = repo.to_string_lossy().into_owned();
++++
++++    let output = run_jeeves(
++++        &["clean", &repo_arg, "feature"],
++++        &dir.join("state"),
++++        "18446744073709551615",
++++    );
++++
++++    assert_eq!(output.status.code(), Some(1));
++++    assert!(stderr(&output).contains("active"));
++++    assert!(worktree.is_dir());
++++    assert!(git_success(
++++        &repo,
++++        &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
++++    ));
++++    let _ = std::fs::remove_dir_all(&dir);
++++}
++diff --git a/.superpowers/sdd/05-outline/task-3-review.md b/.superpowers/sdd/05-outline/task-3-review.md
++new file mode 100644
++index 0000000..53d7a4f
++--- /dev/null
+++++ b/.superpowers/sdd/05-outline/task-3-review.md
++@@ -0,0 +1,130 @@
+++"# Task-Scoped Review: Phase 3
+++
+++## Scope and Method
+++
+++Reviewed the Phase 3 brief, the supplied `7ee2ad3..79364af` diff, the five
+++named reference scripts, and the current audit/core/test implementation. The
+++diff was read once. No repository files, commits, or staging state were
+++modified. Focused reference runs covered audit dangling registrations and
+++`--no-content` placement, archive output, clean usage, hook JSON/timeout
+++behavior, linked-worktree behavior, and hook state-directory behavior.
+++
+++## Findings
+++
+++### Critical
+++
+++- None. The archive implementation creates the tag before worktree removal,
+++  uses conditional `git update-ref --stdin` deletion, and the clean path uses
+++  worktree removal before `git branch -d`; no destructive ordering deviation
+++  was found in the implementation.
+++
+++### Important
+++
+++- **Hook is not fail-closed and not read-only.** `hook.rs:50-52` resolves audit
+++  options outside an error boundary. That calls `audit.rs:35`,
+++  `config.rs:65-68`, and `paths.rs:17-21`, which creates/chmods the state
+++  directory and panics if it cannot be created. With
+++  `JEEVES_STATE_DIR=/dev/null/jeeves-hook-state`, the binary exited 101 rather
+++  than 0. With a valid absent state path and a non-repository `.cwd`, Rust
+++  created the state directory while the reference remained silent and did not
+++  create it. This violates the hook's always-zero and never-mutates contract.
+++
+++- **Clean accepts a missing branch list as a successful no-op.** The Clap
+++  declaration at `src/main.rs:30-33` does not make the `Vec` required, and
+++  `clean_branches` at `src/worktrees/clean.rs:13-33` has no empty-input guard.
+++  `jeeves clean <repo>` returned 0 after pruning; the reference returns 1 and
+++  the exact usage message. This is an observable CLI/refusal contract gap.
+++
+++- **Archive output is not reference-compatible.** `archive.rs:366-374`
+++  redirects `git update-ref --stdin` stdout to `/dev/null`. The reference does
+++  not redirect it, and on this Git version emits `start: ok`, `prepare: ok`,
+++  and `commit: ok` for each transaction. A successful strict archive therefore
+++  has seven output lines in the reference but only the final archived line in
+++  Rust; the non-strict path has the same missing delete-transaction lines.
+++  The existing safety test hardcodes the Rust-only output instead of checking
+++  the reference.
+++
+++- **Not all Phase 3 knobs use the required canonical/legacy core resolver.**
+++  `audit.rs:55-60` resolves the content threshold using only
+++  `WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD`, so the canonical
+++  `JEEVES_AUDIT_CONTENT_MERGE_THRESHOLD` name is ignored. `hook.rs:96-104`
+++  manually scans timeout environment variables and never reads the config file
+++  through `core::config::resolve`. This violates the triplet/config rule even
+++  though the in-flight and archaeology settings do use the resolver.
+++
+++- **Hook repo mode diverges on linked worktrees.** `hook.rs:42-46` selects
+++  `AuditMode::Repo`, and `hook.rs:114-116` calls `audit_repo` directly. The
+++  reference always invokes `audit-worktrees.sh` with the root; its discovery
+++  uses `fd -t d '^\\.git$'`, so a linked-worktree root whose `.git` is a file
+++  produces no report. On this linked checkout, the reference emitted nothing
+++  while Rust emitted a report. The existing hook tests only use ordinary
+++  repositories and do not expose this parity difference.
+++
+++- **Required parity/safety cases are not covered by the tests.**
+++  `tests/audit_golden.rs:125-294` has five reference-spawned cases, but no
+++  actual all-bucket fixture, lock-status coverage, dangling-registration
+++  golden case, or `--no-content` position case. `tests/hook_contract.rs:43-98`
+++  never spawns `ref/session-hook.sh` and has no timeout-mode test. The archive
+++  and clean tests in `tests/safety_invariants.rs:80-221` do not compare the
+++  reference, test missing-branch rc preservation, observe tag-before-destroy
+++  ordering, or exercise the CAS-delete race. Passing final-state assertions
+++  cannot establish those required invariants.
+++
+++### Minor
+++
+++- **Hook JSON differs byte-for-byte from the reference.** `hook.rs:162-164`
+++  emits compact JSON via `serde_json::to_string`, while `ref/session-hook.sh`
+++  emits jq's pretty-printed JSON. The parsed object and fields are equivalent,
+++  but the brief calls for JSON parity and the test at
+++  `tests/hook_contract.rs:76-80` asserts the compact Rust format rather than
+++  comparing the reference output.
+++
+++- **Zero timeout semantics differ.** `hook.rs:107-110` treats timeout `0` as
+++  an immediate skip. GNU `timeout 0`, used by the reference at
+++  `ref/session-hook.sh:46`, disables the timeout; a quick focused run produced
+++  the normal report from the reference and the timeout JSON from Rust. The
+++  behavior should be defined or matched.
+++
+++- **A hard-coded absolute fixture path remains.**
+++  `tests/coverage_golden.rs:324` uses `/nonexistent`, contrary to the task-wide
+++  no-hardcoded-absolute-paths-in-tests constraint. It is outside the supplied
+++  five-commit diff but remains in this checkout.
+++
+++## Reference Checks
+++
+++- Audit dangling-registration output matched the reference byte-for-byte.
+++- Audit accepted `--no-content` after the root and ignored an extra positional,
+++  matching the reference.
+++- Clean unmerged-refusal stderr and rc matched the reference.
+++- Strict and non-strict archive safety behavior preserved the branch/tag and
+++  worktree rules, but successful archive stdout omitted the reference's
+++  `update-ref` transaction status lines.
+++- Normal-repository hook JSON had the correct object and context, but differed
+++  in whitespace from jq output.
+++- Hook timeout `0`, linked-worktree repo mode, and invalid state-directory
+++  handling showed the mismatches described above.
+++
+++## Verification
+++
+++The declared check command passed:
+++
+++`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
+++
+++All five test suites passed: 62 unit tests, 5 audit golden tests, 9 coverage
+++golden tests, 2 hook tests, and 6 safety tests.
+++
+++## Verdict
+++
+++**Spec compliance:** fail. Destructive ordering is sound, and the covered
+++audit cases pass, but hook exit/read-only behavior, clean usage behavior,
+++archive output parity, resolver coverage, and required parity tests have gaps.
+++
+++**Task quality:** Needs fixes.
+++
+++**Root cause:** execution-error + `src/worktrees/hook.rs:50-52`,
+++`src/main.rs:30-33`, and incomplete reference-boundary tests at
+++`tests/hook_contract.rs:43-98` / `tests/safety_invariants.rs:80-221`.
+++
+++**Status:** Review complete; report written. Worktree unchanged except for the
+++supplied untracked diff input.
+++"
++diff --git a/src/core/config.rs b/src/core/config.rs
++index 012bfc2..6a43f0b 100644
++--- a/src/core/config.rs
+++++ b/src/core/config.rs
++@@ -1,21 +1,21 @@
++ //! Config resolution, mirroring bin/jeeves_lib.py:44-74.
++ //!
++ //! Precedence: CLI flag > env (canonical `JEEVES_*` first, then legacy
++ //! aliases) > config file key > default. The config file lives at
++ //! `state_dir()/config`, parsed as `KEY=VALUE` lines; `#` comments and blank
++ //! lines are ignored and the value splits on the FIRST `=`.
++ 
++ use std::collections::HashMap;
++ use std::path::Path;
++ 
++-use crate::core::paths::state_dir;
+++use crate::core::paths::state_dir_path;
++ 
++ /// Resolves a setting: flag, then canonical env, then legacy env aliases in
++ /// order, then config key, then the built-in default.
++ pub fn resolve(
++     flag: &Option<String>,
++     env: &[&str],
++     config: &HashMap<String, String>,
++     default: &str,
++ ) -> String {
++     if let Some(value) = flag {
++@@ -56,21 +56,21 @@ pub fn parse_config(text: &str) -> HashMap<String, String> {
++         }
++         out.insert(key.to_string(), value.to_string());
++     }
++     out
++ }
++ 
++ /// Reads `state_dir()/config` if it exists; returns an empty map otherwise.
++ pub fn read_config(state_dir_override: Option<&Path>) -> HashMap<String, String> {
++     let dir = match state_dir_override {
++         Some(d) => d.to_path_buf(),
++-        None => state_dir(),
+++        None => state_dir_path(),
++     };
++     let file = dir.join("config");
++     match std::fs::read_to_string(&file) {
++         Ok(text) => parse_config(&text),
++         Err(_) => HashMap::new(),
++     }
++ }
++ 
++ #[cfg(test)]
++ mod tests {
++diff --git a/src/core/paths.rs b/src/core/paths.rs
++index 4f68ecc..93e5ed3 100644
++--- a/src/core/paths.rs
+++++ b/src/core/paths.rs
++@@ -1,34 +1,42 @@
++ //! State/data directory resolution, mirroring bin/jeeves_lib.py:44-60.
++ //!
++ //! `state_dir`: `$JEEVES_STATE_DIR` else `$XDG_STATE_HOME/jeeves` else
++-//! `~/.local/state/jeeves`; created mode 0700 on demand.
+++//! `~/.local/state/jeeves`; created mode 0700 on demand. Read-only callers can
+++//! use `state_dir_path` to resolve the location without touching the filesystem.
++ //! `data_dir`: `$JEEVES_DATA_DIR` else `$XDG_DATA_HOME/jeeves` else
++ //! `~/.local/share/jeeves`; created on demand. The Python original chmods
++ //! only the state dir (0700), not the data dir.  mirrored exactly.
++ 
++ use std::path::PathBuf;
++ 
++ /// `$JEEVES_STATE_DIR` if set, else `$XDG_STATE_HOME/jeeves`, else
++ /// `~/.local/state/jeeves`. Creates the directory (mode 0700) on demand.
++ pub fn state_dir() -> PathBuf {
++-    let d = dir_override("JEEVES_STATE_DIR")
++-        .or_else(|| xdg_join("XDG_STATE_HOME", "jeeves"))
++-        .unwrap_or_else(|| home_join(".local/state/jeeves"));
+++    let d = state_dir_path();
++     match std::fs::create_dir_all(&d) {
++         Ok(()) => {}
++         Err(e) => panic!("cannot create state dir {}: {e}", d.display()),
++     }
++     let _ = std::fs::set_permissions(&d, std::os::unix::fs::PermissionsExt::from_mode(0o700));
++     d
++ }
++ 
+++/// Resolves the state directory without creating it. This is used by
+++/// read-only operations such as config loading, including the SessionStart
+++/// hook, which must never mutate the filesystem.
+++pub fn state_dir_path() -> PathBuf {
+++    dir_override("JEEVES_STATE_DIR")
+++        .or_else(|| xdg_join("XDG_STATE_HOME", "jeeves"))
+++        .unwrap_or_else(|| home_join(".local/state/jeeves"))
+++}
+++
++ /// `$JEEVES_DATA_DIR` if set, else `$XDG_DATA_HOME/jeeves`, else
++ /// `~/.local/share/jeeves`. Creates the directory on demand.
++ pub fn data_dir() -> PathBuf {
++     let d = dir_override("JEEVES_DATA_DIR")
++         .or_else(|| xdg_join("XDG_DATA_HOME", "jeeves"))
++         .unwrap_or_else(|| home_join(".local/share/jeeves"));
++     match std::fs::create_dir_all(&d) {
++         Ok(()) => {}
++         Err(e) => panic!("cannot create data dir {}: {e}", d.display()),
++     }
++diff --git a/src/main.rs b/src/main.rs
++index e24afa9..5e44749 100644
++--- a/src/main.rs
+++++ b/src/main.rs
++@@ -45,32 +45,46 @@ fn main() -> ExitCode {
++     // in ANY position (mirroring ref/audit-worktrees.sh:22-27), which clap
++     // would reject as a misplaced flag.
++     if std::env::args().nth(1).as_deref() == Some("audit") {
++         return run_audit();
++     }
++     // `jeeves archive` follows the reference command's positional parsing:
++     // --list and --strict are recognized only in the first argument slot.
++     if std::env::args().nth(1).as_deref() == Some("archive") {
++         return run_archive();
++     }
+++    // `jeeves clean` has one reference usage form for both a missing repo and
+++    // a missing branch list; handle those before clap emits its own rc-2 text.
+++    if std::env::args().nth(1).as_deref() == Some("clean") {
+++        let args: Vec<String> = std::env::args().skip(2).collect();
+++        if args.len() < 2 {
+++            eprintln!("{}", worktrees::clean::USAGE);
+++            return ExitCode::from(1);
+++        }
+++    }
++     // `jeeves session-hook` reads a JSON payload from stdin and must remain a
++     // silent, always-successful command when the hook cannot report anything.
++     if std::env::args().nth(1).as_deref() == Some("session-hook") {
++         return run_session_hook();
++     }
++     match Cli::parse().command {
++         None | Some(Command::Version) => {
++             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
++             ExitCode::SUCCESS
++         }
++         Some(Command::Clean { repo, branches }) => {
++-            ExitCode::from(worktrees::clean::clean_branches(&repo, &branches))
+++            if branches.is_empty() {
+++                eprintln!("{}", worktrees::clean::USAGE);
+++                ExitCode::from(1)
+++            } else {
+++                ExitCode::from(worktrees::clean::clean_branches(&repo, &branches))
+++            }
++         }
++     }
++ }
++ 
++ fn run_audit() -> ExitCode {
++     let args: Vec<String> = std::env::args().skip(2).collect();
++ 
++     // --no-content is accepted in any position; everything else is a root
++     // dir (ref/audit-worktrees.sh:22-27). The first positional wins, extra
++     // positionals are ignored, and the default root is the cwd.
++diff --git a/src/worktrees/archive.rs b/src/worktrees/archive.rs
++index acc5bdc..afc1b97 100644
++--- a/src/worktrees/archive.rs
+++++ b/src/worktrees/archive.rs
++@@ -4,35 +4,37 @@ use std::path::{Path, PathBuf};
++ use std::process::{Command, Output, Stdio};
++ 
++ use crate::core::config;
++ use crate::core::git;
++ use crate::core::proc::{lock_status, LockStatus};
++ use crate::core::time::{activity_age_secs_for, human_age};
++ 
++ const DEFAULT_IN_FLIGHT_SECS: u64 = 7_200;
++ const DEFAULT_ARCHIVE_PREFIX: &str = "archive";
++ const WIP_MESSAGE: &str = "wip: archived with uncommitted changes";
+++const USAGE: &str = "usage: jeeves archive <repo-path> <branch> [<branch>...]";
+++const LIST_USAGE: &str = "usage: jeeves archive --list <repo-path>";
++ 
++ /// Parse and execute the `archive` subcommand arguments.
++ pub fn run(args: &[String]) -> u8 {
++     if args.first().map(String::as_str) == Some("--list") {
++         let Some(repo) = args.get(1) else {
++-            eprintln!("usage: archive-branch.sh --list <repo-path>");
+++            eprintln!("{LIST_USAGE}");
++             return 1;
++         };
++         return list(Path::new(repo));
++     }
++ 
++     let strict = args.first().map(String::as_str) == Some("--strict");
++     let offset = usize::from(strict);
++     if args.len() <= offset + 1 {
++-        eprintln!("usage: archive-branch.sh <repo-path> <branch> [<branch>...]");
+++        eprintln!("{USAGE}");
++         return 1;
++     }
++ 
++     let repo = Path::new(&args[offset]);
++     archive_branches(repo, &args[offset + 1..], strict)
++ }
++ 
++ /// List tags below the configured archive prefix.
++ pub fn list(repo: &Path) -> u8 {
++     let prefix = Settings::load().archive_prefix;
++@@ -53,20 +55,25 @@ pub fn list(repo: &Path) -> u8 {
++     };
++     if !output.status.success() {
++         return 1;
++     }
++     print_bytes(&output.stdout);
++     0
++ }
++ 
++ /// Archive each named local branch, returning one when any branch is refused.
++ pub fn archive_branches(repo: &Path, branches: &[String], strict: bool) -> u8 {
+++    if branches.is_empty() {
+++        eprintln!("{USAGE}");
+++        return 1;
+++    }
+++
++     let Some(root) = repo_root(repo) else {
++         eprintln!(
++             "refusing: can't determine base branch for {}",
++             repo.display()
++         );
++         return 1;
++     };
++ 
++     let Some(base) = detect_base(&root) else {
++         eprintln!(
++@@ -137,21 +144,23 @@ pub fn archive_branches(repo: &Path, branches: &[String], strict: bool) -> u8 {
++             let dirty = worktree_dirty_count(path);
++             if dirty > 0 {
++                 if strict {
++                     eprintln!(
++                         "refusing {branch}: strict mode does not archive a dirty worktree ({dirty} uncommitted file(s) in {})",
++                         path.display()
++                     );
++                     rc = 1;
++                     continue;
++                 }
++-                println!("  {branch}: committing {dirty} uncommitted file(s) before archiving");
+++                print_line(&format!(
+++                    "  {branch}: committing {dirty} uncommitted file(s) before archiving"
+++                ));
++                 if !commit_worktree(path) {
++                     eprintln!(
++                         "refusing {branch}: couldn't commit its uncommitted changes — not deleting anything"
++                     );
++                     rc = 1;
++                     continue;
++                 }
++             }
++         }
++ 
++@@ -246,21 +255,21 @@ pub fn archive_branches(repo: &Path, branches: &[String], strict: bool) -> u8 {
++         let transaction = format!("start\ndelete {branch_ref} {tip}\nprepare\ncommit\n");
++         if !update_ref(&root, &transaction) {
++             eprintln!(
++                 "refusing {branch}: branch advanced during archive (conditional delete aborted) — tag {tag} kept, branch left in place"
++             );
++             rc = 1;
++             continue;
++         }
++ 
++         let short_tip = rev_parse_short(&root, &tip).unwrap_or_else(|| tip.clone());
++-        println!("  archived {branch} -> {tag} ({short_tip})");
+++        print_line(&format!("  archived {branch} -> {tag} ({short_tip})"));
++     }
++ 
++     prune(&root);
++     rc
++ }
++ 
++ struct Settings {
++     in_flight_secs: u64,
++     archive_prefix: String,
++ }
++@@ -363,21 +372,21 @@ fn rev_parse_short(repo: &Path, revision: &str) -> Option<String> {
++     Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
++ }
++ 
++ fn update_ref(repo: &Path, transaction: &str) -> bool {
++     let mut command = Command::new("git");
++     command
++         .arg("-C")
++         .arg(repo)
++         .args(["update-ref", "--stdin"])
++         .stdin(Stdio::piped())
++-        .stdout(Stdio::null())
+++        .stdout(Stdio::inherit())
++         .stderr(Stdio::null());
++     let Ok(mut child) = command.spawn() else {
++         return false;
++     };
++     let write_ok = child
++         .stdin
++         .take()
++         .map(|mut stdin| stdin.write_all(transaction.as_bytes()).is_ok())
++         .unwrap_or(false);
++     let status_ok = child.wait().map(|status| status.success()).unwrap_or(false);
++@@ -409,14 +418,19 @@ where
++         .args(args)
++         .output()
++         .ok()
++ }
++ 
++ fn print_bytes(bytes: &[u8]) {
++     let text = String::from_utf8_lossy(bytes);
++     print!("{text}");
++ }
++ 
+++fn print_line(line: &str) {
+++    println!("{line}");
+++    let _ = std::io::stdout().flush();
+++}
+++
++ fn print_bytes_to_stderr(bytes: &[u8]) {
++     let text = String::from_utf8_lossy(bytes);
++     eprint!("{text}");
++ }
++diff --git a/src/worktrees/audit.rs b/src/worktrees/audit.rs
++index ce4c88c..101c449 100644
++--- a/src/worktrees/audit.rs
+++++ b/src/worktrees/audit.rs
++@@ -47,21 +47,24 @@ pub fn resolve_opts(no_content: bool) -> AuditOpts {
++             "JEEVES_AUDIT_ARCHAEOLOGY_SECS",
++             "WORKTREE_AUDIT_ARCHAEOLOGY_SECS",
++         ],
++         &config,
++         "7776000",
++     )
++     .parse()
++     .unwrap_or(7776000);
++     let mut threshold = config::resolve(
++         &None,
++-        &["WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD"],
+++        &[
+++            "JEEVES_AUDIT_CONTENT_MERGE_THRESHOLD",
+++            "WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD",
+++        ],
++         &config,
++         "95",
++     );
++     if threshold == "0" || !is_valid_pct(&threshold) {
++         eprintln!(
++             "  (skipped: WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD must be an integer 1-100 with no leading zero, got '{threshold}')"
++         );
++         threshold = "95".to_string();
++     }
++     AuditOpts {
++diff --git a/src/worktrees/clean.rs b/src/worktrees/clean.rs
++index 8410602..a4a6cc8 100644
++--- a/src/worktrees/clean.rs
+++++ b/src/worktrees/clean.rs
++@@ -1,23 +1,29 @@
++ use std::ffi::{OsStr, OsString};
++ use std::path::{Path, PathBuf};
++ use std::process::{Command, Output};
++ 
++ use crate::core::config;
++ use crate::core::git;
++ use crate::core::proc::{lock_status, LockStatus};
++ use crate::core::time::{activity_age_secs_for, human_age};
++ 
++ const DEFAULT_IN_FLIGHT_SECS: u64 = 7_200;
+++pub const USAGE: &str = "usage: jeeves clean <repo-path> <branch> [<branch>...]";
++ 
++ /// Clean each named local branch, returning one when any branch is refused.
++ pub fn clean_branches(repo: &Path, branches: &[String]) -> u8 {
+++    if branches.is_empty() {
+++        eprintln!("{USAGE}");
+++        return 1;
+++    }
+++
++     let Some(root) = repo_root(repo) else {
++         eprintln!(
++             "refusing: can't determine base branch for {}",
++             repo.display()
++         );
++         return 1;
++     };
++ 
++     let Some(base) = detect_base(&root) else {
++         eprintln!(
++diff --git a/src/worktrees/hook.rs b/src/worktrees/hook.rs
++index 5a3664f..3890846 100644
++--- a/src/worktrees/hook.rs
+++++ b/src/worktrees/hook.rs
++@@ -1,82 +1,76 @@
++-use std::io::Read;
+++use std::fmt::Write as _;
+++use std::io::{self, Read, Write};
++ use std::path::{Path, PathBuf};
++ use std::sync::mpsc::{self, RecvTimeoutError};
++ use std::thread;
++ use std::time::Duration;
++ 
++-use serde::Serialize;
++-
+++use crate::core::config;
++ use crate::core::git;
++ use crate::worktrees::audit::{self, AuditOpts};
++ 
++ const DEFAULT_TIMEOUT_SECS: u64 = 15;
++ 
++ enum AuditMode {
++-    Repo(PathBuf),
++     Sweep(PathBuf),
++ }
++ 
++-#[derive(Serialize)]
++-struct HookPayload<'a> {
++-    #[serde(rename = "hookSpecificOutput")]
++-    hook_specific_output: HookSpecificOutput<'a>,
++-}
++-
++-#[derive(Serialize)]
++-struct HookSpecificOutput<'a> {
++-    #[serde(rename = "hookEventName")]
++-    hook_event_name: &'static str,
++-    #[serde(rename = "additionalContext")]
++-    additional_context: &'a str,
++-}
++-
++ /// Run the SessionStart hook. Every path through this function is successful;
++ /// a hook failure must never prevent a session from starting.
++ pub fn run() {
+++    // Keep stdout untouched until the whole hook path has completed. A panic
+++    // in config resolution or auditing must be a silent successful no-op.
+++    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+++        if let Some(body) = run_inner() {
+++            emit(&body);
+++        }
+++    }));
+++}
+++
+++fn run_inner() -> Option<String> {
++     let mut payload = String::new();
++-    if std::io::stdin().read_to_string(&mut payload).is_err() {
++-        return;
+++    if io::stdin().read_to_string(&mut payload).is_err() {
+++        return None;
++     }
++ 
++     let cwd = hook_cwd(&payload);
++     let (mode, root, repo_mode) = match git::rev_parse(&cwd, "--show-toplevel") {
++-        Ok(root) if !root.is_empty() => (AuditMode::Repo(PathBuf::from(&root)), root, true),
+++        Ok(root) if !root.is_empty() => {
+++            // The reference always invokes audit with ROOT. Its fd discovery
+++            // therefore ignores a linked-worktree root, where .git is a file.
+++            (AuditMode::Sweep(PathBuf::from(&root)), root, true)
+++        }
++         _ => {
++             let root = cwd.to_string_lossy().into_owned();
++             (AuditMode::Sweep(cwd), root, false)
++         }
++     };
++ 
++     let timeout_secs = resolve_timeout_secs();
++     let opts = audit::resolve_opts(true);
++     let report = match audit_with_timeout(mode, opts, timeout_secs) {
++         Ok(report) => report,
++         Err(()) => {
++-            emit(&format!(
+++            return Some(format!(
++                 "Worktree audit exceeded its {timeout_secs}s budget in {} and was skipped. Run the auditing-worktrees skill manually for the full report.",
++                 basename(Path::new(&root))
++             ));
++-            return;
++         }
++     };
++ 
++     let report = report.trim_end_matches('\n');
++     if report.is_empty() {
++-        return;
+++        return None;
++     }
++ 
++-    let body = match mode_for_root(repo_mode, &root, report) {
++-        Some(body) => body,
++-        None => return,
++-    };
++-    emit(&body);
+++    mode_for_root(repo_mode, &root, report)
++ }
++ 
++ fn hook_cwd(payload: &str) -> PathBuf {
++     let requested = serde_json::from_str::<serde_json::Value>(payload)
++         .ok()
++         .and_then(|value| {
++             value
++                 .get("cwd")
++                 .and_then(serde_json::Value::as_str)
++                 .map(str::to_owned)
++@@ -87,51 +81,55 @@ fn hook_cwd(payload: &str) -> PathBuf {
++     match requested.filter(|path| path.is_dir()) {
++         Some(path) if path.is_absolute() => path,
++         Some(path) => process_cwd
++             .as_ref()
++             .map_or(path.clone(), |cwd| cwd.join(path)),
++         None => process_cwd.unwrap_or_else(|| PathBuf::from(".")),
++     }
++ }
++ 
++ fn resolve_timeout_secs() -> u64 {
++-    let raw = ["JEEVES_HOOK_TIMEOUT", "WORKTREE_AUDIT_HOOK_TIMEOUT"]
++-        .iter()
++-        .find_map(|name| match std::env::var(name) {
++-            Ok(value) if !value.is_empty() => Some(value),
++-            _ => None,
++-        });
++-    raw.and_then(|value| value.parse().ok())
++-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+++    let config = config::read_config(None);
+++    config::resolve(
+++        &None,
+++        &["JEEVES_HOOK_TIMEOUT", "WORKTREE_AUDIT_HOOK_TIMEOUT"],
+++        &config,
+++        "15",
+++    )
+++    .parse()
+++    .unwrap_or(DEFAULT_TIMEOUT_SECS)
++ }
++ 
++ fn audit_with_timeout(mode: AuditMode, opts: AuditOpts, timeout_secs: u64) -> Result<String, ()> {
++     if timeout_secs == 0 {
++-        return Err(());
+++        return Ok(audit_mode(mode, &opts));
++     }
++ 
++     let (sender, receiver) = mpsc::channel();
++     thread::spawn(move || {
++-        let report = match mode {
++-            AuditMode::Repo(root) => audit::audit_repo(&root, &opts),
++-            AuditMode::Sweep(root) => audit::audit_sweep(&[root], &opts),
++-        };
+++        let report = audit_mode(mode, &opts);
++         let _ = sender.send(report);
++     });
++ 
++     match receiver.recv_timeout(Duration::from_secs(timeout_secs)) {
++         Ok(report) => Ok(report),
++         Err(RecvTimeoutError::Timeout) => Err(()),
++         Err(RecvTimeoutError::Disconnected) => Ok(String::new()),
++     }
++ }
++ 
+++fn audit_mode(mode: AuditMode, opts: &AuditOpts) -> String {
+++    match mode {
+++        AuditMode::Sweep(root) => audit::audit_sweep(&[root], opts),
+++    }
+++}
+++
++ fn mode_for_root(repo_mode: bool, root: &str, report: &str) -> Option<String> {
++     if repo_mode {
++         let body = format!(
++             "Worktree drift in {} (from the auditing-worktrees SessionStart hook, report only):\n\n{report}\nNothing here has been changed. To act on it, use the auditing-worktrees skill.",
++             basename(Path::new(root))
++         );
++         return Some(body);
++     }
++ 
++     let summary = audit::summary_collapse(report);
++@@ -146,20 +144,37 @@ fn mode_for_root(repo_mode: bool, root: &str, report: &str) -> Option<String> {
++ 
++ fn basename(path: &Path) -> String {
++     path.file_name()
++         .and_then(|name| name.to_str())
++         .filter(|name| !name.is_empty())
++         .map(str::to_owned)
++         .unwrap_or_else(|| path.to_string_lossy().into_owned())
++ }
++ 
++ fn emit(body: &str) {
++-    let payload = HookPayload {
++-        hook_specific_output: HookSpecificOutput {
++-            hook_event_name: "SessionStart",
++-            additional_context: body,
++-        },
++-    };
++-    if let Ok(json) = serde_json::to_string(&payload) {
++-        println!("{json}");
+++    let escaped = json_escape(body);
+++    let json = format!(
+++        "{{\n  \"hookSpecificOutput\": {{\n    \"hookEventName\": \"SessionStart\",\n    \"additionalContext\": \"{escaped}\"\n  }}\n}}\n"
+++    );
+++    let mut stdout = io::stdout().lock();
+++    let _ = stdout.write_all(json.as_bytes());
+++}
+++
+++fn json_escape(value: &str) -> String {
+++    let mut escaped = String::with_capacity(value.len());
+++    for ch in value.chars() {
+++        match ch {
+++            '"' => escaped.push_str("\\\""),
+++            '\\' => escaped.push_str("\\\\"),
+++            '\u{08}' => escaped.push_str("\\b"),
+++            '\u{0c}' => escaped.push_str("\\f"),
+++            '\n' => escaped.push_str("\\n"),
+++            '\r' => escaped.push_str("\\r"),
+++            '\t' => escaped.push_str("\\t"),
+++            ch if ch <= '\u{1f}' => {
+++                let _ = write!(escaped, "\\u{:04x}", ch as u32);
+++            }
+++            ch => escaped.push(ch),
+++        }
++     }
+++    escaped
++ }
++diff --git a/tests/audit_golden.rs b/tests/audit_golden.rs
++index 42ff4da..d49f9eb 100644
++--- a/tests/audit_golden.rs
+++++ b/tests/audit_golden.rs
++@@ -42,20 +42,43 @@ fn init_repo(dir: &Path) -> PathBuf {
++     git(&repo, &["config", "user.name", "t"]);
++     repo
++ }
++ 
++ fn commit(repo: &Path, fname: &str, content: &str, msg: &str) {
++     std::fs::write(repo.join(fname), content).unwrap();
++     git(repo, &["add", "."]);
++     git(repo, &["commit", "-qm", msg]);
++ }
++ 
+++fn commit_at(repo: &Path, fname: &str, content: &str, msg: &str, date: &str) {
+++    std::fs::write(repo.join(fname), content).unwrap();
+++    git(repo, &["add", "."]);
+++    let out = Command::new("git")
+++        .current_dir(repo)
+++        .env("GIT_AUTHOR_DATE", date)
+++        .env("GIT_COMMITTER_DATE", date)
+++        .args(["commit", "-qm", msg])
+++        .output()
+++        .unwrap();
+++    assert!(
+++        out.status.success(),
+++        "git commit failed: {}",
+++        String::from_utf8_lossy(&out.stderr)
+++    );
+++}
+++
+++fn self_start_ticks() -> String {
+++    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+++    let fields = stat.rsplit_once(") ").unwrap().1;
+++    fields.split_whitespace().nth(19).unwrap().to_string()
+++}
+++
++ /// Audit knobs, identical on both sides of every comparison. `None`
++ /// threshold means the env var is left unset (default 95 on both sides).
++ struct Knobs {
++     inflight_secs: &'static str,
++     archaeology_secs: &'static str,
++     content_merge_threshold: Option<&'static str>,
++ }
++ 
++ /// The reference CLI, resolved from CARGO_MANIFEST_DIR (the sandbox cannot
++ /// hardcode an absolute fallback path).
++@@ -69,38 +92,66 @@ fn ref_lib() -> PathBuf {
++ }
++ 
++ fn apply_env(cmd: &mut Command, knobs: &Knobs, scratch: &Path) {
++     cmd.env("JEEVES_AUDIT_INFLIGHT_SECS", knobs.inflight_secs)
++         .env("WORKTREE_AUDIT_INFLIGHT_SECS", knobs.inflight_secs)
++         .env("JEEVES_AUDIT_ARCHAEOLOGY_SECS", knobs.archaeology_secs)
++         .env("WORKTREE_AUDIT_ARCHAEOLOGY_SECS", knobs.archaeology_secs)
++         .env("AUDIT_WORKTREES_LIB", ref_lib())
++         .env("JEEVES_STATE_DIR", scratch.join("state"));
++     if let Some(t) = knobs.content_merge_threshold {
++-        cmd.env("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD", t);
+++        cmd.env("JEEVES_AUDIT_CONTENT_MERGE_THRESHOLD", t)
+++            .env("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD", t);
+++    } else {
+++        cmd.env_remove("JEEVES_AUDIT_CONTENT_MERGE_THRESHOLD")
+++            .env_remove("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD");
++     }
++ }
++ 
++ fn run_ref(repo_parent: &Path, knobs: &Knobs) -> Output {
++     let mut cmd = Command::new("bash");
++     cmd.arg(ref_audit_worktrees()).arg(repo_parent);
++     apply_env(&mut cmd, knobs, repo_parent);
++     cmd.output().unwrap()
++ }
++ 
++ fn run_rust(repo_parent: &Path, knobs: &Knobs) -> Output {
++     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jeeves"));
++     cmd.arg("audit").arg(repo_parent);
++     apply_env(&mut cmd, knobs, repo_parent);
++     cmd.output().unwrap()
++ }
++ 
+++fn run_ref_no_content(repo_parent: &Path, knobs: &Knobs, before_root: bool) -> Output {
+++    let mut cmd = Command::new("bash");
+++    cmd.arg(ref_audit_worktrees());
+++    if before_root {
+++        cmd.arg("--no-content").arg(repo_parent);
+++    } else {
+++        cmd.arg(repo_parent).arg("--no-content");
+++    }
+++    apply_env(&mut cmd, knobs, repo_parent);
+++    cmd.output().unwrap()
+++}
+++
+++fn run_rust_no_content(repo_parent: &Path, knobs: &Knobs, before_root: bool) -> Output {
+++    let mut cmd = Command::new(env!("CARGO_BIN_EXE_jeeves"));
+++    cmd.arg("audit");
+++    if before_root {
+++        cmd.arg("--no-content").arg(repo_parent);
+++    } else {
+++        cmd.arg(repo_parent).arg("--no-content");
+++    }
+++    apply_env(&mut cmd, knobs, repo_parent);
+++    cmd.output().unwrap()
+++}
+++
++ fn stdout_of(out: &Output) -> String {
++     String::from_utf8_lossy(&out.stdout).trim().to_string()
++ }
++ 
++ /// The heart of the suite: the Rust report must byte-match the reference
++ /// stdout, and both must exit 0.
++ fn assert_parity(repo_parent: &Path, knobs: &Knobs) {
++     let reference = run_ref(repo_parent, knobs);
++     let rust = run_rust(repo_parent, knobs);
++     assert_eq!(
++@@ -115,20 +166,41 @@ fn assert_parity(repo_parent: &Path, knobs: &Knobs) {
++         "rust exited nonzero: {}",
++         String::from_utf8_lossy(&rust.stderr)
++     );
++     assert_eq!(
++         String::from_utf8_lossy(&rust.stdout),
++         String::from_utf8_lossy(&reference.stdout),
++         "audit report mismatch"
++     );
++ }
++ 
+++fn assert_no_content_parity(repo_parent: &Path, knobs: &Knobs, before_root: bool) {
+++    let reference = run_ref_no_content(repo_parent, knobs, before_root);
+++    let rust = run_rust_no_content(repo_parent, knobs, before_root);
+++    assert_eq!(
+++        reference.status.code(),
+++        Some(0),
+++        "reference exited nonzero: {}",
+++        String::from_utf8_lossy(&reference.stderr)
+++    );
+++    assert_eq!(
+++        rust.status.code(),
+++        Some(0),
+++        "rust exited nonzero: {}",
+++        String::from_utf8_lossy(&rust.stderr)
+++    );
+++    assert_eq!(
+++        rust.stdout, reference.stdout,
+++        "--no-content report mismatch"
+++    );
+++}
+++
++ /// (1) clean unmerged branch with no worktree: needs-triage with a SCORED
++ /// reason (the branch's work is provably not in base).
++ #[test]
++ fn clean_unmerged_branch_needs_triage() {
++     let dir = scratch_dir();
++     let repo = init_repo(&dir);
++     commit(&repo, "a.txt", "a\n", "init");
++     git(&repo, &["checkout", "-q", "-b", "feature"]);
++     commit(&repo, "feat.txt", "feature work\n", "add feat");
++     git(&repo, &["checkout", "-q", "main"]);
++@@ -285,10 +357,162 @@ fn inflight_only_repo_prints_nothing() {
++         "binary must print nothing, got: {}",
++         String::from_utf8_lossy(&rust.stdout)
++     );
++     assert!(
++         reference.stdout.is_empty(),
++         "reference must print nothing, got: {}",
++         String::from_utf8_lossy(&reference.stdout)
++     );
++     let _ = std::fs::remove_dir_all(&dir);
++ }
+++
+++#[test]
+++fn all_audit_buckets_match_in_one_repo() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    let old = "2000-01-01T00:00:00Z";
+++
+++    commit_at(&repo, "base.txt", "base\n", "base", old);
+++
+++    git(&repo, &["checkout", "-q", "-b", "triage"]);
+++    commit_at(&repo, "triage.txt", "triage\n", "triage", old);
+++    git(&repo, &["checkout", "-q", "main"]);
+++    git(
+++        &repo,
+++        &["merge", "-q", "--no-ff", "triage", "-m", "merge triage"],
+++    );
+++    let triage_worktree = dir.join("triage-worktree");
+++    let triage_path = triage_worktree.to_string_lossy().into_owned();
+++    git(&repo, &["worktree", "add", "-q", &triage_path, "triage"]);
+++    let triage_file = triage_worktree.join("uncommitted.txt");
+++    std::fs::write(&triage_file, "triage\n").unwrap();
+++    std::fs::File::open(&triage_file)
+++        .unwrap()
+++        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(946684800))
+++        .unwrap();
+++
+++    git(&repo, &["checkout", "-q", "-b", "archaeology"]);
+++    commit_at(
+++        &repo,
+++        "archaeology.txt",
+++        "archaeology\n",
+++        "archaeology",
+++        old,
+++    );
+++    git(&repo, &["checkout", "-q", "main"]);
+++
+++    git(&repo, &["checkout", "-q", "-b", "content"]);
+++    commit_at(&repo, "content.txt", "already shipped\n", "content", old);
+++    git(&repo, &["checkout", "-q", "main"]);
+++    git(&repo, &["merge", "-q", "--squash", "content"]);
+++    commit_at(
+++        &repo,
+++        "main-extra.txt",
+++        "main extra\n",
+++        "squash content",
+++        old,
+++    );
+++
+++    git(&repo, &["checkout", "-q", "-b", "safe"]);
+++    commit_at(&repo, "safe.txt", "safe\n", "safe", old);
+++    git(&repo, &["checkout", "-q", "main"]);
+++    git(
+++        &repo,
+++        &["merge", "-q", "--no-ff", "safe", "-m", "merge safe"],
+++    );
+++    let safe_worktree = dir.join("safe-worktree");
+++    let safe_path = safe_worktree.to_string_lossy().into_owned();
+++    git(&repo, &["worktree", "add", "-q", &safe_path, "safe"]);
+++
+++    git(&repo, &["checkout", "-q", "-b", "hands"]);
+++    commit_at(&repo, "hands.txt", "hands\n", "hands", old);
+++    git(&repo, &["checkout", "-q", "main"]);
+++    let hands_worktree = dir.join("hands-worktree");
+++    let hands_path = hands_worktree.to_string_lossy().into_owned();
+++    git(&repo, &["worktree", "add", "-q", &hands_path, "hands"]);
+++    git(
+++        &repo,
+++        &["worktree", "lock", "--reason", "garbage lock", &hands_path],
+++    );
+++
+++    git(&repo, &["checkout", "-q", "-b", "inflight"]);
+++    git(&repo, &["checkout", "-q", "main"]);
+++
+++    let knobs = Knobs {
+++        inflight_secs: "7200",
+++        archaeology_secs: "0",
+++        content_merge_threshold: Some("95"),
+++    };
+++    assert_parity(&dir, &knobs);
+++    let report = stdout_of(&run_rust(&dir, &knobs));
+++    assert!(report.contains("  safe-to-clean (merged, clean):"));
+++    assert!(report.contains("  needs-triage:"));
+++    assert!(report.contains("  archaeology (older than 0m"));
+++    assert!(report.contains("  likely-content-merged"));
+++    assert!(report.contains("  hands-off"));
+++    assert!(report.contains("  (1 in flight, active within 2h — hidden)"));
+++
+++    git(&repo, &["worktree", "unlock", &hands_path]);
+++    git(&repo, &["worktree", "remove", "--force", &hands_path]);
+++    git(&repo, &["worktree", "remove", "--force", &safe_path]);
+++    git(&repo, &["worktree", "remove", "--force", &triage_path]);
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++#[test]
+++fn no_content_flag_matches_reference_before_and_after_root() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "a.txt", "a\n", "init");
+++    git(&repo, &["checkout", "-q", "-b", "content"]);
+++    commit(&repo, "content.txt", "already shipped\n", "content");
+++    git(&repo, &["checkout", "-q", "main"]);
+++    commit(&repo, "b.txt", "b\n", "unrelated main commit");
+++    git(&repo, &["merge", "-q", "--squash", "content"]);
+++    commit(&repo, "extra.txt", "extra\n", "squash content");
+++
+++    let knobs = Knobs {
+++        inflight_secs: "0",
+++        archaeology_secs: "7776000",
+++        content_merge_threshold: Some("95"),
+++    };
+++    assert_no_content_parity(&dir, &knobs, false);
+++    assert_no_content_parity(&dir, &knobs, true);
+++    let report = stdout_of(&run_rust_no_content(&dir, &knobs, false));
+++    assert!(report.contains("  needs-triage:"));
+++    assert!(!report.contains("likely-content-merged"));
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++#[test]
+++fn live_lock_is_hands_off_in_reference_and_rust() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "base.txt", "base\n", "base");
+++    git(&repo, &["checkout", "-q", "-b", "live"]);
+++    commit(&repo, "live.txt", "live\n", "live");
+++    git(&repo, &["checkout", "-q", "main"]);
+++
+++    let worktree = dir.join("live-worktree");
+++    let worktree_path = worktree.to_string_lossy().into_owned();
+++    git(&repo, &["worktree", "add", "-q", &worktree_path, "live"]);
+++    let gitdir = git(&worktree, &["rev-parse", "--absolute-git-dir"]);
+++    std::fs::write(
+++        Path::new(&gitdir).join("locked"),
+++        format!("pid {} start {}\n", std::process::id(), self_start_ticks()),
+++    )
+++    .unwrap();
+++
+++    let knobs = Knobs {
+++        inflight_secs: "0",
+++        archaeology_secs: "7776000",
+++        content_merge_threshold: None,
+++    };
+++    assert_parity(&dir, &knobs);
+++    let report = stdout_of(&run_rust(&dir, &knobs));
+++    assert!(report.contains("  hands-off"));
+++    assert!(report.contains("[lock: live]"));
+++
+++    git(&repo, &["worktree", "unlock", &worktree_path]);
+++    git(&repo, &["worktree", "remove", "--force", &worktree_path]);
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
++diff --git a/tests/coverage_golden.rs b/tests/coverage_golden.rs
++index ef93ddb..ff8308f 100644
++--- a/tests/coverage_golden.rs
+++++ b/tests/coverage_golden.rs
++@@ -313,19 +313,24 @@ fn usage_errors_match_reference() {
++     let out = Command::new(bin)
++         .args(["coverage", &repo.to_string_lossy(), "main"])
++         .output()
++         .unwrap();
++     assert_eq!(out.status.code(), Some(2));
++     assert_eq!(
++         stdout_of(&out),
++         "error: usage: coverage-score <repo> <base> <branch>"
++     );
++ 
+++    let missing = dir.join("missing-repo");
+++    let missing_arg = missing.to_string_lossy().into_owned();
++     let out = Command::new(bin)
++-        .args(["coverage", "/nonexistent", "main", "feature"])
+++        .args(["coverage", &missing_arg, "main", "feature"])
++         .output()
++         .unwrap();
++     assert_eq!(out.status.code(), Some(2));
++-    assert_eq!(stdout_of(&out), "error: not a directory: /nonexistent");
+++    assert_eq!(
+++        stdout_of(&out),
+++        format!("error: not a directory: {missing_arg}")
+++    );
++ 
++     let _ = std::fs::remove_dir_all(&dir);
++ }
++diff --git a/tests/hook_contract.rs b/tests/hook_contract.rs
++index 12862f7..08f2868 100644
++--- a/tests/hook_contract.rs
+++++ b/tests/hook_contract.rs
++@@ -33,27 +33,56 @@ fn init_repo(dir: &Path) -> PathBuf {
++     std::fs::create_dir_all(&repo).unwrap();
++     git(&repo, &["init", "-q", "-b", "main"]);
++     git(&repo, &["config", "user.email", "test@example.com"]);
++     git(&repo, &["config", "user.name", "Jeeves Test"]);
++     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
++     git(&repo, &["add", "."]);
++     git(&repo, &["commit", "-q", "-m", "base"]);
++     repo
++ }
++ 
+++fn ref_session_hook() -> PathBuf {
+++    Path::new(env!("CARGO_MANIFEST_DIR"))
+++        .join(".superpowers/crispy/rust-rewrite/ref/session-hook.sh")
+++}
+++
++ fn run_hook(process_dir: &Path, payload: &str, state_dir: &Path) -> Output {
++     let mut child = Command::new(env!("CARGO_BIN_EXE_jeeves"))
++         .arg("session-hook")
++         .current_dir(process_dir)
++         .env("JEEVES_STATE_DIR", state_dir)
++         .env("JEEVES_AUDIT_INFLIGHT_SECS", "0")
++         .env("WORKTREE_AUDIT_INFLIGHT_SECS", "0")
+++        .env("JEEVES_HOOK_TIMEOUT", "0")
+++        .env("WORKTREE_AUDIT_HOOK_TIMEOUT", "0")
+++        .stdin(Stdio::piped())
+++        .stdout(Stdio::piped())
+++        .spawn()
+++        .unwrap();
+++    child
+++        .stdin
+++        .take()
+++        .unwrap()
+++        .write_all(payload.as_bytes())
+++        .unwrap();
+++    child.wait_with_output().unwrap()
+++}
+++
+++fn run_ref_hook(process_dir: &Path, payload: &str, state_dir: &Path) -> Output {
+++    let mut child = Command::new("bash")
+++        .arg(ref_session_hook())
+++        .current_dir(process_dir)
+++        .env("JEEVES_STATE_DIR", state_dir)
+++        .env("JEEVES_AUDIT_INFLIGHT_SECS", "0")
+++        .env("WORKTREE_AUDIT_INFLIGHT_SECS", "0")
+++        .env("JEEVES_HOOK_TIMEOUT", "0")
+++        .env("WORKTREE_AUDIT_HOOK_TIMEOUT", "0")
++         .stdin(Stdio::piped())
++         .stdout(Stdio::piped())
++         .spawn()
++         .unwrap();
++     child
++         .stdin
++         .take()
++         .unwrap()
++         .write_all(payload.as_bytes())
++         .unwrap();
++@@ -64,35 +93,90 @@ fn run_hook(process_dir: &Path, payload: &str, state_dir: &Path) -> Output {
++ fn repo_hook_emits_ordered_json_context_for_drift() {
++     let dir = scratch_dir();
++     let repo = init_repo(&dir);
++     git(&repo, &["checkout", "-q", "-b", "feature"]);
++     std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
++     git(&repo, &["add", "."]);
++     git(&repo, &["commit", "-q", "-m", "feature"]);
++     git(&repo, &["checkout", "-q", "main"]);
++     let payload = serde_json::json!({"cwd": repo}).to_string();
++ 
++-    let output = run_hook(&dir, &payload, &dir.join("state"));
+++    let state_dir = dir.join("state");
+++    let reference = run_ref_hook(&repo, &payload, &state_dir);
+++    let output = run_hook(&repo, &payload, &state_dir);
++     let stdout = String::from_utf8_lossy(&output.stdout);
++-    let prefix = r#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""#;
+++    let prefix = "{\n  \"hookSpecificOutput\": {\n    \"hookEventName\": \"SessionStart\",\n    \"additionalContext\": \"";
+++    assert_eq!(reference.status.code(), Some(0));
++     assert_eq!(output.status.code(), Some(0));
+++    assert_eq!(output.stdout, reference.stdout, "hook output mismatch");
++     assert!(
++         stdout.starts_with(prefix),
++         "unexpected hook output: {stdout}"
++     );
++     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++     let context = json["hookSpecificOutput"]["additionalContext"]
++         .as_str()
++         .unwrap();
++     assert!(context.contains("Worktree drift"));
++     let _ = std::fs::remove_dir_all(&dir);
++ }
++ 
+++#[test]
+++fn invalid_state_dir_with_valid_stdin_is_silent_success() {
+++    let dir = scratch_dir();
+++    let payload = serde_json::json!({"cwd": dir}).to_string();
+++
+++    let output = run_hook(&dir, &payload, Path::new("/dev/null/jeeves-hook-state"));
+++
+++    assert_eq!(output.status.code(), Some(0));
+++    assert!(output.stdout.is_empty());
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++#[test]
+++fn linked_worktree_repo_mode_is_silent_when_audit_has_no_repo() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    git(&repo, &["checkout", "-q", "-b", "feature"]);
+++    std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+++    git(&repo, &["add", "."]);
+++    git(&repo, &["commit", "-q", "-m", "feature"]);
+++    git(&repo, &["checkout", "-q", "main"]);
+++
+++    let worktree = dir.join("linked-worktree");
+++    git(
+++        &repo,
+++        &[
+++            "worktree",
+++            "add",
+++            "-q",
+++            &worktree.to_string_lossy(),
+++            "feature",
+++        ],
+++    );
+++    let payload = serde_json::json!({"cwd": worktree}).to_string();
+++    let state_dir = dir.join("state");
+++    let reference = run_ref_hook(&worktree, &payload, &state_dir);
+++    let output = run_hook(&worktree, &payload, &state_dir);
+++
+++    assert_eq!(reference.status.code(), Some(0));
+++    assert_eq!(output.status.code(), Some(0));
+++    assert!(reference.stdout.is_empty());
+++    assert!(output.stdout.is_empty());
+++    assert_eq!(output.stdout, reference.stdout);
+++
+++    git(
+++        &repo,
+++        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+++    );
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
++ #[test]
++ fn empty_stdin_in_non_repo_is_silent_success() {
++     let dir = scratch_dir();
++     let output = run_hook(&dir, "", &dir.join("state"));
++ 
++     assert_eq!(output.status.code(), Some(0));
++     assert!(output.stdout.is_empty());
++     let _ = std::fs::remove_dir_all(&dir);
++ }
++diff --git a/tests/safety_invariants.rs b/tests/safety_invariants.rs
++index 52c02c8..a829c4a 100644
++--- a/tests/safety_invariants.rs
+++++ b/tests/safety_invariants.rs
++@@ -46,30 +46,106 @@ fn init_repo(dir: &Path) -> PathBuf {
++     commit(&repo, "base.txt", "base\n", "base");
++     repo
++ }
++ 
++ fn commit(repo: &Path, name: &str, contents: &str, message: &str) {
++     std::fs::write(repo.join(name), contents).unwrap();
++     git(repo, &["add", "."]);
++     git(repo, &["commit", "-q", "-m", message]);
++ }
++ 
+++fn commit_at(repo: &Path, name: &str, contents: &str, message: &str, date: &str) {
+++    std::fs::write(repo.join(name), contents).unwrap();
+++    git(repo, &["add", "."]);
+++    let output = Command::new("git")
+++        .current_dir(repo)
+++        .env("GIT_AUTHOR_DATE", date)
+++        .env("GIT_COMMITTER_DATE", date)
+++        .args(["commit", "-q", "-m", message])
+++        .output()
+++        .unwrap();
+++    assert!(
+++        output.status.success(),
+++        "git commit failed: {}",
+++        String::from_utf8_lossy(&output.stderr)
+++    );
+++}
+++
++ fn add_feature_worktree(dir: &Path, repo: &Path) -> PathBuf {
++     git(repo, &["checkout", "-q", "-b", "feature"]);
++     commit(repo, "feature.txt", "feature\n", "feature");
++     git(repo, &["checkout", "-q", "main"]);
++     let worktree = dir.join("feature-worktree");
++     let worktree_arg = worktree.to_string_lossy().into_owned();
++     git(repo, &["worktree", "add", "-q", &worktree_arg, "feature"]);
++     worktree
++ }
++ 
+++fn ref_archive_branch() -> PathBuf {
+++    Path::new(env!("CARGO_MANIFEST_DIR"))
+++        .join(".superpowers/crispy/rust-rewrite/ref/archive-branch.sh")
+++}
+++
+++struct ArchiveKnobs {
+++    inflight_secs: &'static str,
+++    archive_prefix: &'static str,
+++}
+++
+++fn apply_archive_env(cmd: &mut Command, knobs: &ArchiveKnobs, state_dir: &Path) {
+++    cmd.env("JEEVES_AUDIT_INFLIGHT_SECS", knobs.inflight_secs)
+++        .env("WORKTREE_AUDIT_INFLIGHT_SECS", knobs.inflight_secs)
+++        .env("JEEVES_AUDIT_ARCHIVE_PREFIX", knobs.archive_prefix)
+++        .env("WORKTREE_AUDIT_ARCHIVE_PREFIX", knobs.archive_prefix)
+++        .env("JEEVES_STATE_DIR", state_dir);
+++}
+++
+++fn run_ref_archive(
+++    repo: &Path,
+++    branches: &[&str],
+++    knobs: &ArchiveKnobs,
+++    state_dir: &Path,
+++) -> Output {
+++    let mut command = Command::new("bash");
+++    command.arg(ref_archive_branch()).arg(repo).args(branches);
+++    apply_archive_env(&mut command, knobs, state_dir);
+++    command.output().unwrap()
+++}
+++
+++fn run_rust_archive(
+++    repo: &Path,
+++    branches: &[&str],
+++    knobs: &ArchiveKnobs,
+++    state_dir: &Path,
+++) -> Output {
+++    let mut command = Command::new(env!("CARGO_BIN_EXE_jeeves"));
+++    command.arg("archive").arg(repo).args(branches);
+++    apply_archive_env(&mut command, knobs, state_dir);
+++    command.output().unwrap()
+++}
+++
+++fn deterministic_archive_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+++    let repo = dir.join("repo");
+++    std::fs::create_dir_all(&repo).unwrap();
+++    git(&repo, &["init", "-q", "-b", "main"]);
+++    git(&repo, &["config", "user.email", "test@example.com"]);
+++    git(&repo, &["config", "user.name", "Jeeves Test"]);
+++    let old = "2000-01-01T00:00:00Z";
+++    commit_at(&repo, "base.txt", "base\n", "base", old);
+++    git(&repo, &["checkout", "-q", "-b", "feature"]);
+++    commit_at(&repo, "feature.txt", "feature\n", "feature", old);
+++    git(&repo, &["checkout", "-q", "main"]);
+++    let worktree = dir.join("feature-worktree");
+++    let worktree_path = worktree.to_string_lossy().into_owned();
+++    git(&repo, &["worktree", "add", "-q", &worktree_path, "feature"]);
+++    (repo, worktree)
+++}
+++
++ fn run_jeeves(args: &[&str], state_dir: &Path, inflight_secs: &str) -> Output {
++     Command::new(env!("CARGO_BIN_EXE_jeeves"))
++         .args(args)
++         .env("JEEVES_STATE_DIR", state_dir)
++         .env("JEEVES_AUDIT_INFLIGHT_SECS", inflight_secs)
++         .env("WORKTREE_AUDIT_INFLIGHT_SECS", inflight_secs)
++         .output()
++         .unwrap()
++ }
++ 
++@@ -84,35 +160,139 @@ fn archive_tags_then_deletes_branch_and_worktree() {
++     let worktree = add_feature_worktree(&dir, &repo);
++     let tip = git(&repo, &["rev-parse", "refs/heads/feature"]);
++     let short_tip = git(&repo, &["rev-parse", "--short", "refs/heads/feature"]);
++     let repo_arg = repo.to_string_lossy().into_owned();
++ 
++     let output = run_jeeves(&["archive", &repo_arg, "feature"], &dir.join("state"), "0");
++ 
++     assert_eq!(output.status.code(), Some(0));
++     assert_eq!(
++         String::from_utf8_lossy(&output.stdout),
++-        format!("  archived feature -> archive/feature ({short_tip})\n")
+++        format!(
+++            "start: ok\nprepare: ok\ncommit: ok\n  archived feature -> archive/feature ({short_tip})\n"
+++        )
++     );
++     assert_eq!(git(&repo, &["rev-parse", "refs/tags/archive/feature"]), tip);
++     assert!(!git_success(
++         &repo,
++         &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
++     ));
++     assert!(!worktree.exists());
++ 
++     let oid = short_tip.as_bytes();
++     assert!((7..=40).contains(&oid.len()));
++     assert!(oid.iter().all(u8::is_ascii_hexdigit));
++     let _ = std::fs::remove_dir_all(&dir);
++ }
++ 
+++#[test]
+++fn archive_success_stdout_matches_reference() {
+++    let reference_dir = scratch_dir();
+++    let (reference_repo, reference_worktree) = deterministic_archive_fixture(&reference_dir);
+++    let rust_dir = scratch_dir();
+++    let (rust_repo, rust_worktree) = deterministic_archive_fixture(&rust_dir);
+++    let knobs = ArchiveKnobs {
+++        inflight_secs: "0",
+++        archive_prefix: "retained",
+++    };
+++    let reference_tip = git(&reference_repo, &["rev-parse", "refs/heads/feature"]);
+++    let short_tip = git(
+++        &reference_repo,
+++        &["rev-parse", "--short", "refs/heads/feature"],
+++    );
+++
+++    let reference = run_ref_archive(
+++        &reference_repo,
+++        &["feature"],
+++        &knobs,
+++        &reference_dir.join("state"),
+++    );
+++    let rust = run_rust_archive(&rust_repo, &["feature"], &knobs, &rust_dir.join("state"));
+++
+++    assert_eq!(reference.status.code(), Some(0));
+++    assert_eq!(
+++        rust.status.code(),
+++        Some(0),
+++        "rust archive failed: {}",
+++        stderr(&rust)
+++    );
+++    assert_eq!(rust.stdout, reference.stdout, "archive stdout mismatch");
+++    assert_eq!(
+++        String::from_utf8_lossy(&rust.stdout),
+++        format!(
+++            "start: ok\nprepare: ok\ncommit: ok\n  archived feature -> retained/feature ({short_tip})\n"
+++        )
+++    );
+++
+++    for (repo, worktree) in [
+++        (&reference_repo, &reference_worktree),
+++        (&rust_repo, &rust_worktree),
+++    ] {
+++        assert_eq!(
+++            git(repo, &["rev-parse", "refs/tags/retained/feature"]),
+++            reference_tip
+++        );
+++        assert!(!git_success(
+++            repo,
+++            &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
+++        ));
+++        assert!(!worktree.exists());
+++    }
+++
+++    let _ = std::fs::remove_dir_all(&reference_dir);
+++    let _ = std::fs::remove_dir_all(&rust_dir);
+++}
+++
+++#[test]
+++fn archive_missing_branch_skip_keeps_success_status() {
+++    let reference_dir = scratch_dir();
+++    let (reference_repo, reference_worktree) = deterministic_archive_fixture(&reference_dir);
+++    let rust_dir = scratch_dir();
+++    let (rust_repo, rust_worktree) = deterministic_archive_fixture(&rust_dir);
+++    let knobs = ArchiveKnobs {
+++        inflight_secs: "0",
+++        archive_prefix: "retained",
+++    };
+++
+++    let reference = run_ref_archive(
+++        &reference_repo,
+++        &["feature", "does-not-exist"],
+++        &knobs,
+++        &reference_dir.join("state"),
+++    );
+++    let rust = run_rust_archive(
+++        &rust_repo,
+++        &["feature", "does-not-exist"],
+++        &knobs,
+++        &rust_dir.join("state"),
+++    );
+++
+++    assert_eq!(reference.status.code(), Some(0));
+++    assert_eq!(rust.status.code(), Some(0));
+++    assert_eq!(rust.stdout, reference.stdout, "archive stdout mismatch");
+++    assert!(String::from_utf8_lossy(&reference.stderr).contains("skip does-not-exist"));
+++    assert!(stderr(&rust).contains("skip does-not-exist"));
+++    assert!(!git_success(
+++        &reference_repo,
+++        &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
+++    ));
+++    assert!(!git_success(
+++        &rust_repo,
+++        &["show-ref", "--verify", "--quiet", "refs/heads/feature"]
+++    ));
+++    assert!(!reference_worktree.exists());
+++    assert!(!rust_worktree.exists());
+++
+++    let _ = std::fs::remove_dir_all(&reference_dir);
+++    let _ = std::fs::remove_dir_all(&rust_dir);
+++}
+++
++ #[test]
++ fn strict_archive_refuses_dirty_worktree_without_tagging_or_removing() {
++     let dir = scratch_dir();
++     let repo = init_repo(&dir);
++     let worktree = add_feature_worktree(&dir, &repo);
++     std::fs::write(worktree.join("dirty.txt"), "uncommitted\n").unwrap();
++     let repo_arg = repo.to_string_lossy().into_owned();
++ 
++     let output = run_jeeves(
++         &["archive", "--strict", &repo_arg, "feature"],
+diff --git a/tests/audit_golden.rs b/tests/audit_golden.rs
+index d49f9eb..7116b52 100644
+--- a/tests/audit_golden.rs
++++ b/tests/audit_golden.rs
+@@ -430,33 +430,47 @@ fn all_audit_buckets_match_in_one_repo() {
+     let hands_path = hands_worktree.to_string_lossy().into_owned();
+     git(&repo, &["worktree", "add", "-q", &hands_path, "hands"]);
+     git(
+         &repo,
+         &["worktree", "lock", "--reason", "garbage lock", &hands_path],
+     );
+ 
+     git(&repo, &["checkout", "-q", "-b", "inflight"]);
+     git(&repo, &["checkout", "-q", "main"]);
+ 
++    // Git returns 1 for unrelated histories, so the reference classifies this
++    // as unmerged with UNKNOWN coverage; only merge-base errors above 1 reach
++    // the unknown-merge bucket.
++    git(&repo, &["checkout", "-q", "--orphan", "unrelated"]);
++    commit_at(&repo, "unrelated.txt", "unrelated\n", "unrelated", old);
++    git(&repo, &["checkout", "-q", "main"]);
++
++    git(&repo, &["worktree", "add", "-q", "../wtd"]);
++    let dangling_worktree = dir.join("wtd");
++    std::fs::remove_dir_all(&dangling_worktree).unwrap();
++
+     let knobs = Knobs {
+         inflight_secs: "7200",
+         archaeology_secs: "0",
+         content_merge_threshold: Some("95"),
+     };
+     assert_parity(&dir, &knobs);
+     let report = stdout_of(&run_rust(&dir, &knobs));
+     assert!(report.contains("  safe-to-clean (merged, clean):"));
+     assert!(report.contains("  needs-triage:"));
+     assert!(report.contains("  archaeology (older than 0m"));
+     assert!(report.contains("  likely-content-merged"));
+     assert!(report.contains("  hands-off"));
+-    assert!(report.contains("  (1 in flight, active within 2h — hidden)"));
++    assert!(report.contains("  dangling worktree registrations (git worktree prune is safe):"));
++    assert!(report.contains("    unrelated  [idle ") && report.contains(" — unmerged, UNKNOWN"));
++    assert!(report.contains(&format!("    {}", dangling_worktree.display())));
++    assert!(report.contains("  (2 in flight, active within 2h — hidden)"));
+ 
+     git(&repo, &["worktree", "unlock", &hands_path]);
+     git(&repo, &["worktree", "remove", "--force", &hands_path]);
+     git(&repo, &["worktree", "remove", "--force", &safe_path]);
+     git(&repo, &["worktree", "remove", "--force", &triage_path]);
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
+ #[test]
+ fn no_content_flag_matches_reference_before_and_after_root() {
