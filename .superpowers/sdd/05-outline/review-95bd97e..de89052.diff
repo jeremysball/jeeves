@@ -1,0 +1,930 @@
+# Review package: 95bd97e..de89052
+
+## Commits
+de89052 fix(coverage): resolve objects dir via --git-path for linked worktrees
+294f4f4 docs(sdd): ledger phase 2 round 1
+2af03f4 docs(sdd): phase 2 report and review package
+
+## Files changed
+ .superpowers/sdd/05-outline/progress.md            |   3 +
+ .../sdd/05-outline/review-57a9e11..95bd97e.diff    | 659 +++++++++++++++++++++
+ .superpowers/sdd/05-outline/task-2-report.md       |  54 ++
+ src/core/git.rs                                    |  26 +
+ src/worktrees/coverage.rs                          |  12 +-
+ tests/coverage_golden.rs                           |  39 ++
+ 6 files changed, 790 insertions(+), 3 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/05-outline/progress.md b/.superpowers/sdd/05-outline/progress.md
+index 0bf8819..2207a5f 100644
+--- a/.superpowers/sdd/05-outline/progress.md
++++ b/.superpowers/sdd/05-outline/progress.md
+@@ -1,10 +1,13 @@
+ # SDD ledger — plan: .superpowers/crispy/rust-rewrite/05-outline.md
+ 
+ Preflight scan: Phases 2..6 share src/worktrees/coverage.rs and src/orient/scan.rs; sequencing fixed by outline order (coverage before scan content pass). Phase 4/6 roots-file default change is read-compatible (legacy fallback). Phase 7 normalize vectors must be generated from Python BEFORE Phase 9 deletion — ordering constraint respected. No task-internal contradictions found.
+ 
+ Task 1: review round 1: spec ❌ (log_units drops interior empty fields — controller-verified vs shell; toon_table missing). Root cause: execution-error.
+ Task 1: fix round 1/5 dispatched (resumed session ses_fa4e9604, worktree jeeves-rust-fix1, oc_mti5plnk).
+ Task 1: minor (deferred): reviewer could not read sdd artifacts initially (untracked in worktree) — fixed by committing them.
+ Task 1: fix round 1/5 (2 addressed, 0 open; commits dbe7a93..776efa8)
+ Task 1: complete (commits fe4daad..776efa8, review clean after round 1)
+ Note: mise gate fails in sandbox on trusted-config symlink (RO state dir) - manual host verification + --force is the standing workaround this migration.
++Task 2: review round 1: spec fail - linked-worktree objects path (controller-reproduced: rust UNKNOWN merge-conflict vs ref SCORED 0 on /tmp/covchk/wt). Root cause: execution-error.
++Task 2: minor (deferred): main.rs bad-dir-vs-count error ordering differs from ref cd semantics (same exit-2 family).
++Task 2: fix round 1/5 dispatched (oc_mti7h3iq, worktree jeeves-rust-fix2).
+diff --git a/.superpowers/sdd/05-outline/review-57a9e11..95bd97e.diff b/.superpowers/sdd/05-outline/review-57a9e11..95bd97e.diff
+new file mode 100644
+index 0000000..4d8bc8c
+--- /dev/null
++++ b/.superpowers/sdd/05-outline/review-57a9e11..95bd97e.diff
+@@ -0,0 +1,659 @@
++# Review package: 57a9e11..95bd97e
++
++## Commits
++95bd97e feat(worktrees): add coverage scorer with golden parity vs reference
++
++## Files changed
++ src/core/git.rs           |   5 +
++ src/main.rs               |  72 +++++++++++-
++ src/worktrees/coverage.rs | 191 ++++++++++++++++++++++++++++++
++ src/worktrees/mod.rs      |   1 +
++ tests/coverage_golden.rs  | 292 ++++++++++++++++++++++++++++++++++++++++++++++
++ 5 files changed, 559 insertions(+), 2 deletions(-)
++
++## Diff
++diff --git a/src/core/git.rs b/src/core/git.rs
++index 580b253..680584d 100644
++--- a/src/core/git.rs
+++++ b/src/core/git.rs
++@@ -85,20 +85,25 @@ pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<Option<String>, CliEr
++     let count = all.stdout.iter().filter(|&&b| b == b'\n').count();
++     if count != 1 {
++         return Err(CliError::refusal(format!(
++             "criss-cross history: {count} merge bases between {a} and {b}"
++         )));
++     }
++     let base = stdout(repo, &["merge-base", a, b])?;
++     Ok(Some(base.trim().to_string()))
++ }
++ 
+++/// `git rev-parse <ref>` (ref/lib.sh:205). Errors -> refusal.
+++pub fn rev_parse(repo: &Path, r: &str) -> Result<String, CliError> {
+++    Ok(stdout(repo, &["rev-parse", r])?.trim().to_string())
+++}
+++
++ /// `(path, sha, branch)` for every worktree, parsed line-by-line from
++ /// `git worktree list --porcelain` so paths containing spaces survive intact
++ /// (mirrors ref/lib.sh:81-93). The branch is the full ref name (e.g.
++ /// `refs/heads/main`) or empty for a detached HEAD. Records are terminated by
++ /// blank lines; every non-blank line (including a `branch` line) belongs to
++ /// the most recent `worktree` line, so a path that merely contains the word
++ /// "worktree" cannot corrupt the parse.
++ pub fn worktree_list(repo: &Path) -> Result<Vec<(String, String, String)>, CliError> {
++     let out = stdout(repo, &["worktree", "list", "--porcelain"])?;
++     let mut result = Vec::new();
++diff --git a/src/main.rs b/src/main.rs
++index 5451a5a..cba2d98 100644
++--- a/src/main.rs
+++++ b/src/main.rs
++@@ -1,38 +1,106 @@
++ // Phase 1 ships the shared core modules but no commands call them yet; the
++ // call sites land in later phases. Allow dead_code until then (the clippy
++ // gate runs with -D warnings, so this must be explicit, not incidental).
++ #![allow(dead_code)]
++ 
++ use std::process::ExitCode;
++ 
++ use clap::{Parser, Subcommand};
++ 
++ mod core;
+++mod worktrees;
++ 
++ #[derive(Parser)]
++ #[command(
++     name = "jeeves",
++     version,
++     about = "Jeeves - worktree and digest automation"
++ )]
++ struct Cli {
++     #[command(subcommand)]
++     command: Option<Command>,
++ }
++ 
++ #[derive(Subcommand)]
++ enum Command {
++     /// Print the jeeves version and exit
++     Version,
++ }
++ 
++ fn main() -> ExitCode {
++-    // Phase 1 ships exactly one command: version. Bare invocation and
++-    // `-V/--version` (handled by clap before we get here) behave the same.
+++    // `jeeves coverage` parses its own args: the verdict contract publishes
+++    // exact error strings on stdout (mirroring ref/coverage-score:43-69),
+++    // which clap's error rendering would not reproduce.
+++    if std::env::args().nth(1).as_deref() == Some("coverage") {
+++        return run_coverage();
+++    }
++     match Cli::parse().command {
++         None | Some(Command::Version) => {
++             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
++             ExitCode::SUCCESS
++         }
++     }
++ }
+++
+++fn run_coverage() -> ExitCode {
+++    let args: Vec<String> = std::env::args().skip(2).collect();
+++
+++    // --help as the first argument prints the usage text and exits 0
+++    // (ref/coverage-score:43-46).
+++    if args.first().map(String::as_str) == Some("--help") {
+++        print!("{}", COVERAGE_USAGE);
+++        return ExitCode::SUCCESS;
+++    }
+++
+++    // Any flag anywhere is an unknown flag, checked before the count
+++    // (ref/coverage-score:48-55).
+++    for arg in &args {
+++        if arg.starts_with('-') {
+++            println!("error: unknown flag {arg}");
+++            return ExitCode::from(2);
+++        }
+++    }
+++
+++    // Exactly three positionals (ref/coverage-score:56-59).
+++    if args.len() != 3 {
+++        println!("error: usage: coverage-score <repo> <base> <branch>");
+++        return ExitCode::from(2);
+++    }
+++
+++    // Resolve <repo> to an absolute path; a relative path is resolved against
+++    // the caller's cwd. The cd's own error is a usage error reported on
+++    // stdout (ref/coverage-score:65-69).
+++    let repo = match std::fs::canonicalize(&args[0]) {
+++        Ok(p) if p.is_dir() => p,
+++        _ => {
+++            println!("error: not a directory: {}", args[0]);
+++            return ExitCode::from(2);
+++        }
+++    };
+++
+++    match worktrees::coverage::coverage_score(&repo, &args[1], &args[2]) {
+++        Ok(verdict) => {
+++            println!("{verdict}");
+++            ExitCode::SUCCESS
+++        }
+++        Err(e) => {
+++            eprintln!("{e}");
+++            ExitCode::from(e.exit_code())
+++        }
+++    }
+++}
+++
+++const COVERAGE_USAGE: &str = "\
+++usage: coverage-score <repo> <base> <branch>
+++
+++Scores how much of <branch>'s work is already in <base>, printing one line:
+++  SCORED <0-100>   - percent of the branch's text lines already in base.
+++  UNSCORED <why>   - binary/mode-only row, O==0, or empty patch.
+++  UNKNOWN <why>    - criss-cross history, merge conflict, merge-tree error.
+++Exit 0 on every successful run (including UNSCORED/UNKNOWN verdicts);
+++exit 2 on usage error.
+++
+++examples:
+++  coverage-score \"$PWD\" main feature
+++  coverage-score /path/to/repo origin/main topic-branch
+++";
++diff --git a/src/worktrees/coverage.rs b/src/worktrees/coverage.rs
++new file mode 100644
++index 0000000..3730b03
++--- /dev/null
+++++ b/src/worktrees/coverage.rs
++@@ -0,0 +1,191 @@
+++//! Content-coverage scorer: how much of a branch's net text lines are already
+++//! in base, mirroring ref/lib.sh's `coverage_score` (lib.sh:180-248) so the
+++//! verdict strings are byte-for-byte identical to the reference CLI.
+++//!
+++//! Verdict contract (single line on stdout, exit 0):
+++//!   SCORED <0-100>   - percent of the branch's net text lines in base.
+++//!   UNSCORED <why>   - binary/mode-only row, O==0, or empty patch.
+++//!   UNKNOWN <why>    - criss-cross history, merge conflict, merge-tree error.
+++
+++use std::path::Path;
+++use std::process::Command;
+++
+++use crate::core::error::CliError;
+++use crate::core::git;
+++
+++/// Sums net text lines from numstat input (added-minus-deleted), mirroring
+++/// ref/lib.sh:164-174. Returns `Ok(net)` for a normal text diff, or the
+++/// documented `UNSCORED <why>` verdict when a binary (`- -`) or mode-only
+++/// (`0 0`) row appears. Rows are read TAB-aware: numstat emits
+++/// `add<TAB>del<TAB>path`, so the pathname must never be parsed as a count.
+++fn numstat_net(input: &str) -> Result<i64, String> {
+++    let mut total: i64 = 0;
+++    for row in input.lines() {
+++        if row.is_empty() {
+++            continue;
+++        }
+++        let mut fields = row.split('\t');
+++        let a = fields.next().unwrap_or("");
+++        let d = fields.next().unwrap_or("");
+++        if a == "-" && d == "-" {
+++            return Err("UNSCORED binary".to_string());
+++        }
+++        if a == "0" && d == "0" {
+++            return Err("UNSCORED mode-only".to_string());
+++        }
+++        let a: i64 = a.parse().unwrap_or(0);
+++        let d: i64 = d.parse().unwrap_or(0);
+++        total += a - d;
+++    }
+++    Ok(total)
+++}
+++
+++/// Runs `git diff --numstat` between two refs, mirroring the reference's
+++/// `git -C repo diff --no-ext-diff --no-textconv --numstat --no-renames`
+++/// (lib.sh:186). Returns `Ok(None)` when git exits nonzero (bad ref, ...),
+++/// which the reference maps to `UNKNOWN branch-diff-failed`.
+++fn numstat_diff(repo: &Path, a: &str, b: &str) -> Result<Option<String>, CliError> {
+++    let out = Command::new("git")
+++        .current_dir(repo)
+++        .args([
+++            "diff",
+++            "--no-ext-diff",
+++            "--no-textconv",
+++            "--numstat",
+++            "--no-renames",
+++            a,
+++            b,
+++        ])
+++        .output()
+++        .map_err(|e| CliError::refusal(format!("git diff failed: {e}")))?;
+++    if !out.status.success() {
+++        return Ok(None);
+++    }
+++    Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+++}
+++
+++/// Scores how much of `<branch>`'s work is already in `<base>` and returns
+++/// the verdict line, mirroring ref/lib.sh:180-248.
+++pub fn coverage_score(repo: &Path, base: &str, branch: &str) -> Result<String, CliError> {
+++    // Singular merge base; >1 base (criss-cross history) is an error, and no
+++    // base at all is UNKNOWN no-merge-base (lib.sh:182-183). The reference
+++    // maps every merge-base failure to the same verdict, so any Err here
+++    // (criss-cross, unreadable repo, ...) is UNKNOWN no-merge-base too.
+++    let mb = match git::merge_base(repo, base, branch) {
+++        Ok(Some(mb)) => mb,
+++        Ok(None) | Err(_) => return Ok("UNKNOWN no-merge-base".to_string()),
+++    };
+++
+++    // O: net text lines on the branch from its merge base (lib.sh:186-195).
+++    let out = match numstat_diff(repo, &mb, branch)? {
+++        Some(out) => out,
+++        None => return Ok("UNKNOWN branch-diff-failed".to_string()),
+++    };
+++    let o = match numstat_net(&out) {
+++        Ok(o) => o,
+++        Err(verdict) => return Ok(verdict),
+++    };
+++    if o <= 0 {
+++        return Ok("UNSCORED no-text-rows".to_string());
+++    }
+++
+++    // Simulated merge + residual diff in ONE subprocess so the synthesized
+++    // tree stays reachable (lib.sh:201-231). merge-tree rc 1 = conflict,
+++    // >1 = error -> UNKNOWN. An empty tree with rc 0 must NOT fail open to
+++    // SCORED 100: the reference exits 2 from the subshell in that case,
+++    // which surfaces as rc 2 -> UNKNOWN merge-tree-error (lib.sh:216-221).
+++    let obj = tempfile_dir()?;
+++    let alt = git::rev_parse_abs_git_dir(repo)?;
+++    let alt = format!("{alt}/objects");
+++    let base_oid = git::rev_parse(repo, base)?;
+++    let residual = merge_tree_residual(repo, &obj, &alt, base, branch, &base_oid)?;
+++    let _ = std::fs::remove_dir_all(&obj);
+++
+++    let (mtrc, rc, residual) = residual;
+++    if mtrc == 1 {
+++        return Ok("UNKNOWN merge-conflict".to_string());
+++    }
+++    if mtrc > 1 || rc > 1 {
+++        return Ok("UNKNOWN merge-tree-error".to_string());
+++    }
+++
+++    let r = match numstat_net(&residual) {
+++        Ok(r) => r,
+++        Err(verdict) => return Ok(verdict),
+++    };
+++
+++    // R is a NET line count, so it goes negative when the branch's own
+++    // deletions are missing from base. Subtracting a negative R would inflate
+++    // the score past O - a branch whose deletion never shipped must not score
+++    // >100. Score against its magnitude and clamp to 0-100 (lib.sh:238-247).
+++    let abs_r = r.abs();
+++    let num = o - abs_r;
+++    let num = num.max(0);
+++    let pct = num * 100 / o;
+++    let pct = pct.min(100);
+++    Ok(format!("SCORED {pct}"))
+++}
+++
+++/// `mktemp -d` equivalent (lib.sh:202). Failure -> `UNKNOWN no-temp-dir`.
+++fn tempfile_dir() -> Result<std::path::PathBuf, CliError> {
+++    let dir = std::env::temp_dir().join(format!(
+++        "jeeves-coverage-{}-{}",
+++        std::process::id(),
+++        std::time::SystemTime::now()
+++            .duration_since(std::time::UNIX_EPOCH)
+++            .map(|d| d.as_nanos())
+++            .unwrap_or(0)
+++    ));
+++    std::fs::create_dir_all(&dir).map_err(|e| CliError::refusal(format!("mktemp failed: {e}")))?;
+++    Ok(dir)
+++}
+++
+++/// Runs merge-tree with the object dir wired to a temp dir backed by the
+++/// repo's object store, then diffs the synthesized tree against base
+++/// (lib.sh:211-224). Returns `(merge_tree_rc, diff_rc, residual_output)`.
+++fn merge_tree_residual(
+++    repo: &Path,
+++    obj: &Path,
+++    alt: &str,
+++    base: &str,
+++    branch: &str,
+++    base_oid: &str,
+++) -> Result<(i32, i32, String), CliError> {
+++    let obj = obj.to_string_lossy().into_owned();
+++    let tree = Command::new("git")
+++        .current_dir(repo)
+++        .env("GIT_OBJECT_DIRECTORY", &obj)
+++        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt)
+++        .args(["merge-tree", "--write-tree", base, branch])
+++        .output()
+++        .map_err(|e| CliError::refusal(format!("git merge-tree failed: {e}")))?;
+++    let mtrc = tree.status.code().unwrap_or(-1);
+++    let tree_out = String::from_utf8_lossy(&tree.stdout).into_owned();
+++    let tree_oid = tree_out.lines().next().unwrap_or("").trim().to_string();
+++
+++    // Empty tree with rc 0 must NOT fall through: the reference exits 2 from
+++    // the subshell, which surfaces as rc 2 -> UNKNOWN merge-tree-error
+++    // (lib.sh:216-221).
+++    if mtrc != 0 || tree_oid.is_empty() {
+++        let rc = if mtrc != 0 { mtrc } else { 2 };
+++        return Ok((rc, 0, String::new()));
+++    }
+++
+++    let diff = Command::new("git")
+++        .current_dir(repo)
+++        .env("GIT_OBJECT_DIRECTORY", &obj)
+++        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt)
+++        .args([
+++            "diff",
+++            "--no-ext-diff",
+++            "--no-textconv",
+++            "--numstat",
+++            "--no-renames",
+++            base_oid,
+++            &tree_oid,
+++        ])
+++        .output()
+++        .map_err(|e| CliError::refusal(format!("git diff failed: {e}")))?;
+++    let rc = diff.status.code().unwrap_or(-1);
+++    Ok((mtrc, rc, String::from_utf8_lossy(&diff.stdout).into_owned()))
+++}
++diff --git a/src/worktrees/mod.rs b/src/worktrees/mod.rs
++new file mode 100644
++index 0000000..56152a1
++--- /dev/null
+++++ b/src/worktrees/mod.rs
++@@ -0,0 +1 @@
+++pub mod coverage;
++diff --git a/tests/coverage_golden.rs b/tests/coverage_golden.rs
++new file mode 100644
++index 0000000..f080aad
++--- /dev/null
+++++ b/tests/coverage_golden.rs
++@@ -0,0 +1,292 @@
+++//! Golden parity: `jeeves coverage` must reproduce ref/coverage-score
+++//! verdict-for-verdict on fixture repos. The reference is spawned at test
+++//! time (AUDIT_WORKTREES_LIB pointed at ref/lib.sh), so the expected output
+++//! is generated, never hardcoded.
+++
+++use std::path::{Path, PathBuf};
+++use std::process::{Command, Output};
+++use std::sync::atomic::{AtomicU64, Ordering};
+++
+++static COUNTER: AtomicU64 = AtomicU64::new(0);
+++
+++fn scratch_dir() -> PathBuf {
+++    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+++    let d = std::env::temp_dir().join(format!("jeeves-cov-{}-{n}", std::process::id()));
+++    let _ = std::fs::remove_dir_all(&d);
+++    std::fs::create_dir_all(&d).unwrap();
+++    d
+++}
+++
+++fn git(repo: &Path, args: &[&str]) -> String {
+++    let out = Command::new("git")
+++        .current_dir(repo)
+++        .args(args)
+++        .output()
+++        .unwrap();
+++    assert!(
+++        out.status.success(),
+++        "git {:?} failed: {}",
+++        args,
+++        String::from_utf8_lossy(&out.stderr)
+++    );
+++    String::from_utf8_lossy(&out.stdout).trim().to_string()
+++}
+++
+++fn init_repo(dir: &Path) -> PathBuf {
+++    let repo = dir.join("repo");
+++    std::fs::create_dir_all(&repo).unwrap();
+++    git(&repo, &["init", "-q", "-b", "main"]);
+++    git(&repo, &["config", "user.email", "t@t"]);
+++    git(&repo, &["config", "user.name", "t"]);
+++    repo
+++}
+++
+++fn commit(repo: &Path, fname: &str, content: &str, msg: &str) {
+++    std::fs::write(repo.join(fname), content).unwrap();
+++    git(repo, &["add", "."]);
+++    git(repo, &["commit", "-qm", msg]);
+++}
+++
+++/// The reference CLI, resolved from CARGO_MANIFEST_DIR (the sandbox cannot
+++/// hardcode an absolute fallback path).
+++fn ref_coverage_score() -> PathBuf {
+++    Path::new(env!("CARGO_MANIFEST_DIR"))
+++        .join(".superpowers/crispy/rust-rewrite/ref/coverage-score")
+++}
+++
+++fn ref_lib() -> PathBuf {
+++    Path::new(env!("CARGO_MANIFEST_DIR")).join(".superpowers/crispy/rust-rewrite/ref/lib.sh")
+++}
+++
+++fn run_ref(repo: &Path, base: &str, branch: &str) -> Output {
+++    Command::new("bash")
+++        .arg(ref_coverage_score())
+++        .arg(repo)
+++        .arg(base)
+++        .arg(branch)
+++        .env("AUDIT_WORKTREES_LIB", ref_lib())
+++        .output()
+++        .unwrap()
+++}
+++
+++fn run_rust(repo: &Path, base: &str, branch: &str) -> Output {
+++    Command::new(env!("CARGO_BIN_EXE_jeeves"))
+++        .arg("coverage")
+++        .arg(repo)
+++        .arg(base)
+++        .arg(branch)
+++        .output()
+++        .unwrap()
+++}
+++
+++fn stdout_of(out: &Output) -> String {
+++    String::from_utf8_lossy(&out.stdout).trim().to_string()
+++}
+++
+++/// The heart of the phase: the Rust verdict string must equal the reference
+++/// stdout, and both must exit 0.
+++fn assert_parity(repo: &Path, base: &str, branch: &str) {
+++    let reference = run_ref(repo, base, branch);
+++    let rust = run_rust(repo, base, branch);
+++    assert_eq!(
+++        reference.status.code(),
+++        Some(0),
+++        "reference exited nonzero: {}",
+++        String::from_utf8_lossy(&reference.stderr)
+++    );
+++    assert_eq!(
+++        rust.status.code(),
+++        Some(0),
+++        "rust exited nonzero: {}",
+++        String::from_utf8_lossy(&rust.stderr)
+++    );
+++    assert_eq!(
+++        stdout_of(&rust),
+++        stdout_of(&reference),
+++        "verdict mismatch for {base}..{branch}"
+++    );
+++}
+++
+++/// (a) squash-merged onto an advanced base: SCORED 100 while
+++/// merge-base --is-ancestor says false.
+++#[test]
+++fn squash_merged_onto_advanced_base_scores_100() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "a.txt", "a\n", "init");
+++    git(&repo, &["checkout", "-q", "-b", "feature"]);
+++    commit(&repo, "feat.txt", "feature work\n", "add feat");
+++    git(&repo, &["checkout", "-q", "main"]);
+++    commit(&repo, "b.txt", "b\n", "unrelated main commit");
+++    git(&repo, &["merge", "-q", "--squash", "feature"]);
+++    git(&repo, &["commit", "-qm", "squash: add feat (#1)"]);
+++
+++    let branch_sha = git(&repo, &["rev-parse", "feature"]);
+++    let ancestor = Command::new("git")
+++        .current_dir(&repo)
+++        .args(["merge-base", "--is-ancestor", &branch_sha, "main"])
+++        .status()
+++        .unwrap();
+++    assert!(!ancestor.success(), "ancestry must say false on this shape");
+++
+++    assert_parity(&repo, "main", "feature");
+++    assert_eq!(stdout_of(&run_rust(&repo, "main", "feature")), "SCORED 100");
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++/// (b) genuinely unmerged feature branch: low SCORED, asserted by parity with
+++/// the reference (never hardcoded).
+++#[test]
+++fn genuinely_unmerged_branch_scores_low() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "a.txt", "a\n", "init");
+++    git(&repo, &["checkout", "-q", "-b", "feature"]);
+++    let mut content = String::new();
+++    for i in 0..20 {
+++        content.push_str(&format!("line {i}\n"));
+++    }
+++    commit(&repo, "open.txt", &content, "real unshipped work");
+++    git(&repo, &["checkout", "-q", "main"]);
+++
+++    assert_parity(&repo, "main", "feature");
+++    let verdict = stdout_of(&run_rust(&repo, "main", "feature"));
+++    assert!(
+++        verdict.starts_with("SCORED "),
+++        "expected SCORED, got {verdict}"
+++    );
+++    let score: i64 = verdict["SCORED ".len()..].parse().unwrap();
+++    assert!(score < 50, "unmerged work must score low, got {verdict}");
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++/// (c) empty patch branch: UNSCORED no-text-rows.
+++#[test]
+++fn empty_patch_is_unscored_no_text_rows() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "a.txt", "a\n", "init");
+++    git(&repo, &["checkout", "-q", "-b", "feature"]);
+++    git(&repo, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+++
+++    assert_parity(&repo, "main", "feature");
+++    assert_eq!(
+++        stdout_of(&run_rust(&repo, "main", "feature")),
+++        "UNSCORED no-text-rows"
+++    );
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++/// (d) binary file added: UNSCORED binary.
+++#[test]
+++fn binary_file_is_unscored_binary() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "a.txt", "a\n", "init");
+++    git(&repo, &["checkout", "-q", "-b", "feature"]);
+++    std::fs::write(repo.join("blob.bin"), [0x00, 0x01, 0x02, 0xff]).unwrap();
+++    git(&repo, &["add", "."]);
+++    git(&repo, &["commit", "-qm", "binary"]);
+++
+++    assert_parity(&repo, "main", "feature");
+++    assert_eq!(
+++        stdout_of(&run_rust(&repo, "main", "feature")),
+++        "UNSCORED binary"
+++    );
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++/// (e) chmod-only change: UNSCORED mode-only.
+++#[test]
+++fn chmod_only_is_unscored_mode_only() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "a.txt", "a\n", "init");
+++    git(&repo, &["checkout", "-q", "-b", "feature"]);
+++    let mut perms = std::fs::metadata(repo.join("a.txt")).unwrap().permissions();
+++    use std::os::unix::fs::PermissionsExt;
+++    perms.set_mode(perms.mode() | 0o111);
+++    std::fs::set_permissions(repo.join("a.txt"), perms).unwrap();
+++    git(&repo, &["add", "."]);
+++    git(&repo, &["commit", "-qm", "chmod"]);
+++
+++    assert_parity(&repo, "main", "feature");
+++    assert_eq!(
+++        stdout_of(&run_rust(&repo, "main", "feature")),
+++        "UNSCORED mode-only"
+++    );
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++/// (f) unrelated history: UNKNOWN no-merge-base.
+++#[test]
+++fn unrelated_history_is_unknown_no_merge_base() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "a.txt", "a\n", "init");
+++    git(&repo, &["checkout", "-q", "--orphan", "other"]);
+++    commit(&repo, "b.txt", "b\n", "other");
+++
+++    assert_parity(&repo, "main", "other");
+++    assert_eq!(
+++        stdout_of(&run_rust(&repo, "main", "other")),
+++        "UNKNOWN no-merge-base"
+++    );
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++/// (g) conflicting merge: UNKNOWN merge-conflict. Both sides add a line at
+++/// the same position so O > 0 and merge-tree actually conflicts.
+++#[test]
+++fn conflicting_merge_is_unknown_merge_conflict() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "a.txt", "one\n", "init");
+++    git(&repo, &["checkout", "-q", "-b", "feature"]);
+++    commit(&repo, "a.txt", "one\nfeature\n", "feature change");
+++    git(&repo, &["checkout", "-q", "main"]);
+++    commit(&repo, "a.txt", "one\nmain\n", "main change");
+++
+++    assert_parity(&repo, "main", "feature");
+++    assert_eq!(
+++        stdout_of(&run_rust(&repo, "main", "feature")),
+++        "UNKNOWN merge-conflict"
+++    );
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+++
+++/// Usage errors mirror ref/coverage-score: exact strings on stdout, exit 2.
+++#[test]
+++fn usage_errors_match_reference() {
+++    let dir = scratch_dir();
+++    let repo = init_repo(&dir);
+++    commit(&repo, "a.txt", "a\n", "init");
+++
+++    let bin = env!("CARGO_BIN_EXE_jeeves");
+++
+++    let out = Command::new(bin)
+++        .args(["coverage", "--bogus", "x", "y", "z"])
+++        .output()
+++        .unwrap();
+++    assert_eq!(out.status.code(), Some(2));
+++    assert_eq!(stdout_of(&out), "error: unknown flag --bogus");
+++
+++    let out = Command::new(bin)
+++        .args(["coverage", &repo.to_string_lossy(), "main"])
+++        .output()
+++        .unwrap();
+++    assert_eq!(out.status.code(), Some(2));
+++    assert_eq!(
+++        stdout_of(&out),
+++        "error: usage: coverage-score <repo> <base> <branch>"
+++    );
+++
+++    let out = Command::new(bin)
+++        .args(["coverage", "/nonexistent", "main", "feature"])
+++        .output()
+++        .unwrap();
+++    assert_eq!(out.status.code(), Some(2));
+++    assert_eq!(stdout_of(&out), "error: not a directory: /nonexistent");
+++
+++    let _ = std::fs::remove_dir_all(&dir);
+++}
+diff --git a/.superpowers/sdd/05-outline/task-2-report.md b/.superpowers/sdd/05-outline/task-2-report.md
+new file mode 100644
+index 0000000..bb983cb
+--- /dev/null
++++ b/.superpowers/sdd/05-outline/task-2-report.md
+@@ -0,0 +1,54 @@
++"# Task 2 Report — `jeeves coverage` (three-state scorer)
++
++Commit: `4717836 feat(worktrees): add coverage scorer with golden parity vs reference`
++
++## Fixture verdicts (rust vs reference, both quoted)
++
++| # | Fixture | Rust verdict | Reference verdict | Match |
++|---|---------|--------------|-------------------|-------|
++| a | squash-merged-onto-advanced-base | `"SCORED 100"` | `"SCORED 100"` | yes |
++| b | genuinely unmerged feature branch | `"SCORED 0"` | `"SCORED 0"` | yes |
++| c | empty patch branch | `"UNSCORED no-text-rows"` | `"UNSCORED no-text-rows"` | yes |
++| d | binary file added | `"UNSCORED binary"` | `"UNSCORED binary"` | yes |
++| e | chmod-only | `"UNSCORED mode-only"` | `"UNSCORED mode-only"` | yes |
++| f | unrelated history | `"UNKNOWN no-merge-base"` | `"UNKNOWN no-merge-base"` | yes |
++| g | conflicting merge | `"UNKNOWN merge-conflict"` | `"UNKNOWN merge-conflict"` | yes |
++
++Bonus fixtures from the brief (verified manually, not in the golden suite):
++- criss-cross history: rust `"UNKNOWN no-merge-base"` == ref `"UNKNOWN no-merge-base"`
++- negative-residual clamp: rust `"SCORED 88"` == ref `"SCORED 88"` (a branch whose deletion never shipped must not score >100)
++
++Usage errors (stdout, exit 2), all matching ref/coverage-score wording:
++- `error: unknown flag --bogus`
++- `error: usage: coverage-score <repo> <base> <branch>` (legacy binary name in the usage string, as published)
++- `error: not a directory: /nonexistent`
++
++## Implementation notes
++
++- `src/worktrees/coverage.rs` — port of `coverage_score` + `numstat_net` + merge-base use from ref/lib.sh:149-248. Verdict strings are exact; the empty-merge-tree-with-rc-0 guard (lib.sh:216-221) is replicated: an empty tree exits the subshell with rc 2, surfacing as `UNKNOWN merge-tree-error` instead of failing open to `SCORED 100`. R negative uses abs (lib.sh:244-246). Criss-cross (>1 merge base) maps to `UNKNOWN no-merge-base` exactly as the reference's `merge_base ||` does (lib.sh:182).
++- `src/core/git.rs` — added `rev_parse` (mirrors lib.sh:205).
++- `src/main.rs` — `jeeves coverage` parses its own args (clap's error rendering would not reproduce the published strings): `--help` -> usage exit 0, any `-*` -> `error: unknown flag <x>` exit 2, count != 3 -> usage error exit 2, non-directory -> `error: not a directory: <x>` exit 2. All verdicts exit 0.
++- `tests/coverage_golden.rs` — 7 fixture repos built in tempfile (local user.email/name set), each asserting the Rust verdict string equals the reference stdout. The reference is spawned at test time: `bash .superpowers/crispy/rust-rewrite/ref/coverage-score <repo> <base> <branch>` with `AUDIT_WORKTREES_LIB` resolved from `CARGO_MANIFEST_DIR` (no hardcoded absolute path). Plus a usage-errors test (3 assertions).
++
++## Command outputs
++
++`mise run check-rust` (env overrides for the sandbox's read-only state dirs:
++`RUSTUP_HOME=/tmp/opencode/rustup CARGO_HOME=/tmp/opencode/cargo MISE_STATE_DIR=/tmp/opencode/mise-state MISE_CACHE_DIR=/tmp/opencode/mise-cache`):
++
++```
++[lint] $ cargo clippy --all-targets -- -D warnings
++test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
++test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
++rc=0
++```
++
++- `cargo fmt --check`: clean (one formatting fix applied via `cargo fmt` before the final run).
++- `cargo clippy --all-targets -- -D warnings`: clean.
++- `cargo test`: 53 unit + 8 golden = 61 passed, 0 failed.
++
++Note: `mise run check-rust` fails out of the box in this sandbox because
++`/home/jeremy/.local/state/mise` and `/home/jeremy/.rustup` are read-only
++mounts; the env overrides above redirect mise's state/cache and the rustup
++toolchain to `/tmp/opencode`, after which the declared check command runs
++unmodified and passes.
++"
+diff --git a/src/core/git.rs b/src/core/git.rs
+index 680584d..2029b2e 100644
+--- a/src/core/git.rs
++++ b/src/core/git.rs
+@@ -85,20 +85,46 @@ pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<Option<String>, CliEr
+     let count = all.stdout.iter().filter(|&&b| b == b'\n').count();
+     if count != 1 {
+         return Err(CliError::refusal(format!(
+             "criss-cross history: {count} merge bases between {a} and {b}"
+         )));
+     }
+     let base = stdout(repo, &["merge-base", a, b])?;
+     Ok(Some(base.trim().to_string()))
+ }
+ 
++/// `git rev-parse --path-format=absolute --git-path objects`
++/// (ref/lib.sh:203). `Ok(None)` when git fails or prints nothing, mirroring
++/// the reference's `2>/dev/null` read + empty check -> `UNKNOWN no-object-dir`
++/// (ref/lib.sh:204). Unlike `--absolute-git-dir`, this resolves the actual
++/// object store even from a linked worktree (whose per-worktree gitdir has no
++/// `objects/` directory).
++pub fn objects_dir(repo: &Path) -> Result<Option<String>, CliError> {
++    let out = run(
++        repo,
++        &[
++            "rev-parse",
++            "--path-format=absolute",
++            "--git-path",
++            "objects",
++        ],
++    )?;
++    if !out.status.success() {
++        return Ok(None);
++    }
++    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
++    if s.is_empty() {
++        return Ok(None);
++    }
++    Ok(Some(s))
++}
++
+ /// `git rev-parse <ref>` (ref/lib.sh:205). Errors -> refusal.
+ pub fn rev_parse(repo: &Path, r: &str) -> Result<String, CliError> {
+     Ok(stdout(repo, &["rev-parse", r])?.trim().to_string())
+ }
+ 
+ /// `(path, sha, branch)` for every worktree, parsed line-by-line from
+ /// `git worktree list --porcelain` so paths containing spaces survive intact
+ /// (mirrors ref/lib.sh:81-93). The branch is the full ref name (e.g.
+ /// `refs/heads/main`) or empty for a detached HEAD. Records are terminated by
+ /// blank lines; every non-blank line (including a `branch` line) belongs to
+diff --git a/src/worktrees/coverage.rs b/src/worktrees/coverage.rs
+index 3730b03..a3ac8fe 100644
+--- a/src/worktrees/coverage.rs
++++ b/src/worktrees/coverage.rs
+@@ -1,18 +1,19 @@
+ //! Content-coverage scorer: how much of a branch's net text lines are already
+ //! in base, mirroring ref/lib.sh's `coverage_score` (lib.sh:180-248) so the
+ //! verdict strings are byte-for-byte identical to the reference CLI.
+ //!
+ //! Verdict contract (single line on stdout, exit 0):
+ //!   SCORED <0-100>   - percent of the branch's net text lines in base.
+ //!   UNSCORED <why>   - binary/mode-only row, O==0, or empty patch.
+-//!   UNKNOWN <why>    - criss-cross history, merge conflict, merge-tree error.
++//!   UNKNOWN <why>    - criss-cross history, no object dir, merge conflict,
++//!                     or merge-tree error.
+ 
+ use std::path::Path;
+ use std::process::Command;
+ 
+ use crate::core::error::CliError;
+ use crate::core::git;
+ 
+ /// Sums net text lines from numstat input (added-minus-deleted), mirroring
+ /// ref/lib.sh:164-174. Returns `Ok(net)` for a normal text diff, or the
+ /// documented `UNSCORED <why>` verdict when a binary (`- -`) or mode-only
+@@ -88,22 +89,27 @@ pub fn coverage_score(repo: &Path, base: &str, branch: &str) -> Result<String, C
+     if o <= 0 {
+         return Ok("UNSCORED no-text-rows".to_string());
+     }
+ 
+     // Simulated merge + residual diff in ONE subprocess so the synthesized
+     // tree stays reachable (lib.sh:201-231). merge-tree rc 1 = conflict,
+     // >1 = error -> UNKNOWN. An empty tree with rc 0 must NOT fail open to
+     // SCORED 100: the reference exits 2 from the subshell in that case,
+     // which surfaces as rc 2 -> UNKNOWN merge-tree-error (lib.sh:216-221).
+     let obj = tempfile_dir()?;
+-    let alt = git::rev_parse_abs_git_dir(repo)?;
+-    let alt = format!("{alt}/objects");
++    let alt = match git::objects_dir(repo)? {
++        Some(alt) => alt,
++        None => {
++            let _ = std::fs::remove_dir_all(&obj);
++            return Ok("UNKNOWN no-object-dir".to_string());
++        }
++    };
+     let base_oid = git::rev_parse(repo, base)?;
+     let residual = merge_tree_residual(repo, &obj, &alt, base, branch, &base_oid)?;
+     let _ = std::fs::remove_dir_all(&obj);
+ 
+     let (mtrc, rc, residual) = residual;
+     if mtrc == 1 {
+         return Ok("UNKNOWN merge-conflict".to_string());
+     }
+     if mtrc > 1 || rc > 1 {
+         return Ok("UNKNOWN merge-tree-error".to_string());
+diff --git a/tests/coverage_golden.rs b/tests/coverage_golden.rs
+index f080aad..ef93ddb 100644
+--- a/tests/coverage_golden.rs
++++ b/tests/coverage_golden.rs
+@@ -248,20 +248,59 @@ fn conflicting_merge_is_unknown_merge_conflict() {
+     commit(&repo, "a.txt", "one\nmain\n", "main change");
+ 
+     assert_parity(&repo, "main", "feature");
+     assert_eq!(
+         stdout_of(&run_rust(&repo, "main", "feature")),
+         "UNKNOWN merge-conflict"
+     );
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
++/// (h) scoring from a LINKED worktree's path: `--git-path objects` must
++/// resolve the real object store (the per-worktree gitdir has no `objects/`),
++/// so Rust's verdict equals the reference's. A squashed-merged branch plus an
++/// extra main commit makes feat genuinely unmerged (SCORED 0 from the main
++/// repo path, reference parity asserted on both).
++#[test]
++fn linked_worktree_path_scores_like_main_repo() {
++    let dir = scratch_dir();
++    let repo = init_repo(&dir);
++    commit(&repo, "a.txt", "a\n", "init");
++    let init_sha = git(&repo, &["rev-parse", "HEAD"]);
++    git(&repo, &["checkout", "-q", "-b", "old"]);
++    commit(&repo, "old.txt", "old work\n", "old work");
++    git(&repo, &["checkout", "-q", "main"]);
++    git(&repo, &["merge", "-q", "--squash", "old"]);
++    git(&repo, &["commit", "-qm", "squash: old (#1)"]);
++    commit(&repo, "extra.txt", "extra\n", "extra main commit");
++
++    git(&repo, &["checkout", "-q", "-b", "feat", &init_sha]);
++    commit(&repo, "feat.txt", "feat work\n", "feat work");
++    git(&repo, &["checkout", "-q", "main"]);
++
++    let wt = dir.join("wt");
++    git(
++        &repo,
++        &["worktree", "add", "-q", &wt.to_string_lossy(), "feat"],
++    );
++
++    assert_parity(&repo, "main", "feat");
++    assert_parity(&wt, "main", "feat");
++    assert_eq!(stdout_of(&run_rust(&wt, "main", "feat")), "SCORED 0");
++
++    git(
++        &repo,
++        &["worktree", "remove", "--force", &wt.to_string_lossy()],
++    );
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
+ /// Usage errors mirror ref/coverage-score: exact strings on stdout, exit 2.
+ #[test]
+ fn usage_errors_match_reference() {
+     let dir = scratch_dir();
+     let repo = init_repo(&dir);
+     commit(&repo, "a.txt", "a\n", "init");
+ 
+     let bin = env!("CARGO_BIN_EXE_jeeves");
+ 
+     let out = Command::new(bin)
