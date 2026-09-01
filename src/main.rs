@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod core;
+mod orient;
 mod worktrees;
 
 #[derive(Parser)]
@@ -65,6 +66,18 @@ fn main() -> ExitCode {
     // silent, always-successful command when the hook cannot report anything.
     if std::env::args().nth(1).as_deref() == Some("session-hook") {
         return run_session_hook();
+    }
+    if std::env::args().nth(1).as_deref() == Some("git-state") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return ExitCode::from(orient::gitstate::run(&args));
+    }
+    if std::env::args().nth(1).as_deref() == Some("roots") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return ExitCode::from(orient::roots::run(&args));
+    }
+    if std::env::args().nth(1).as_deref() == Some("session-tail") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return ExitCode::from(orient::tail::run(&args));
     }
     match Cli::parse().command {
         None | Some(Command::Version) => {
