@@ -9,6 +9,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod core;
+mod digest;
+mod migrate;
 mod orient;
 mod worktrees;
 
@@ -90,6 +92,13 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("scan-active") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         return ExitCode::from(orient::scan::run(&args));
+    }
+    if std::env::args().nth(1).as_deref() == Some("install-cron") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return ExitCode::from(digest::cron::run(&args));
+    }
+    if std::env::args().nth(1).as_deref() == Some("migrate") {
+        return ExitCode::from(migrate::run());
     }
     match Cli::parse().command {
         None | Some(Command::Version) => {

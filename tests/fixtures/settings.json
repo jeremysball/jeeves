@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/skills/auditing-worktrees/bin/session-hook.sh\"",
+            "timeout": 20,
+            "statusMessage": "Checking for worktree drift..."
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/home/jeremy/.local/bin/moshi-hook' claude-hook",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
