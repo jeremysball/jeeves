@@ -13,3 +13,5 @@ Task 2: minor (deferred): main.rs bad-dir-vs-count error ordering differs from r
 Task 2: fix round 1/5 dispatched (oc_mti7h3iq, worktree jeeves-rust-fix2).
 Task 2: fix round 1/5 (2 addressed, 0 open; commits 95bd97e..de89052)
 Task 2: complete (commits 2af03f4..de89052, review clean after round 1)
+Task 3a: 3-dispatch split (core/tests/hook) after two context-death attempts on the monolithic brief.
+Task 3a-1: core landed (host-verified 62 tests, clippy clean). Note: audit.rs carries 14 em-dashes mirroring the reference report strings; inherited convention, flag at final review.

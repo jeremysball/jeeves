@@ -1,1 +1,4 @@
-check = "mise run check-rust"
+# Cargo direct rather than `mise run check-rust`: the sandbox mounts mise's
+# state dir read-only and mise fails on its trusted-configs symlink before
+# reaching cargo. CI owns the mise task surface; this gate owns the check.
+check = "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
