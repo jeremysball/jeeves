@@ -428,6 +428,148 @@ pub fn audit_sweep(roots: &[PathBuf], opts: &AuditOpts) -> String {
     out
 }
 
+/// Collapses a multi-repo audit report into one line per repo with per-bucket
+/// counts, mirroring ref/summary-parser.sh exactly. Bucket headings are
+/// matched structurally (two-space indent + name + colon) so a branch
+/// description that mentions a bucket name can never set the current bucket.
+/// Output lines are `  <repo>: <n> triage, <n> content-merged, ...` in fixed
+/// bucket order with zero-count buckets omitted and the trailing comma
+/// stripped; repos with no tallied buckets are omitted entirely. Only
+/// four-space-indented lines increment; any unmatched two-space heading
+/// (including the dangling-worktree list) clears the current bucket, and so
+/// does the `(N in flight...)` line. Repo names are the second whitespace
+/// field of the `===` line, so spaces in repo paths are a known reference
+/// limitation.
+pub fn summary_collapse(audit_stdout: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Bucket {
+        None,
+        Triage,
+        ContentMerged,
+        UnknownMerge,
+        Archaeology,
+        SafeToClean,
+        HandsOff,
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct Counts {
+        triage: u64,
+        content_merged: u64,
+        unknown_merge: u64,
+        archaeology: u64,
+        safe_to_clean: u64,
+        hands_off: u64,
+    }
+
+    /// awk `/^  <name>[^:]*:/`: two-space indent, literal name, then any run
+    /// of non-colon chars (possibly empty) and a colon.
+    fn heading(line: &str, name: &str) -> bool {
+        line.strip_prefix("  ")
+            .and_then(|r| r.strip_prefix(name))
+            .is_some_and(|r| r.contains(':'))
+    }
+
+    /// awk `/^  couldn.t determine merge state[^:]*:/` where `.` is a
+    /// wildcard (matches the apostrophe in "couldn't").
+    fn unknown_merge_heading(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("  couldn") else {
+            return false;
+        };
+        let Some(wild) = rest.chars().next() else {
+            return false;
+        };
+        rest[wild.len_utf8()..]
+            .strip_prefix("t determine merge state")
+            .is_some_and(|r| r.contains(':'))
+    }
+
+    /// awk `/^  [^ ][^:]*:/`: every other two-space heading (currently the
+    /// dangling-worktree list) has no counter, but it MUST still clear the
+    /// current bucket: an unmatched heading used to leave the previous bucket
+    /// active, so its indented lines were tallied under whichever bucket
+    /// happened to precede it.
+    fn unmatched_heading(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("  ") else {
+            return false;
+        };
+        let mut chars = rest.chars();
+        match chars.next() {
+            Some(c) if c != ' ' => chars.any(|c| c == ':'),
+            _ => false,
+        }
+    }
+
+    fn emit(out: &mut String, repo: &str, c: &Counts) {
+        let mut parts = String::new();
+        if c.triage > 0 {
+            parts.push_str(&format!("{} triage, ", c.triage));
+        }
+        if c.content_merged > 0 {
+            parts.push_str(&format!("{} content-merged, ", c.content_merged));
+        }
+        if c.unknown_merge > 0 {
+            parts.push_str(&format!("{} unknown-merge, ", c.unknown_merge));
+        }
+        if c.archaeology > 0 {
+            parts.push_str(&format!("{} archaeology, ", c.archaeology));
+        }
+        if c.safe_to_clean > 0 {
+            parts.push_str(&format!("{} safe-to-clean, ", c.safe_to_clean));
+        }
+        if c.hands_off > 0 {
+            parts.push_str(&format!("{} hands-off, ", c.hands_off));
+        }
+        if !parts.is_empty() {
+            parts.truncate(parts.len() - 2);
+            out.push_str(&format!("  {repo}: {parts}\n"));
+        }
+    }
+
+    let mut out = String::new();
+    let mut repo = String::new();
+    let mut bucket = Bucket::None;
+    let mut counts = Counts::default();
+    for line in audit_stdout.lines() {
+        if let Some(rest) = line.strip_prefix("=== ") {
+            if !repo.is_empty() {
+                emit(&mut out, &repo, &counts);
+            }
+            repo = rest.split_whitespace().next().unwrap_or("").to_string();
+            counts = Counts::default();
+            bucket = Bucket::None;
+        } else if heading(line, "safe-to-clean") {
+            bucket = Bucket::SafeToClean;
+        } else if heading(line, "needs-triage") {
+            bucket = Bucket::Triage;
+        } else if heading(line, "archaeology") {
+            bucket = Bucket::Archaeology;
+        } else if heading(line, "hands-off") {
+            bucket = Bucket::HandsOff;
+        } else if heading(line, "likely-content-merged") {
+            bucket = Bucket::ContentMerged;
+        } else if unknown_merge_heading(line) {
+            bucket = Bucket::UnknownMerge;
+        } else if unmatched_heading(line) || line.starts_with("  (") {
+            bucket = Bucket::None;
+        } else if line.starts_with("    ") {
+            match bucket {
+                Bucket::Triage => counts.triage += 1,
+                Bucket::ContentMerged => counts.content_merged += 1,
+                Bucket::UnknownMerge => counts.unknown_merge += 1,
+                Bucket::Archaeology => counts.archaeology += 1,
+                Bucket::SafeToClean => counts.safe_to_clean += 1,
+                Bucket::HandsOff => counts.hands_off += 1,
+                Bucket::None => {}
+            }
+        }
+    }
+    if !repo.is_empty() {
+        emit(&mut out, &repo, &counts);
+    }
+    out
+}
+
 /// `fd -H -t d '^\.git$' <root> --max-depth 2` (ref/audit-worktrees.sh:250).
 fn fd_git_dirs(root: &Path) -> Vec<PathBuf> {
     let out = Command::new("fd")
@@ -529,4 +671,162 @@ fn detect_base(repo: &Path) -> Option<String> {
     s.trim()
         .strip_prefix("refs/remotes/origin/")
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summary_collapse;
+
+    fn report() -> String {
+        [
+            "=== alpha (base: main) ===",
+            "  safe-to-clean (merged, clean):",
+            "    a/clean-1",
+            "    a/clean-2",
+            "  needs-triage:",
+            "    a/triage-1",
+            "  archaeology (older than 30d, never pushed — batch archive):",
+            "    a/arch-1",
+            "  likely-content-merged (work already in base under a different hash — batch archive):",
+            "    a/cm-1",
+            "  hands-off (live or unrecognized lock — never touch):",
+            "    a/ho-1",
+            "  couldn't determine merge state (unrelated history / bad ref):",
+            "    a/unk-1",
+            "  (2 in flight, active within 2h — hidden)",
+            "",
+            "=== beta (base: master) ===",
+            "  needs-triage:",
+            "    b/triage-1",
+            "    b/triage-2",
+            "  safe-to-clean (merged, clean):",
+            "    b/clean-1",
+            "",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn fixed_bucket_order_with_zero_counts_omitted() {
+        assert_eq!(
+            summary_collapse(&report()),
+            "  alpha: 1 triage, 1 content-merged, 1 unknown-merge, 1 archaeology, 2 safe-to-clean, 1 hands-off\n  beta: 2 triage, 1 safe-to-clean\n"
+        );
+    }
+
+    #[test]
+    fn repo_with_no_tallied_buckets_is_omitted() {
+        let input = [
+            "=== alpha (base: main) ===",
+            "  needs-triage:",
+            "    a/triage-1",
+            "",
+            "=== empty (base: main) ===",
+            "  (1 in flight, active within 2h — hidden)",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(summary_collapse(&input), "  alpha: 1 triage\n");
+    }
+
+    #[test]
+    fn trailing_comma_stripped_and_single_bucket() {
+        let input = [
+            "=== solo (base: main) ===",
+            "  archaeology (older than 30d, never pushed — batch archive):",
+            "    s/arch-1",
+            "    s/arch-2",
+            "    s/arch-3",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(summary_collapse(&input), "  solo: 3 archaeology\n");
+    }
+
+    #[test]
+    fn branch_description_mentioning_bucket_name_does_not_set_bucket() {
+        let input = [
+            "=== alpha (base: main) ===",
+            "  needs-triage:",
+            "    a/triage-1",
+            "    a/needs-triage: not a heading, just a description",
+            "    a/archaeology: also just a description",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(summary_collapse(&input), "  alpha: 3 triage\n");
+    }
+
+    #[test]
+    fn unmatched_heading_clears_current_bucket() {
+        let input = [
+            "=== alpha (base: main) ===",
+            "  needs-triage:",
+            "    a/triage-1",
+            "  dangling worktree registrations (git worktree prune is safe):",
+            "    a/prunable-1",
+            "    a/prunable-2",
+            "  safe-to-clean (merged, clean):",
+            "    a/clean-1",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(
+            summary_collapse(&input),
+            "  alpha: 1 triage, 1 safe-to-clean\n"
+        );
+    }
+
+    #[test]
+    fn inflight_line_clears_current_bucket() {
+        let input = [
+            "=== alpha (base: main) ===",
+            "  needs-triage:",
+            "    a/triage-1",
+            "  (2 in flight, active within 2h — hidden)",
+            "    a/after-inflight-1",
+            "    a/after-inflight-2",
+            "  safe-to-clean (merged, clean):",
+            "    a/clean-1",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(
+            summary_collapse(&input),
+            "  alpha: 1 triage, 1 safe-to-clean\n"
+        );
+    }
+
+    #[test]
+    fn only_four_space_indented_lines_increment() {
+        let input = [
+            "=== alpha (base: main) ===",
+            "  needs-triage:",
+            "    a/triage-1",
+            "  a/triage-2",
+            "      a/triage-3",
+            "    a/triage-4",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(summary_collapse(&input), "  alpha: 3 triage\n");
+    }
+
+    #[test]
+    fn repo_name_is_second_whitespace_field_of_equals_line() {
+        let input = [
+            "=== /tmp/foo bar (base: main) ===",
+            "  needs-triage:",
+            "    x/triage-1",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(summary_collapse(&input), "  /tmp/foo: 1 triage\n");
+    }
+
+    #[test]
+    fn empty_input_produces_empty_output() {
+        assert_eq!(summary_collapse(""), "");
+        assert_eq!(summary_collapse("\n\n"), "");
+    }
 }
