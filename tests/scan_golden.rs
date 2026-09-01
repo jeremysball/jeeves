@@ -86,6 +86,22 @@ fn run_rust(root: &Path, since: &str) -> Output {
     cmd.output().unwrap()
 }
 
+/// PATH with every directory containing an `fd` entry removed, so `fd` is
+/// unresolvable (mirrors a bare cron PATH in the reference's fd preflight
+/// comment, scan-active.sh:66-75).
+fn path_without_fd() -> String {
+    let orig: Vec<_> = std::env::split_paths(&std::env::var("PATH").unwrap()).collect();
+    assert!(
+        orig.iter().any(|dir| dir.join("fd").exists()),
+        "test requires fd on the runner's PATH"
+    );
+    orig.iter()
+        .filter(|dir| !dir.join("fd").exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// Shared normalization for BOTH sides: drop the first line (the bin: line,
 /// which differs by construction) and collapse relative ages to "N ago".
 fn normalize(out: &Output) -> String {
@@ -216,4 +232,43 @@ fn content_merged() {
 
     assert_parity(&dir, "10 years ago");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// (4) The fd preflight (scan-active.sh:66-75): with `fd` stripped from PATH,
+/// the binary must print the reference's exact two lines on stdout and exit 2
+/// instead of silently reporting "0 of 0 scanned repos".
+#[test]
+fn missing_fd_preflight() {
+    let out = Command::new(env!("CARGO_BIN_EXE_jeeves"))
+        .env("PATH", path_without_fd())
+        .args(["scan-active", "yesterday 00:00", "/tmp"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "error: fd not found on PATH\nhelp: repo discovery needs `fd`; install it or add its dir to PATH (mise installs are not on a bare cron PATH)\n"
+    );
+}
+
+/// (5) A `--`-prefixed argument in ANY position is an unknown flag
+/// (scan-active.sh:48-58), not just args[0]: two-line error on stdout, exit 2.
+#[test]
+fn unknown_flag_any_position() {
+    for args in [
+        vec!["scan-active", "--bogus", "yesterday 00:00", "/tmp"],
+        vec!["scan-active", "yesterday 00:00", "--bogus", "/tmp"],
+        vec!["scan-active", "yesterday 00:00", "/tmp", "--bogus"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_jeeves"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "args: {args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "error: unknown flag --bogus for `scan-active.sh`\nhelp: the only flag is --help; positional args are <since> [root ...]\n",
+            "args: {args:?}"
+        );
+    }
 }

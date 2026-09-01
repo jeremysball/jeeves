@@ -336,17 +336,32 @@ fn self_display(self_path: &str) -> String {
 
 /// Runs `scan-active <since> [root ...]`: prints the TOON report.
 pub fn run(args: &[String]) -> u8 {
+    // AXI §6: reject unknown flags by name before doing any work; --help
+    // always passes (scan-active.sh:48-58).
+    for arg in args {
+        if arg == "--help" {
+            print_usage();
+            return 0;
+        }
+        if arg.starts_with("--") {
+            println!("error: unknown flag {arg} for `scan-active.sh`");
+            println!("help: the only flag is --help; positional args are <since> [root ...]");
+            return 2;
+        }
+    }
+
     let Some(since) = args.first() else {
         eprintln!("error: <since> is required");
         eprintln!("help: jeeves scan-active \"yesterday 00:00\" [root ...]");
         return 2;
     };
-    if since == "--help" {
-        print_usage();
-        return 0;
-    }
-    if since.starts_with("--") {
-        println!("error: unknown flag {since} for `scan-active`");
+
+    // fd preflight (scan-active.sh:66-75): repo discovery is entirely `fd`,
+    // and that call swallows stderr, so a missing `fd` must not read as a
+    // quiet "0 of 0 scanned repos" scan.
+    if !fd_on_path() {
+        println!("error: fd not found on PATH");
+        println!("help: repo discovery needs `fd`; install it or add its dir to PATH (mise installs are not on a bare cron PATH)");
         return 2;
     }
 
@@ -550,6 +565,20 @@ fn fd_git_dirs(root: &Path) -> Vec<PathBuf> {
         .filter(|line| !line.is_empty())
         .map(PathBuf::from)
         .collect()
+}
+
+/// PATH resolvability of `fd`, mirroring the reference's `command -v fd`
+/// preflight (scan-active.sh:71).
+fn fd_on_path() -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.join("fd").is_file() {
+            return true;
+        }
+    }
+    false
 }
 
 fn checked_out_branch(repo: &Path) -> String {
