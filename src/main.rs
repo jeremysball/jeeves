@@ -41,6 +41,11 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("audit") {
         return run_audit();
     }
+    // `jeeves archive` follows the reference command's positional parsing:
+    // --list and --strict are recognized only in the first argument slot.
+    if std::env::args().nth(1).as_deref() == Some("archive") {
+        return run_archive();
+    }
     match Cli::parse().command {
         None | Some(Command::Version) => {
             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
@@ -70,6 +75,11 @@ fn run_audit() -> ExitCode {
     let opts = worktrees::audit::resolve_opts(no_content);
     print!("{}", worktrees::audit::audit_sweep(&[root], &opts));
     ExitCode::SUCCESS
+}
+
+fn run_archive() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    ExitCode::from(worktrees::archive::run(&args))
 }
 
 fn run_coverage() -> ExitCode {
