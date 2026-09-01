@@ -489,6 +489,56 @@ def test_flag_refs_does_not_match_inside_a_longer_sibling_name(monkeypatch):
     assert flagged2 == ["9001"]
 
 
+def test_git_state_runs_discovery_before_scan(tmp_path, monkeypatch):
+    """git_state() refreshes the discovered-roots file (discover-roots.sh)
+    before running scan-active.sh, so the scan deduplicates clones of the
+    same remote. A missing discover-roots.sh is tolerated (best-effort), and
+    the scan still runs."""
+    _env(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(args)
+        return cc.subprocess.CompletedProcess(args, 0, "scan output", "")
+
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+    monkeypatch.setattr(cc.Path, "home", lambda: tmp_path)
+    scan = tmp_path / ".claude/skills/orient/bin/scan-active.sh"
+    discover = tmp_path / ".claude/skills/orient/bin/discover-roots.sh"
+    scan.parent.mkdir(parents=True)
+    scan.write_text("#!/bin/sh\n")
+    discover.write_text("#!/bin/sh\n")
+
+    out = cc.git_state()
+    assert "scan output" in out
+    # discovery runs first, then the scan
+    assert calls[0] == ["bash", str(discover)]
+    assert calls[1] == ["bash", str(scan), "yesterday 00:00"]
+
+
+def test_git_state_tolerates_missing_discovery(tmp_path, monkeypatch):
+    """When discover-roots.sh is absent, git_state() still runs the scan and
+    does not raise — discovery is best-effort, not a hard dependency."""
+    _env(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(args)
+        return cc.subprocess.CompletedProcess(args, 0, "scan output", "")
+
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+    monkeypatch.setattr(cc.Path, "home", lambda: tmp_path)
+    scan = tmp_path / ".claude/skills/orient/bin/scan-active.sh"
+    scan.parent.mkdir(parents=True)
+    scan.write_text("#!/bin/sh\n")
+    # no discover-roots.sh written
+
+    out = cc.git_state()
+    assert "scan output" in out
+    assert len(calls) == 1  # only the scan ran
+    assert calls[0] == ["bash", str(scan), "yesterday 00:00"]
+
+
 def test_repo_origins_is_memoized_per_state_dir(tmp_path, monkeypatch):
     _env_carry(tmp_path, monkeypatch)
     cc._ORIGINS.clear()
