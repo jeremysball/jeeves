@@ -1,0 +1,85 @@
+
+# ---- SeenStore ----
+class SeenStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.rows = {}
+        if path.exists():
+            for line in path.read_text().splitlines():
+                if line.strip():
+                    r = json.loads(line)
+                    self.rows[r["hash"]] = r
+
+    @classmethod
+    def load(cls) -> "SeenStore":
+        return cls(state_dir() / "seen.ndjson")
+
+    def check(self, h: str):
+        return self.rows.get(h)
+
+    def upsert(self, h: str, line: str, status: str = "open") -> dict:
+        now = now_et().isoformat(timespec="seconds")
+        r = self.rows.get(h)
+        if r is None:
+            r = {"hash": h, "line": line, "first_seen": now, "last_seen": now,
+                 "count": 1, "status": status}
+        else:
+            r["last_seen"] = now
+            r["count"] += 1
+            r["status"] = status
+        self.rows[h] = r
+        return r
+
+    def set_status(self, h: str, status: str) -> None:
+        if h in self.rows:
+            self.rows[h]["status"] = status
+
+    def by_status(self, status: str) -> list:
+        return [r for r in self.rows.values() if r["status"] == status]
+
+    def save(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text("\n".join(json.dumps(r) for r in self.rows.values()) + "\n")
+        tmp.replace(self.path)
+
+
+FENCE_RE = re.compile(r"```json\s*\n(.*?)```", re.S)
+
+
+
+# ---- load_pending ----
+def load_pending() -> list:
+    p = pending_path()
+    return json.loads(p.read_text()) if p.exists() and p.read_text().strip() else []
+
+
+
+# ---- save_pending ----
+def save_pending(items: list) -> None:
+    tmp = pending_path().with_suffix(".tmp")
+    tmp.write_text(json.dumps(items, indent=1))
+    tmp.replace(pending_path())
+
+
+# Checkbox bullets arrive with, without, and in either case for the x
+# ("[X]" on old imported todos). jl.normalize's own bullet handling is a
+# char-class lstrip whose class lacks "X", so strip the bullet here with a
+# case-insensitive regex BEFORE normalize; normalize's uppercase hole stays
+# untouched for its other callers (finding-match) until it gets its own fix.
+_BULLET_RE = re.compile(r"^\s*[-*]\s*\[[ xX]?\]\s*")
+
+
+
+# ---- _seen_of ----
+def _seen_of(row: dict) -> int:
+    """Attempt count of a queue row, robust to junk from hand-edited or
+    pre-fold files: a null/garbage `seen` reads as one attempt, never a
+    crash and never a silent zero."""
+    v = row.get("seen", 1)
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return 1
+    return v if v > 0 else 1
+
+

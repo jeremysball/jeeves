@@ -1,0 +1,447 @@
+
+# ---- _coverage_score_bin ----
+def _coverage_score_bin() -> Path:
+    """auditing-worktrees' coverage-score CLI, wherever it is installed.
+
+    Read at call time rather than at import so a test (or a caller pointing at
+    a worktree copy) can move it with AUDIT_WORKTREES_BIN.
+    """
+    root = os.environ.get("AUDIT_WORKTREES_BIN") or str(
+        Path.home() / ".claude" / "skills" / "auditing-worktrees" / "bin")
+    return Path(root) / "coverage-score"
+
+
+
+# ---- _coverage_threshold ----
+def _coverage_threshold() -> int:
+    """Coverage % at or above which a commit's content counts as already in base.
+
+    Shares WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD with auditing-worktrees and
+    orient rather than hardcoding a third copy of 95. A malformed value falls
+    back to the default instead of being read as some other number: 0 is
+    rejected with the rest, since it would call every commit landed.
+    """
+    raw = os.environ.get("WORKTREE_AUDIT_CONTENT_MERGE_THRESHOLD")
+    if raw is not None and re.fullmatch(r"[1-9][0-9]?|100", raw):
+        return int(raw)
+    return 95
+
+
+# Per (repo, base, sha) coverage verdict, in-process. prune_pending and --pending
+# classify the same rows repeatedly, and each call re-spawns a coverage-score
+# subprocess that runs a merge-tree plus two diffs -- several hundred ms on a
+# large repo, and the whole reason to cache the GitHub pull lookup in
+# _PULLS_CACHE applies here too. Keyed by all three so a verdict is never
+# reused across bases or repos.
+_COVERAGE_CACHE: dict[tuple[str, str, str], bool] = {}
+
+# _capture's 15s budget is tuned for quick git status/log calls. A coverage
+# score runs a merge-tree plus two diffs across the whole history, which on a
+# large repo can exceed it; the verifier reproduced a 700k-file repo flapping
+# between SCORED 100 at 14.46s and a silent "" at 15.0s run-to-run. The offline
+# pass needs its own, longer budget, separate from _capture so a slow repo does
+# not stretch the budget of every unrelated git call.
+_COVERAGE_TIMEOUT = 60
+
+
+
+# ---- _coverage_landed ----
+def _coverage_landed(sha: str, base: str, repo) -> bool:
+    """True when coverage-score says this commit's content is already in base.
+
+    Offline, and it answers the squash shape ancestry cannot see. Once base
+    advances between the branch point and the squash, the squash commit's tree
+    is `new-base + branch changes` while the branch's own tree is still
+    `old-base + branch changes`, so neither ancestry nor a tree comparison
+    matches. Scoring residual content does.
+
+    Only a score at or above the threshold is an answer. UNSCORED (a binary or
+    mode-only row) and UNKNOWN (criss-cross history, a merge conflict) mean the
+    scorer declined to judge, not that the work is outstanding, so the caller
+    keeps asking. A missing CLI reads the same way: this closes a gap in the
+    offline path, it does not make auditing-worktrees a dependency.
+
+    The score is a percentage of content present in base, so a value outside
+    0-100 is not a valid verdict -- it means a CLI regression or a mispointed
+    AUDIT_WORKTREES_BIN, and is treated as "declined to judge" rather than
+    trusted as landed. The subprocess gets its own longer timeout so a large
+    repo cannot silently time out the offline pass.
+    """
+    key = (str(repo), base, sha)
+    if key in _COVERAGE_CACHE:
+        return _COVERAGE_CACHE[key]
+    try:
+        p = subprocess.run(
+            [str(_coverage_score_bin()), str(repo), base, sha],
+            capture_output=True, text=True, timeout=_COVERAGE_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    out = (p.stdout if p.returncode == 0 else "").strip()
+    m = re.fullmatch(r"SCORED (\d+)", out)
+    if not m:
+        return False
+    score = int(m.group(1))
+    if not 0 <= score <= 100:
+        return False
+    landed = score >= _coverage_threshold()
+    _COVERAGE_CACHE[key] = landed
+    return landed
+
+
+
+# ---- classify_evidence ----
+def classify_evidence(evidence: str, repo) -> str:
+    """Memoized entry point: same verdict as _classify_evidence_uncached, with
+    a short-TTL disk cache so consecutive processes over the same rows do not
+    redo each other's gh-axi round trips.
+
+    UNKNOWN is never cached, the same rule the inner caches (_PULLS_CACHE,
+    _PR_CACHE, _ISSUE_CACHE) already apply to a failed lookup: it means
+    "could not determine" rather than a real answer, and caching it would let
+    a transient gh-axi outage outlive itself for up to _MEMO_TTL seconds --
+    exactly the "run --prune-pending then --pending seconds apart" workflow
+    this memo exists to speed up would then see a stale UNKNOWN instead of a
+    retry. A malformed entry (missing "t"/"verdict", e.g. from schema drift)
+    is treated as a cache miss rather than trusted.
+    """
+    global _MEMO
+    if _MEMO is None:
+        _MEMO = _load_memo()
+        atexit.register(_save_memo)
+    key = f"{repo}\x1f{evidence}"
+    hit = _MEMO.get(key)
+    if (
+        isinstance(hit, dict)
+        and isinstance(hit.get("t"), (int, float))
+        and hit.get("verdict") in (LANDED, OUTSTANDING, UNKNOWN)
+        and time.time() - hit["t"] < _MEMO_TTL
+    ):
+        return hit["verdict"]
+    verdict = _classify_evidence_uncached(evidence, repo)
+    if verdict != UNKNOWN:
+        _MEMO[key] = {"verdict": verdict, "t": time.time()}
+    return verdict
+
+
+
+# ---- _capture ----
+def _capture(args) -> str:
+    """stdout of a successful run, or "" on any failure. Never raises."""
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+    return p.stdout if p.returncode == 0 else ""
+
+
+# Evidence verdicts. `landed` is the only one that checks a todo off; the split
+# exists because "this ref exists" and "this work is merged" are different
+# questions, and an earlier version of verify_evidence answered the first while
+# the ledger asked the second.
+LANDED = "landed"        # merged into the base branch / present on disk
+OUTSTANDING = "outstanding"  # the ref is real but not merged: still live work
+UNKNOWN = "unknown"      # could not determine; never treated as landed
+
+
+# The base branch is a property of the repo, not of any one evidence row, and
+# resolving it costs up to three git calls; memoize per repo path.
+_DEFAULT_BRANCH_CACHE: dict[str, str] = {}
+
+
+
+# ---- _save_memo ----
+def _save_memo() -> None:
+    """Best-effort: a failed write (disk full, permissions) must never crash
+    the CLI over a cache write."""
+    if _MEMO is None:
+        return
+    try:
+        (jl.state_dir() / _MEMO_PATH).write_text(json.dumps(_MEMO))
+    except OSError:
+        pass
+
+
+
+# ---- _load_memo ----
+def _load_memo() -> dict:
+    """The memo file is disposable: a missing, unreadable, or malformed file
+    just means starting from an empty cache, never a wrong answer. "Malformed"
+    covers both invalid JSON and syntactically valid JSON of the wrong shape
+    (null, a list, a scalar) -- json.loads happily returns those without
+    raising, so the shape is checked explicitly rather than trusted."""
+    try:
+        data = json.loads((jl.state_dir() / _MEMO_PATH).read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+
+# ---- reconcile ----
+def reconcile() -> dict:
+    """Ledger wins. Register untracked lines; record vanished lines as dismissed."""
+    seen = jl.SeenStore.load()
+    sections = parse_ledger(ledger_path().read_text())
+    present = {}
+    for s in SECTIONS:
+        status = {"open": "open", "done": "done", "dismissed": "dismissed"}[s]
+        for ln in sections[s]:
+            present[jl.line_hash(ln)] = (status, ln)
+    added = dismissed = 0
+    for h, (status, ln) in present.items():
+        if seen.check(h) is None:
+            text = re.sub(r"^-\s*\[[ x]\]\s*", "", ln).strip()
+            seen.upsert(h, text, status=status)
+            added += 1
+    for h, rec in list(seen.rows.items()):
+        if rec["status"] != "dismissed" and h not in present:
+            seen.set_status(h, "dismissed")
+            dismissed += 1
+    seen.save()
+    jl.log(f"reconcile: +{added} registered, {dismissed} recorded dismissed")
+    return {"registered": added, "dismissed": dismissed}
+
+
+
+# ---- prune_pending ----
+def prune_pending() -> dict:
+    """Re-run the gates over the pending queue and drain what no longer belongs.
+
+    pending.json is append-only in spirit: the queue only ever grows (a
+    re-queued subject folds into its existing row, never a second copy), and
+    before this existed nothing ever removed anything, so a check queued
+    against a since-merged PR sat in the queue forever and every wake
+    re-reported it as a live loose end.
+
+    Each row resolves one of five ways:
+      applied  - evidence now shows LANDED and the ledger line is still open,
+                 so the check it was demoted from finally goes through
+      moot     - the ledger line is no longer open (checked or dismissed since),
+                 so there is nothing left for this row to do
+      stale    - the line was never in the ledger at all
+      kept     - still genuinely pending; evidence has not landed yet
+      merged   - same-subject kept rows folded into their survivor; kept +
+                 merged still equals the kept rows drained in, so all five
+                 counts sum to the rows the queue held before the call.
+    """
+    AMBIGUOUS = object()
+
+    def _match(sections, line, only):
+        """find_match raises on duplicate ledger lines; a duplicated line is a
+        reason to keep the row for a human, never to crash the whole prune.
+
+        Ambiguity returns its own sentinel rather than None. Collapsing it to
+        None read as "not in the open section", which sent the row down the
+        moot/stale path and dropped it from the queue outright -- the one thing
+        the queue exists to prevent, and the opposite of what this docstring
+        promised."""
+        try:
+            return find_match(sections, line, only=only)
+        except AmbiguousMatch:
+            return AMBIGUOUS
+
+    items = load_pending()
+    if not items:
+        return {"applied": 0, "moot": 0, "stale": 0, "kept": 0, "merged": 0}
+    seen = jl.SeenStore.load()
+    sections = parse_ledger(ledger_path().read_text())
+    counts = {"applied": 0, "moot": 0, "stale": 0, "kept": 0, "merged": 0}
+    kept = []
+    for row in items:
+        line = (row.get("line") or "").strip()
+        if not line:
+            counts["stale"] += 1
+            continue
+        open_hit = _match(sections, line, "open")
+        if open_hit is AMBIGUOUS:
+            # Several open lines match, so there is no safe one to check off and
+            # no basis for calling the row resolved. Keep it for a human.
+            kept.append(row)
+            counts["kept"] += 1
+            jl.log(f"prune-pending: kept (ambiguous ledger match): {line}")
+            continue
+        if open_hit is None:
+            # Distinguish "resolved since" from "never existed" so a genuinely
+            # lost line is visible rather than silently swallowed as handled.
+            # A line ambiguous in done/dismissed is NOT "resolved" -- a
+            # duplicated match is a reason to keep the row for a human (same
+            # rationale as the open-section AMBIGUOUS case above), not to drop
+            # it as moot. The AMBIGUOUS sentinel is truthy, so it must be
+            # checked explicitly rather than folded into `known`.
+            done_hit = _match(sections, line, "done")
+            dismissed_hit = _match(sections, line, "dismissed")
+            if done_hit is AMBIGUOUS or dismissed_hit is AMBIGUOUS:
+                kept.append(row)
+                counts["kept"] += 1
+                jl.log(f"prune-pending: kept (ambiguous done/dismissed match): {line}")
+                continue
+            known = done_hit or dismissed_hit
+            counts["moot" if known else "stale"] += 1
+            jl.log(f"prune-pending: dropped ({'moot' if known else 'stale'}): {line}")
+            continue
+        if not verify_evidence(row.get("evidence", ""), row.get("repo")):
+            kept.append(row)
+            counts["kept"] += 1
+            continue
+        try:
+            apply_check(line, row.get("evidence", "verified"))
+            seen.set_status(jl.line_hash(line), "done")
+            counts["applied"] += 1
+            jl.log(f"prune-pending: applied: {line}")
+            sections = parse_ledger(ledger_path().read_text())
+        except AmbiguousMatch:
+            kept.append(row)
+            counts["kept"] += 1
+    seen.save()
+    # Survivors fold to one row per subject through the same _fold_row the
+    # push side uses (one implementation, no drift): first slot keeps the
+    # subject's `queued` age, latest truthy fields win, attempts sum. After
+    # folding, every saved row carries a sane integer `seen` - rows written
+    # before the fold era had none, and --pending's display must not have to
+    # guess whether absent means "0", "1", or "broken".
+    survivors: list = []
+    slot: dict = {}
+    merged = 0
+    for row in kept:
+        key = (row.get("op") or "check", _pending_subject(row.get("line", "")))
+        if key in slot:
+            survivors[slot[key]] = _fold_row(survivors[slot[key]], row)
+            merged += 1
+        else:
+            slot[key] = len(survivors)
+            survivors.append(row)
+    counts["kept"] = len(survivors)
+    counts["merged"] = merged
+    for row in survivors:
+        row["seen"] = _seen_of(row)
+    save_pending(survivors)
+    jl.log(f"prune-pending: {counts}")
+    return counts
+
+
+
+# ---- delta_summary ----
+def delta_summary() -> dict:
+    """Counts of ledger state for the invocation card."""
+    seen = jl.SeenStore.load()
+    sections = parse_ledger(ledger_path().read_text())
+    top = sorted(seen.by_status("open"), key=lambda r: -r["count"])[:3]
+    return {"open": len(sections["open"]), "done": len(sections["done"]),
+            "dismissed": len(sections["dismissed"]), "pending": len(load_pending()),
+            "top_recurrence": [(r["line"], r["count"]) for r in top if r["count"] > 1]}
+
+
+
+# ---- ingest_repo_todos ----
+def ingest_repo_todos(dirs) -> dict:
+    """One-time-per-content-hash import of repo todo files. Inputs are
+    read-only: jeeves never writes to them."""
+    seen = jl.SeenStore.load()
+    hf = jl.state_dir() / "imports.ndjson"
+    known = {}
+    if hf.exists():
+        for line in hf.read_text().splitlines():
+            if line.strip():
+                r = json.loads(line)
+                known[r["path"]] = r["hash"]
+    counts = {"scanned": 0, "ingested": 0, "skipped": 0}
+    for d in dirs:
+        d = Path(d)
+        if not d.is_dir():
+            continue
+        counts["scanned"] += 1
+        for f in _todo_files(d):
+            try:
+                body = f.read_text()
+            except OSError as e:
+                jl.log(f"ingest read failed {f}: {e}")
+                continue
+            fh = hashlib.sha256(body.encode()).hexdigest()
+            if known.get(str(f)) == fh:
+                counts["skipped"] += 1
+                continue
+            known[str(f)] = fh
+            for item in _open_items(body):
+                ih = jl.line_hash(item)
+                if seen.check(ih) is None:
+                    apply_add(item, kind="import", source=d.name)
+                    seen.upsert(ih, item)
+                    counts["ingested"] += 1
+    seen.save()
+    tmp = hf.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps({"path": p, "hash": v}) + "\n" for p, v in known.items()))
+    tmp.replace(hf)
+    jl.log(f"ingest: {counts}")
+    return counts
+
+
+
+# ---- _open_items ----
+def _open_items(text: str) -> list:
+    """Parse a loose checklist file into open items, joining wrapped
+    continuation lines onto whichever item they physically follow — a
+    continuation of a `[x]` (done) item is not a separate open item."""
+    items: list[str] = []
+    cur_text = None
+    cur_checked = None
+
+    def flush():
+        nonlocal cur_text, cur_checked
+        if cur_text and not cur_checked:
+            t = cur_text.strip()
+            if t and not t.endswith(":") and len(t) >= 4 and len(t.split()) >= 2:
+                items.append(t)
+        cur_text = None
+        cur_checked = None
+
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            flush()
+            continue
+        if s.startswith("#") or re.match(r"^[-=_]{3,}$", s):
+            flush()
+            continue
+        m = re.match(r"^([-*]\s*)?\[([ xX])\]\s*(.*)$", s)
+        if m:
+            flush()
+            cur_checked = m.group(2).lower() == "x"
+            cur_text = m.group(3)
+            continue
+        m2 = re.match(r"^[-*]\s+(.*)$", s)
+        if m2:
+            flush()
+            cur_checked = False
+            cur_text = m2.group(1)
+            continue
+        # bare single-word line ("Feat", "Bugs"): section header — ends any
+        # open item and is itself dropped, even mid-item
+        if re.fullmatch(r"\w+", s):
+            flush()
+            continue
+        # bare line with no active item: skip
+        if cur_text is None:
+            continue
+        # a "(fixed in ...)" continuation marks the whole item resolved
+        if re.match(r"^\(fixed\b", s, re.IGNORECASE):
+            cur_checked = True
+        cur_text += " " + s
+    flush()
+    return items
+
+
+
+# ---- wake ----
+def wake() -> None:
+    p = jl.state_dir() / "last_wake"
+    p.write_text(jl.now_et().isoformat(timespec="seconds") + "\n")
+
+
+
+# ---- last_wake ----
+def last_wake() -> str:
+    p = jl.state_dir() / "last_wake"
+    return p.read_text().strip() if p.exists() else ""
+
+

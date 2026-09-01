@@ -1,0 +1,136 @@
+
+# ---- apply_add ----
+def apply_add(item: str, kind: str, source: str) -> str:
+    tag = f"(jeeves: {kind}, {source}, {jl.today_et()})"
+    line = f"- [ ] {item} {tag}"
+    sections = parse_ledger(ledger_path().read_text())
+    sections["open"].append(line)
+    _write(sections)
+    jl.log(f"todo add: {line}")
+    return line
+
+
+
+# ---- apply_check ----
+def apply_check(query: str, evidence: str) -> str:
+    sections = parse_ledger(ledger_path().read_text())
+    m = find_match(sections, query, only="open")
+    if m is None:
+        raise AmbiguousMatch(f"no open ledger line matches {query!r}")
+    _, i = m
+    line = sections["open"].pop(i)
+    if line.startswith("- [ ] "):
+        checked = "- [x] " + line[len("- [ ] "):] + f" (jeeves: {evidence}, {jl.today_et()})"
+    else:
+        checked = line.replace("- [ ]", "- [x]", 1)
+    sections["done"].append(checked)
+    _write(sections)
+    jl.log(f"todo check: {checked}")
+    return checked
+
+
+
+# ---- apply_dismiss ----
+def apply_dismiss(query: str) -> str:
+    sections = parse_ledger(ledger_path().read_text())
+    m = find_match(sections, query, only="open")
+    if m is None:
+        raise AmbiguousMatch(f"no open ledger line matches {query!r}")
+    _, i = m
+    line = sections["open"].pop(i)
+    dismissed = f"{line} (dismissed {jl.today_et()})"
+    sections["dismissed"].append(dismissed)
+    _write(sections)
+    jl.log(f"todo dismiss: {dismissed}")
+    return dismissed
+
+
+# Trailing prose is the norm, not the exception: the synthesis ferry writes
+# "commit 3c33869 reset" and "PR #419 merged", never a bare ref. Anchoring
+# these on $ meant every real PR check fell through to False and queued in
+# pending.json forever.
+HEX_RE = re.compile(r"^commit ([0-9a-f]{7,40})\b", re.I)
+PR_RE = re.compile(r"^PR #(\d+)\b", re.I)
+ISSUE_RE = re.compile(r"^issue #(\d+)\b", re.I)
+FILE_RE = re.compile(r"^file (.+)$", re.I)
+
+# The single-ref anchored forms above are what the extraction ferry is *asked*
+# to emit, but it routinely emits several refs in one string instead:
+#   "commit 062563c, commit e0056ed"
+#   "commit dcfcab4 + 01442dd (PR #114, PR #115)"
+#   "commit e0056ed (#364), 062563c (#360)"
+# Anchored single-ref matching read every one of those as unparseable, so real
+# and fully verifiable evidence demoted to pending and stayed there forever.
+# These scan for every ref in the string instead of demanding exactly one.
+SHA_SCAN_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.I)
+PR_SCAN_RE = re.compile(r"#(\d+)\b")
+# `issue #391` is a real evidence shape the synthesis ferry emits, but
+# GitHub's own auto-close keywords (close/closes/closed, fix/fixes/fixed,
+# resolve/resolves/resolved) are a far more common phrasing to quote from a
+# commit or PR body -- without them, "resolves #391" fell through to the
+# keyword-less PR_SCAN_RE and misclassified as a PR. Scanned separately
+# because `gh-axi pr view` fails on an issue number, so classifying every
+# `#N` as a pr would leave issue-backed evidence permanently unknown.
+# `\s*` (not `\s+`): the ferry also glues the form as `issue#391`/`fixes#391`,
+# and a space requirement misclassifies that as a pr and strands it in pending
+# forever.
+ISSUE_SCAN_RE = re.compile(
+    r"\b(?:issues?|close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*#(\d+)\b", re.I)
+
+
+
+# ---- parse_ledger ----
+def parse_ledger(text: str) -> dict:
+    sections: dict[str, list[str]] = {s: [] for s in SECTIONS}
+    current = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            name = line[3:].strip()
+            current = name if name in sections else None
+        elif current is not None and line.strip():
+            sections[current].append(line)
+    return sections
+
+
+
+# ---- _write ----
+def _write(sections: dict) -> None:
+    p = ledger_path()
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(render(sections))
+    tmp.replace(p)
+
+
+
+# ---- find_match ----
+def find_match(sections: dict, query: str, only: str = "open"):
+    nq = jl.normalize(query)
+    hits = [(s, i, ln) for s in SECTIONS if s == only or only is None
+            for i, ln in enumerate(sections[s]) if jl.normalize(ln) == nq]
+    if not hits:
+        return None
+    if len(hits) > 1:
+        raise AmbiguousMatch(f"{len(hits)} ledger lines match {query!r}")
+    return hits[0][0], hits[0][1]
+
+
+
+# ---- SKELETON ----
+bin/todos.py:56:SKELETON = "# jeeves todo ledger\n\n## open\n\n## done\n\n## dismissed\n"
+bin/todos.py:67:        p.write_text(SKELETON)
+SKELETON = "# jeeves todo ledger\n\n## open\n\n## done\n\n## dismissed\n"
+SECTIONS = ("open", "done", "dismissed")
+
+
+class AmbiguousMatch(Exception):
+    pass
+
+
+def ledger_path() -> Path:
+    p = jl.data_dir() / "todo.md"
+    if not p.exists():
+        p.write_text(SKELETON)
+    return p
+# ---- now/date helpers ----
+bin/jeeves_lib.py:36:def now_et() -> datetime:
+bin/jeeves_lib.py:40:def today_et() -> str:
