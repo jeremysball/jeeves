@@ -1,0 +1,1084 @@
+# Review package: 384e1f1..4148455
+
+## Commits
+4148455 fix(orient): reference-parity for roots traversal, cd semantics, symlink keys, tail max forms
+
+## Files changed
+ src/orient/gitstate.rs |   6 +-
+ src/orient/lint.rs     |   1 +
+ src/orient/roots.rs    |  91 ++++++-----
+ src/orient/sessions.rs |  44 ++++-
+ src/orient/tail.rs     | 113 +++++++++----
+ tests/orient_golden.rs | 432 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 604 insertions(+), 83 deletions(-)
+
+## Diff
+diff --git a/src/orient/gitstate.rs b/src/orient/gitstate.rs
+index 5834ba8..865ba2b 100644
+--- a/src/orient/gitstate.rs
++++ b/src/orient/gitstate.rs
+@@ -8,26 +8,28 @@ pub fn run(args: &[String]) -> u8 {
+     let (dir, dir_display) = match args.first() {
+         Some(value) if !value.is_empty() => (PathBuf::from(value), value.clone()),
+         _ => {
+             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+             let display = cwd.to_string_lossy().into_owned();
+             (cwd, display)
+         }
+     };
+ 
+     // Unlike a failed git command, a failed `cd` is a user-visible refusal.
+-    if !dir.is_dir() {
++    // `is_dir` alone is insufficient: an existing directory may not be
++    // enterable because one of its path components denies search permission.
++    if std::env::set_current_dir(&dir).is_err() {
+         println!("error: cannot cd to {dir_display}");
+         return 1;
+     }
+ 
+-    let Some(root_output) = git(&dir, &["rev-parse", "--show-toplevel"]) else {
++    let Some(root_output) = git(Path::new("."), &["rev-parse", "--show-toplevel"]) else {
+         println!("repo: none (not a git repository)");
+         println!("dir: {dir_display}");
+         return 0;
+     };
+     let root = command_substitution(&root_output.stdout);
+     if root.is_empty() {
+         println!("repo: none (not a git repository)");
+         println!("dir: {dir_display}");
+         return 0;
+     }
+diff --git a/src/orient/lint.rs b/src/orient/lint.rs
+index bc5d59c..74d742e 100644
+--- a/src/orient/lint.rs
++++ b/src/orient/lint.rs
+@@ -18,20 +18,21 @@ pub fn run(args: &[String]) -> u8 {
+                 eprintln!("{error}");
+                 return 1;
+             }
+             input
+         }
+     };
+ 
+     // Python text streams apply universal-newline translation before
+     // `readlines()` returns the input.
+     let input = input.replace("\r\n", "\n").replace('\r', "\n");
++    // The reference counts each reported problem, not each failed bullet.
+     let mut failures = 0;
+     for (line_number, line) in input.split_inclusive('\n').enumerate() {
+         if !is_bullet(line) {
+             continue;
+         }
+         let text = line.trim_end_matches('\n');
+         let problems = lint_line(text);
+         for problem in problems {
+             println!("line {}: {problem}: {}", line_number + 1, line.trim_end());
+             failures += 1;
+diff --git a/src/orient/roots.rs b/src/orient/roots.rs
+index 5964e59..e71c5fd 100644
+--- a/src/orient/roots.rs
++++ b/src/orient/roots.rs
+@@ -32,30 +32,30 @@ pub fn run(args: &[String]) -> u8 {
+     let scan_roots = if args.is_empty() {
+         candidate_roots_from_env()
+     } else {
+         args.iter().map(PathBuf::from).collect()
+     };
+ 
+     let state_home = state_home();
+     let default_file = state_home.join("jeeves/roots.txt");
+     let roots_file = std::env::var_os("JEEVES_ROOTS_FILE")
+         .filter(|value| !value.is_empty())
++        .or_else(|| std::env::var_os("ORIENT_ROOTS_FILE").filter(|value| !value.is_empty()))
+         .map(PathBuf::from)
+         .unwrap_or_else(|| default_file.clone());
+ 
+     let mut chosen: BTreeMap<String, Candidate> = BTreeMap::new();
+     for root in scan_roots {
+         if !root.is_dir() {
+             continue;
+         }
+-        let mut git_entries = Vec::new();
+-        collect_git_entries(&root, 0, &mut git_entries);
++        let mut git_entries = git_entries(&root);
+         git_entries.sort();
+         for git_entry in git_entries {
+             let Some(repo_path) = git_entry.parent() else {
+                 continue;
+             };
+             let Some(origin) = origin_of(repo_path) else {
+                 continue;
+             };
+             let key = normalize_url(&origin);
+             if key.is_empty() {
+@@ -115,84 +115,93 @@ pub fn run(args: &[String]) -> u8 {
+     0
+ }
+ 
+ fn print_usage() {
+     println!("bin: {}", self_display());
+     println!("description: {DESCRIPTION}");
+     println!();
+     println!("usage: discover-roots.sh [root ...]");
+     println!();
+     println!("arguments:");
+-    println!("  [root]   dirs to scan for git repos; defaults to $ORIENT_ROOT_CANDIDATES");
+-    println!("           (space/colon separated), else /workspace $HOME/.claude $HOME/.dotfiles");
++    println!("  [root]   dirs to scan for git repos; defaults to $JEEVES_ROOT_CANDIDATES");
++    println!("           then $ORIENT_ROOT_CANDIDATES (space/colon separated), else");
++    println!("           /workspace $HOME/.claude $HOME/.dotfiles");
+     println!();
+     println!("flags:");
+     println!("  --help   show this reference");
+     println!();
+     println!("environment:");
+-    println!("  ORIENT_ROOT_CANDIDATES   dirs to scan when no [root] is given");
+-    println!("  ORIENT_ROOTS_FILE        where to persist the discovered roots");
+-    println!("                           (default $XDG_STATE_HOME/orient/roots.txt)");
++    println!("  JEEVES_ROOT_CANDIDATES   canonical dirs to scan when no [root] is given");
++    println!("  ORIENT_ROOT_CANDIDATES   legacy dirs to scan when no [root] is given");
++    println!("  JEEVES_ROOTS_FILE        canonical roots-file path");
++    println!("  ORIENT_ROOTS_FILE        legacy roots-file path");
++    println!("                           (default $XDG_STATE_HOME/jeeves/roots.txt)");
+ }
+ 
+ fn candidate_roots_from_env() -> Vec<PathBuf> {
+-    let value = nonempty_env("ORIENT_ROOT_CANDIDATES")
+-        .or_else(|| nonempty_env("JEEVES_ROOT_CANDIDATES"))
+-        .unwrap_or_else(|| {
+-            let home = std::env::var("HOME").unwrap_or_default();
+-            format!("/workspace {home}/.claude {home}/.dotfiles")
+-        });
+-    value
+-        .split([':', ' '])
+-        .filter(|part| !part.is_empty())
+-        .map(PathBuf::from)
+-        .collect()
++    if let Some(value) =
++        nonempty_env("JEEVES_ROOT_CANDIDATES").or_else(|| nonempty_env("ORIENT_ROOT_CANDIDATES"))
++    {
++        return value
++            .split([':', ' '])
++            .filter(|part| !part.is_empty())
++            .map(PathBuf::from)
++            .collect();
++    }
++
++    let mut roots = vec![PathBuf::from("/workspace")];
++    if let Some(home) = dirs::home_dir() {
++        roots.push(home.join(".claude"));
++        roots.push(home.join(".dotfiles"));
++    }
++    roots
+ }
+ 
+ fn nonempty_env(name: &str) -> Option<String> {
+     std::env::var(name).ok().filter(|value| !value.is_empty())
+ }
+ 
+ fn state_home() -> PathBuf {
+     std::env::var_os("XDG_STATE_HOME")
+         .filter(|value| !value.is_empty())
+         .map(PathBuf::from)
+         .unwrap_or_else(|| {
+             let home = std::env::var_os("HOME").unwrap_or_default();
+             PathBuf::from(home).join(".local/state")
+         })
+ }
+ 
+-fn collect_git_entries(dir: &Path, depth: usize, output: &mut Vec<PathBuf>) {
+-    let Ok(entries) = std::fs::read_dir(dir) else {
+-        return;
++fn git_entries(root: &Path) -> Vec<PathBuf> {
++    let Ok(output) = Command::new("fd")
++        .args([
++            "-t",
++            "d",
++            "-d",
++            "4",
++            "-H",
++            "-E",
++            "node_modules",
++            "-E",
++            ".cache",
++            "^\\.git$",
++        ])
++        .arg(root)
++        .output()
++    else {
++        return Vec::new();
+     };
+-    for entry in entries.flatten() {
+-        let path = entry.path();
+-        let name = entry.file_name();
+-        let name = name.to_string_lossy();
+-        let Ok(file_type) = entry.file_type() else {
+-            continue;
+-        };
+-        if (name == "node_modules" || name == ".cache") && file_type.is_dir() {
+-            continue;
+-        }
+-        if name == ".git" && depth < 4 {
+-            if file_type.is_dir() || file_type.is_file() {
+-                output.push(path);
+-            }
+-            continue;
+-        }
+-        if file_type.is_dir() && depth < 3 {
+-            collect_git_entries(&path, depth + 1, output);
+-        }
+-    }
++
++    String::from_utf8_lossy(&output.stdout)
++        .lines()
++        .filter(|line| !line.is_empty())
++        .map(PathBuf::from)
++        .collect()
+ }
+ 
+ fn origin_of(repo: &Path) -> Option<String> {
+     let output = Command::new("git")
+         .arg("-C")
+         .arg(repo)
+         .args(["remote", "get-url", "origin"])
+         .output()
+         .ok()?;
+     if !output.status.success() {
+diff --git a/src/orient/sessions.rs b/src/orient/sessions.rs
+index 8bb7ef4..74f1cd9 100644
+--- a/src/orient/sessions.rs
++++ b/src/orient/sessions.rs
+@@ -27,27 +27,61 @@ pub fn run(args: &[String]) -> u8 {
+     });
+     if let Some(path) = latest {
+         println!("CLAUDE_JSONL={}", path.display());
+     }
+ 
+     emit_opencode_session(&dir);
+     0
+ }
+ 
+ fn resolved_dir(raw_dir: &str) -> String {
+-    if Path::new(raw_dir).is_dir() {
+-        std::fs::canonicalize(raw_dir)
+-            .map(|path| path.to_string_lossy().into_owned())
+-            .unwrap_or_else(|_| raw_dir.to_string())
+-    } else {
++    let original = std::env::current_dir().ok();
++    let logical_cwd = logical_current_dir(original.as_deref());
++    if std::env::set_current_dir(raw_dir).is_err() {
+         raw_dir.to_string()
++    } else {
++        let path = if Path::new(raw_dir).is_absolute() {
++            PathBuf::from(raw_dir)
++        } else {
++            logical_cwd.join(raw_dir)
++        };
++        let resolved = normalize_logical_path(path);
++        if let Some(original) = original {
++            let _ = std::env::set_current_dir(original);
++        }
++        resolved.to_string_lossy().into_owned()
++    }
++}
++
++fn logical_current_dir(fallback: Option<&Path>) -> PathBuf {
++    std::env::var_os("PWD")
++        .map(PathBuf::from)
++        .filter(|path| path.is_absolute() && path.is_dir())
++        .or_else(|| fallback.map(Path::to_path_buf))
++        .unwrap_or_else(|| PathBuf::from("."))
++}
++
++fn normalize_logical_path(path: PathBuf) -> PathBuf {
++    let is_absolute = path.is_absolute();
++    let mut normalized = PathBuf::new();
++    for component in path.components() {
++        match component {
++            std::path::Component::CurDir => {}
++            std::path::Component::ParentDir => {
++                if !normalized.pop() && !is_absolute {
++                    normalized.push(component.as_os_str());
++                }
++            }
++            _ => normalized.push(component.as_os_str()),
++        }
+     }
++    normalized
+ }
+ 
+ fn claude_projects_dir() -> PathBuf {
+     let home = std::env::var_os("HOME").unwrap_or_default();
+     if home.is_empty() {
+         PathBuf::from("/.claude/projects")
+     } else {
+         PathBuf::from(home).join(".claude/projects")
+     }
+ }
+diff --git a/src/orient/tail.rs b/src/orient/tail.rs
+index d104543..c418586 100644
+--- a/src/orient/tail.rs
++++ b/src/orient/tail.rs
+@@ -1,122 +1,171 @@
+ //! Human-readable tails of Claude Code JSONL sessions.
+ 
+ use serde_json::Value;
++use std::io::Write;
++use std::process::{Command, Stdio};
+ 
+ /// Runs `session-tail` with the reference-compatible positional arguments.
+ pub fn run(args: &[String]) -> u8 {
+     let Some(file_arg) = args.first() else {
+-        println!("usage: session-tail.sh <jsonl> [since-iso] [max]");
++        eprintln!("usage: session-tail.sh <jsonl> [since-iso] [max]");
+         return 1;
+     };
+     if !std::path::Path::new(file_arg).is_file() {
+         println!("error: no such file: {file_arg}");
+         return 1;
+     }
+     let Ok(input) = std::fs::read_to_string(file_arg) else {
+         return 1;
+     };
+     let since = args.get(1).map(String::as_str).unwrap_or("");
+     let max_arg = args
+         .get(2)
+         .map(String::as_str)
+         .filter(|value| !value.is_empty())
+         .unwrap_or("40");
+-    let Ok(max) = max_arg.parse::<i64>() else {
+-        return 1;
+-    };
+ 
+     let mut entries = Vec::new();
++    let mut jq_failed = false;
+     for line in input.lines() {
+-        let Ok(value) = serde_json::from_str::<Value>(line) else {
++        if line.trim().is_empty() {
+             continue;
++        }
++        let Ok(value) = serde_json::from_str::<Value>(line) else {
++            jq_failed = true;
++            break;
+         };
++        jq_failed = false;
+         let Some(timestamp) = value.get("timestamp").filter(|value| !value.is_null()) else {
+             continue;
+         };
+         let Some(role) = value
+             .get("message")
+             .and_then(|message| message.get("role"))
+             .filter(|value| !value.is_null())
+         else {
+             continue;
+         };
+         if !since.is_empty() && !timestamp_is_at_or_after(timestamp, since) {
+             continue;
+         }
+ 
+         let Some(message) = value.get("message") else {
+             continue;
+         };
+         let content = message.get("content");
+-        let text = content_text(content);
++        let Ok(text) = content_text(content) else {
++            jq_failed = true;
++            continue;
++        };
+         if text.is_empty() {
+             continue;
+         }
+ 
+         let text: String = text.chars().take(800).collect();
+         entries.push(format!(
+             "[{}] {}: {text}",
+             jq_text(timestamp),
+             jq_text(role)
+         ));
+     }
+ 
+-    let entries = tail_entries(entries, max);
+-    if !entries.is_empty() {
+-        println!("{}", entries.join("\n"));
++    // The reference's jq-unavailable branch cannot occur here: serde_json is
++    // the parser replacement, so the fallback line is unreachable by design.
++    let rendered = if entries.is_empty() {
++        String::new()
++    } else {
++        format!("{}\n", entries.join("\n"))
++    };
++    let Some(tail_status) = run_tail(&rendered, max_arg) else {
++        return 1;
++    };
++    if tail_status != 0 {
++        return tail_status;
++    }
++    if jq_failed {
++        5
++    } else {
++        0
+     }
+-    0
+ }
+ 
+ fn timestamp_is_at_or_after(timestamp: &Value, since: &str) -> bool {
+     // Session timestamps are ISO strings, so jq's comparison is a lexical
+     // comparison in the normal and contractually relevant case.
+     match timestamp {
+         Value::String(timestamp) => timestamp.as_str() >= since,
+         Value::Array(_) | Value::Object(_) => true,
+         Value::Null | Value::Bool(_) | Value::Number(_) => false,
+     }
+ }
+ 
+-fn content_text(content: Option<&Value>) -> String {
+-    let Some(content) = content.filter(|value| !value.is_null()) else {
+-        return String::new();
++fn content_text(content: Option<&Value>) -> Result<String, ()> {
++    let Some(content) = content else {
++        return Ok(String::new());
+     };
+     match content {
+-        Value::Array(parts) => parts
+-            .iter()
+-            .filter(|part| part.get("type") == Some(&Value::String("text".to_string())))
+-            .map(|part| part.get("text").map_or_else(String::new, jq_join_text))
+-            .collect::<Vec<_>>()
+-            .join(" "),
+-        other => jq_text(other),
++        Value::Null | Value::Bool(false) => Ok(String::new()),
++        Value::Array(parts) => {
++            let mut text_parts = Vec::new();
++            for part in parts {
++                if part.get("type") != Some(&Value::String("text".to_string())) {
++                    continue;
++                }
++                let text = part.get("text").unwrap_or(&Value::Null);
++                text_parts.push(jq_join_text(text)?);
++            }
++            Ok(text_parts.join(" "))
++        }
++        other => Ok(jq_text(other)),
+     }
+ }
+ 
+-fn jq_join_text(value: &Value) -> String {
++fn jq_join_text(value: &Value) -> Result<String, ()> {
+     match value {
+-        Value::Null => String::new(),
+-        _ => jq_text(value),
++        Value::Null => Ok(String::new()),
++        Value::Array(_) | Value::Object(_) => Err(()),
++        _ => Ok(jq_text(value)),
+     }
+ }
+ 
+ fn jq_text(value: &Value) -> String {
+     match value {
+         Value::Null => "null".to_string(),
+         Value::Bool(value) => value.to_string(),
+         Value::Number(value) => value.to_string(),
+         Value::String(value) => value.clone(),
+         Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+     }
+ }
+ 
+-fn tail_entries(entries: Vec<String>, max: i64) -> Vec<String> {
+-    if max >= 0 {
+-        let keep = max as usize;
+-        let start = entries.len().saturating_sub(keep);
+-        entries[start..].to_vec()
+-    } else {
+-        let skip = max.unsigned_abs() as usize;
+-        entries[skip.min(entries.len())..].to_vec()
+-    }
++fn run_tail(input: &str, max: &str) -> Option<u8> {
++    let mut child = Command::new("tail")
++        .args(["-n", max])
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .spawn()
++        .ok()?;
++    let write_failed = child
++        .stdin
++        .take()
++        .map(|mut stdin| stdin.write_all(input.as_bytes()).is_err())
++        .unwrap_or(false);
++    let output = child.wait_with_output().ok()?;
++    print!("{}", String::from_utf8_lossy(&output.stdout));
++    let status = output.status.code().unwrap_or(1);
++    Some(
++        if status == 0 && (write_failed || is_zero_tail_limit(max) && !input.is_empty()) {
++            // GNU tail -n 0 closes the pipe before jq can finish writing, so the
++            // reference pipeline reports jq's SIGPIPE status (141).
++            141
++        } else {
++            status as u8
++        },
++    )
++}
++
++fn is_zero_tail_limit(max: &str) -> bool {
++    let max = max.trim();
++    let digits = max.strip_prefix('-').unwrap_or(max);
++    !digits.is_empty() && digits.chars().all(|character| character == '0')
+ }
+diff --git a/tests/orient_golden.rs b/tests/orient_golden.rs
+index f5dd29e..e37182a 100644
+--- a/tests/orient_golden.rs
++++ b/tests/orient_golden.rs
+@@ -149,20 +149,51 @@ fn git_state_clean_dirty_and_error_cases_match_reference() {
+     let missing = dir.join("missing");
+     let missing_arg = missing.to_string_lossy().into_owned();
+     let reference = run_ref("git-state.sh", &[&missing_arg]);
+     let rust = run_rust("git-state", &[&missing_arg]);
+     assert_stdout_parity(&reference, &rust, "git-state cd failure");
+     assert_eq!(rust.status.code(), Some(1));
+ 
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
++#[cfg(unix)]
++#[test]
++fn git_state_rejects_an_unenterable_directory_like_reference() {
++    let uid = Command::new("id").arg("-u").output().unwrap();
++    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
++        eprintln!("skip: chmod-000 cd test is not meaningful as root");
++        return;
++    }
++
++    use std::os::unix::fs::PermissionsExt;
++
++    let dir = scratch_dir("git-state-permissions");
++    let blocked = dir.join("blocked");
++    std::fs::create_dir_all(&blocked).unwrap();
++    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
++    let blocked_arg = blocked.to_string_lossy().into_owned();
++
++    let reference = run_ref("git-state.sh", &[&blocked_arg]);
++    let rust = run_rust("git-state", &[&blocked_arg]);
++
++    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
++    assert_stdout_parity(&reference, &rust, "git-state unenterable directory");
++    assert_eq!(rust.status.code(), Some(1));
++    assert_eq!(
++        rust.stdout,
++        format!("error: cannot cd to {blocked_arg}\n").as_bytes()
++    );
++
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
+ #[test]
+ fn roots_deduplicate_and_persist_with_matching_toon() {
+     let dir = scratch_dir("roots");
+     let tree = dir.join("tree");
+     std::fs::create_dir_all(&tree).unwrap();
+ 
+     let primary = tree.join("primary");
+     init_repo(&primary);
+     commit_at(
+         &primary,
+@@ -225,30 +256,30 @@ fn roots_deduplicate_and_persist_with_matching_toon() {
+     );
+ 
+     let state = dir.join("state");
+     let reference_file = dir.join("reference-roots.txt");
+     let rust_file = dir.join("rust-roots.txt");
+     let tree_arg = tree.to_string_lossy().into_owned();
+ 
+     let reference = Command::new("bash")
+         .arg(ref_script("discover-roots.sh"))
+         .env("ORIENT_ROOT_CANDIDATES", &tree_arg)
+-        .env("JEEVES_ROOT_CANDIDATES", dir.join("not-used"))
++        .env("JEEVES_ROOT_CANDIDATES", &tree_arg)
+         .env("ORIENT_ROOTS_FILE", &reference_file)
+         .env_remove("JEEVES_ROOTS_FILE")
+         .env("XDG_STATE_HOME", &state)
+         .output()
+         .unwrap();
+     let rust = Command::new(env!("CARGO_BIN_EXE_jeeves"))
+         .arg("roots")
+-        .env("ORIENT_ROOT_CANDIDATES", &tree_arg)
+-        .env("JEEVES_ROOT_CANDIDATES", dir.join("not-used"))
++        .env("ORIENT_ROOT_CANDIDATES", dir.join("not-used"))
++        .env("JEEVES_ROOT_CANDIDATES", &tree_arg)
+         .env_remove("ORIENT_ROOTS_FILE")
+         .env("JEEVES_ROOTS_FILE", &rust_file)
+         .env("XDG_STATE_HOME", &state)
+         .output()
+         .unwrap();
+ 
+     assert_eq!(reference.status.code(), Some(0), "reference roots failed");
+     assert_eq!(rust.status.code(), Some(0), "rust roots failed");
+     assert_eq!(
+         std::fs::read(&reference_file).unwrap(),
+@@ -261,20 +292,280 @@ fn roots_deduplicate_and_persist_with_matching_toon() {
+         "roots TOON mismatch\nreference:\n{}\nrust:\n{}",
+         String::from_utf8_lossy(&reference.stdout),
+         String::from_utf8_lossy(&rust.stdout)
+     );
+     assert!(String::from_utf8_lossy(&rust.stdout).contains("count: 1 distinct remotes"));
+     assert!(String::from_utf8_lossy(&rust.stdout).contains(&format!("  {}", primary.display())));
+ 
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
++#[test]
++fn roots_environment_aliases_and_precedence_match_reference() {
++    let dir = scratch_dir("roots-env");
++    let canonical_tree = dir.join("canonical-tree");
++    let legacy_tree = dir.join("legacy-tree");
++    let canonical_repo = canonical_tree.join("canonical");
++    let legacy_repo = legacy_tree.join("legacy");
++
++    init_repo(&canonical_repo);
++    commit_at(
++        &canonical_repo,
++        "canonical.txt",
++        "canonical\n",
++        "canonical",
++        "2022-01-01T00:00:00Z",
++    );
++    git(
++        &canonical_repo,
++        &[
++            "remote",
++            "add",
++            "origin",
++            "https://example.com/env-canonical.git",
++        ],
++    );
++
++    init_repo(&legacy_repo);
++    commit_at(
++        &legacy_repo,
++        "legacy.txt",
++        "legacy\n",
++        "legacy",
++        "2022-01-01T00:00:00Z",
++    );
++    git(
++        &legacy_repo,
++        &[
++            "remote",
++            "add",
++            "origin",
++            "https://example.com/env-legacy.git",
++        ],
++    );
++
++    let state = dir.join("state");
++    let reference_canonical_file = dir.join("reference-canonical.txt");
++    let rust_canonical_file = dir.join("rust-canonical.txt");
++    let rust_legacy_file = dir.join("rust-legacy.txt");
++    let canonical_arg = canonical_tree.to_string_lossy().into_owned();
++    let legacy_arg = legacy_tree.to_string_lossy().into_owned();
++
++    let reference = Command::new("bash")
++        .arg(ref_script("discover-roots.sh"))
++        .env_remove("JEEVES_ROOT_CANDIDATES")
++        .env("ORIENT_ROOT_CANDIDATES", &canonical_arg)
++        .env_remove("JEEVES_ROOTS_FILE")
++        .env("ORIENT_ROOTS_FILE", &reference_canonical_file)
++        .env("XDG_STATE_HOME", &state)
++        .output()
++        .unwrap();
++    let rust = Command::new(env!("CARGO_BIN_EXE_jeeves"))
++        .arg("roots")
++        .env("JEEVES_ROOT_CANDIDATES", &canonical_arg)
++        .env("ORIENT_ROOT_CANDIDATES", &legacy_arg)
++        .env("JEEVES_ROOTS_FILE", &rust_canonical_file)
++        .env("ORIENT_ROOTS_FILE", &rust_legacy_file)
++        .env("XDG_STATE_HOME", &state)
++        .output()
++        .unwrap();
++
++    assert_eq!(reference.status.code(), Some(0));
++    assert_eq!(rust.status.code(), Some(0));
++    assert_eq!(
++        std::fs::read(&reference_canonical_file).unwrap(),
++        std::fs::read(&rust_canonical_file).unwrap(),
++        "canonical roots file mismatch"
++    );
++    assert_eq!(
++        normalize_toon(&reference.stdout),
++        normalize_toon(&rust.stdout),
++        "roots canonical environment precedence"
++    );
++    assert!(!rust_legacy_file.exists(), "legacy file should not win");
++
++    let reference_legacy_file = dir.join("reference-legacy.txt");
++    let rust_legacy_only_file = dir.join("rust-legacy-only.txt");
++    let reference = Command::new("bash")
++        .arg(ref_script("discover-roots.sh"))
++        .env_remove("JEEVES_ROOT_CANDIDATES")
++        .env("ORIENT_ROOT_CANDIDATES", &legacy_arg)
++        .env_remove("JEEVES_ROOTS_FILE")
++        .env("ORIENT_ROOTS_FILE", &reference_legacy_file)
++        .env("XDG_STATE_HOME", &state)
++        .output()
++        .unwrap();
++    let rust = Command::new(env!("CARGO_BIN_EXE_jeeves"))
++        .arg("roots")
++        .env_remove("JEEVES_ROOT_CANDIDATES")
++        .env("ORIENT_ROOT_CANDIDATES", &legacy_arg)
++        .env_remove("JEEVES_ROOTS_FILE")
++        .env("ORIENT_ROOTS_FILE", &rust_legacy_only_file)
++        .env("XDG_STATE_HOME", &state)
++        .output()
++        .unwrap();
++
++    assert_eq!(reference.status.code(), rust.status.code());
++    assert_eq!(
++        normalize_toon(&reference.stdout),
++        normalize_toon(&rust.stdout),
++        "roots legacy-only environment"
++    );
++    assert_eq!(
++        std::fs::read(&reference_legacy_file).unwrap(),
++        std::fs::read(&rust_legacy_only_file).unwrap(),
++        "legacy roots file mismatch"
++    );
++    assert!(String::from_utf8_lossy(&rust.stdout)
++        .contains(&format!("roots_file: {}", rust_legacy_only_file.display())));
++
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn roots_fd_traversal_matches_reference() {
++    let dir = scratch_dir("roots-fd");
++    let tree = dir.join("tree");
++    let visible = tree.join("visible");
++    init_repo(&visible);
++    commit_at(
++        &visible,
++        "visible.txt",
++        "visible\n",
++        "visible",
++        "2022-01-01T00:00:00Z",
++    );
++    git(
++        &visible,
++        &[
++            "remote",
++            "add",
++            "origin",
++            "https://example.com/fd-visible.git",
++        ],
++    );
++
++    let ignored = tree.join("node_modules/ignored");
++    init_repo(&ignored);
++    commit_at(
++        &ignored,
++        "ignored.txt",
++        "ignored\n",
++        "ignored",
++        "2022-01-01T00:00:00Z",
++    );
++    git(
++        &ignored,
++        &[
++            "remote",
++            "add",
++            "origin",
++            "https://example.com/fd-node-modules.git",
++        ],
++    );
++
++    let cached = tree.join(".cache/ignored");
++    init_repo(&cached);
++    commit_at(
++        &cached,
++        "cached.txt",
++        "cached\n",
++        "cached",
++        "2022-01-01T00:00:00Z",
++    );
++    git(
++        &cached,
++        &[
++            "remote",
++            "add",
++            "origin",
++            "https://example.com/fd-cache.git",
++        ],
++    );
++
++    let deep = tree.join("a/b/c/d/repo");
++    init_repo(&deep);
++    commit_at(&deep, "deep.txt", "deep\n", "deep", "2022-01-01T00:00:00Z");
++    git(
++        &deep,
++        &[
++            "remote",
++            "add",
++            "origin",
++            "https://example.com/fd-too-deep.git",
++        ],
++    );
++
++    let source = dir.join("source");
++    init_repo(&source);
++    commit_at(
++        &source,
++        "source.txt",
++        "source\n",
++        "source",
++        "2022-01-01T00:00:00Z",
++    );
++    git(
++        &source,
++        &[
++            "remote",
++            "add",
++            "origin",
++            "https://example.com/fd-worktree.git",
++        ],
++    );
++    let linked = tree.join("linked");
++    let linked_arg = linked.to_string_lossy().into_owned();
++    git(
++        &source,
++        &["worktree", "add", "-q", "-b", "linked", &linked_arg, "main"],
++    );
++
++    let reference_file = dir.join("reference.txt");
++    let rust_file = dir.join("rust.txt");
++    let tree_arg = tree.to_string_lossy().into_owned();
++    let reference = Command::new("bash")
++        .arg(ref_script("discover-roots.sh"))
++        .arg(&tree_arg)
++        .env("ORIENT_ROOTS_FILE", &reference_file)
++        .env_remove("JEEVES_ROOTS_FILE")
++        .output()
++        .unwrap();
++    let rust = Command::new(env!("CARGO_BIN_EXE_jeeves"))
++        .arg("roots")
++        .arg(&tree_arg)
++        .env("JEEVES_ROOTS_FILE", &rust_file)
++        .env_remove("ORIENT_ROOTS_FILE")
++        .output()
++        .unwrap();
++
++    assert_eq!(reference.status.code(), rust.status.code());
++    assert_eq!(
++        normalize_toon(&reference.stdout),
++        normalize_toon(&rust.stdout),
++        "roots fd traversal"
++    );
++    assert_eq!(
++        std::fs::read(&reference_file).unwrap(),
++        std::fs::read(&rust_file).unwrap(),
++        "fd traversal roots file mismatch"
++    );
++    let stdout = String::from_utf8_lossy(&rust.stdout);
++    assert!(stdout.contains(&format!("  {}", visible.display())));
++    assert!(!stdout.contains(&ignored.display().to_string()));
++    assert!(!stdout.contains(&cached.display().to_string()));
++    assert!(!stdout.contains(&deep.display().to_string()));
++    assert!(!stdout.contains(&linked.display().to_string()));
++
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
+ #[test]
+ fn roots_rewrite_existing_legacy_file_when_using_default_path() {
+     let dir = scratch_dir("roots-migration");
+     let tree = dir.join("tree");
+     let repo = tree.join("repo");
+     init_repo(&repo);
+     commit_at(
+         &repo,
+         "file.txt",
+         "content\n",
+@@ -424,20 +715,83 @@ fn session_tail_filters_truncates_and_matches_reference() {
+     let missing = dir.join("missing.jsonl");
+     let missing_arg = missing.to_string_lossy().into_owned();
+     let reference = run_ref("session-tail.sh", &[&missing_arg]);
+     let rust = run_rust("session-tail", &[&missing_arg]);
+     assert_stdout_parity(&reference, &rust, "session-tail missing file");
+     assert_eq!(rust.status.code(), Some(1));
+ 
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
++#[test]
++fn session_tail_malformed_json_preserves_prior_output_and_reference_status() {
++    let dir = scratch_dir("session-tail-malformed");
++    let session = dir.join("session.jsonl");
++    let before = json!({
++        "timestamp": "2026-07-12T14:00:00Z",
++        "message": {"role": "user", "content": "before"}
++    });
++    let after = json!({
++        "timestamp": "2026-07-12T14:00:01Z",
++        "message": {"role": "assistant", "content": "after"}
++    });
++    std::fs::write(&session, format!("{}\nnot json\n{}\n", before, after)).unwrap();
++
++    let session_arg = session.to_string_lossy().into_owned();
++    let reference = run_ref("session-tail.sh", &[&session_arg]);
++    let rust = run_rust("session-tail", &[&session_arg]);
++    assert_stdout_parity(&reference, &rust, "session-tail malformed JSON");
++    assert_eq!(rust.status.code(), Some(5));
++    assert!(String::from_utf8_lossy(&rust.stdout).contains("user: before"));
++    assert!(!String::from_utf8_lossy(&rust.stdout).contains("assistant: after"));
++
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++#[test]
++fn session_tail_gnu_max_forms_and_diagnostics_match_reference() {
++    let dir = scratch_dir("session-tail-max");
++    let session = dir.join("session.jsonl");
++    let lines: Vec<String> = (0..5)
++        .map(|n| {
++            json!({
++                "timestamp": format!("2026-07-12T14:00:0{n}Z"),
++                "message": {"role": "user", "content": format!("entry-{n}")}
++            })
++            .to_string()
++        })
++        .collect();
++    std::fs::write(&session, format!("{}\n", lines.join("\n"))).unwrap();
++    let session_arg = session.to_string_lossy().into_owned();
++
++    for max in ["+2", "-2", "2", "0"] {
++        let reference = run_ref("session-tail.sh", &[&session_arg, "", max]);
++        let rust = run_rust("session-tail", &[&session_arg, "", max]);
++        assert_stdout_parity(&reference, &rust, &format!("session-tail max {max}"));
++    }
++
++    let reference = run_ref("session-tail.sh", &[]);
++    let rust = run_rust("session-tail", &[]);
++    assert_stdout_parity(&reference, &rust, "session-tail missing argument");
++    assert!(rust.stdout.is_empty());
++    assert!(!rust.stderr.is_empty());
++
++    let reference = run_ref("session-tail.sh", &[&session_arg, "", "invalid"]);
++    let rust = run_rust("session-tail", &[&session_arg, "", "invalid"]);
++    assert_stdout_parity(&reference, &rust, "session-tail invalid max");
++    assert_eq!(rust.status.code(), Some(1));
++    assert!(rust.stdout.is_empty());
++    assert!(!rust.stderr.is_empty());
++
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
+ #[test]
+ fn sessions_newest_claude_file_and_empty_case_match_reference() {
+     let dir = scratch_dir("sessions");
+     let home = dir.join("home");
+     let project_dir = dir.join("project");
+     let projects = home.join(".claude/projects");
+     std::fs::create_dir_all(&project_dir).unwrap();
+     let slug: String = project_dir
+         .to_string_lossy()
+         .bytes()
+@@ -512,20 +866,72 @@ fn sessions_newest_claude_file_and_empty_case_match_reference() {
+         .env("JEEVES_ORIENT_OPENCODE_SCAN", "0")
+         .output()
+         .unwrap();
+     assert_stdout_parity(&reference, &rust, "sessions no matching Claude file");
+     assert_eq!(rust.status.code(), Some(0));
+     assert!(rust.stdout.is_empty());
+ 
+     let _ = std::fs::remove_dir_all(&dir);
+ }
+ 
++#[cfg(unix)]
++#[test]
++fn sessions_preserves_a_symlink_argument_for_the_project_slug() {
++    use std::os::unix::fs::symlink;
++
++    let dir = scratch_dir("sessions-symlink");
++    let home = dir.join("home");
++    let real = dir.join("real-project");
++    let link = dir.join("logical-project");
++    std::fs::create_dir_all(&real).unwrap();
++    symlink(&real, &link).unwrap();
++
++    let slug: String = real
++        .to_string_lossy()
++        .bytes()
++        .map(|byte| {
++            if byte.is_ascii_alphanumeric() {
++                byte as char
++            } else {
++                '-'
++            }
++        })
++        .collect();
++    let claude_project = home.join(".claude/projects").join(slug);
++    std::fs::create_dir_all(&claude_project).unwrap();
++    let session = claude_project.join("real-target.jsonl");
++    std::fs::write(&session, "real target\n").unwrap();
++
++    let link_arg = link.to_string_lossy().into_owned();
++    let reference = Command::new("bash")
++        .arg(ref_script("session-discover.sh"))
++        .arg(&link_arg)
++        .env("HOME", &home)
++        .env("ORIENT_OPENCODE_SCAN", "0")
++        .env_remove("JEEVES_ORIENT_OPENCODE_SCAN")
++        .output()
++        .unwrap();
++    let rust = Command::new(env!("CARGO_BIN_EXE_jeeves"))
++        .arg("sessions")
++        .arg(&link_arg)
++        .env("HOME", &home)
++        .env("ORIENT_OPENCODE_SCAN", "0")
++        .env("JEEVES_ORIENT_OPENCODE_SCAN", "0")
++        .output()
++        .unwrap();
++
++    assert_stdout_parity(&reference, &rust, "sessions symlink argument");
++    assert!(rust.stdout.is_empty());
++
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
+ #[test]
+ fn checkin_lint_stdin_and_file_golden_match_reference() {
+     let dir = scratch_dir("checkin-lint");
+     let long_body = "x".repeat(119);
+     let markdown = format!(
+         "# status\n\nA non-bullet line, with commas, **bold**, and no linting.\n\n- clean bullet\n  * clean, with two commas, okay\n- {long_body}\n* one, two, three, four\n- **first** and **second**\n- {long_body}, one, two, three, **first** and **second**\nnot a bullet - still untouched\n"
+     );
+ 
+     let script = ref_script("lint-checkin.py");
+     let script_arg = script.to_string_lossy().into_owned();
+@@ -551,10 +957,30 @@ fn checkin_lint_stdin_and_file_golden_match_reference() {
+         .arg("checkin-lint")
+         .arg(&clean)
+         .output()
+         .unwrap();
+     assert_stdout_parity(&reference, &rust, "checkin-lint clean file");
+     assert_eq!(rust.status.code(), Some(0));
+     assert_eq!(rust.stdout, b"OK: all bullets pass.\n");
+ 
+     let _ = std::fs::remove_dir_all(&dir);
+ }
++
++#[test]
++fn checkin_lint_three_problems_have_three_diagnostics_and_summary() {
++    let long_body = "x".repeat(119);
++    let markdown = format!("- {long_body}, one, two, three **first** **second**\nplain\n");
++    let script = ref_script("lint-checkin.py");
++    let script_arg = script.to_string_lossy().into_owned();
++    let reference = run_with_stdin(Path::new("python3"), &[&script_arg], &markdown);
++    let rust = run_with_stdin(
++        Path::new(env!("CARGO_BIN_EXE_jeeves")),
++        &["checkin-lint"],
++        &markdown,
++    );
++
++    assert_stdout_parity(&reference, &rust, "checkin-lint three problems");
++    assert_eq!(rust.status.code(), Some(1));
++    let output = String::from_utf8_lossy(&rust.stdout);
++    assert_eq!(output.lines().count(), 4);
++    assert_eq!(output.lines().last(), Some("3 violation(s) found."));
++}
