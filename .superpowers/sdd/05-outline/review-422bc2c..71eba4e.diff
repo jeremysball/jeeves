@@ -1,0 +1,811 @@
+# Review package: 422bc2c..71eba4e
+
+## Commits
+71eba4e feat(digest): port install-cron with stable-dirs PATH and add migrate plan printer
+
+## Files changed
+ src/digest/cron.rs           | 243 +++++++++++++++++++++++++++++++++++++++
+ src/digest/mod.rs            |   1 +
+ src/lib.rs                   |   7 ++
+ src/main.rs                  |   9 ++
+ src/migrate.rs               | 160 ++++++++++++++++++++++++++
+ tests/cron_migrate.rs        | 267 +++++++++++++++++++++++++++++++++++++++++++
+ tests/fixtures/settings.json |  26 +++++
+ 7 files changed, 713 insertions(+)
+
+## Diff
+diff --git a/src/digest/cron.rs b/src/digest/cron.rs
+new file mode 100644
+index 0000000..b29a0b9
+--- /dev/null
++++ b/src/digest/cron.rs
+@@ -0,0 +1,243 @@
++//! Idempotent crontab entry for jeeves' hourly collection run.
++//!
++//! Port of bin/install-cron.py. Deliberate deviation: the Python original
++//! writes the crontab by default (`--install`); this port only *prints* the
++//! block by default and writes only when `--write` is passed, so a stray
++//! invocation can never rewrite the user's crontab. A second deviation: the
++//! log path resolves through `state_dir_path` (read-only) instead of
++//! `state_dir` (which creates the directory), so `--print` never touches the
++//! filesystem.
++
++use std::path::{Path, PathBuf};
++
++use crate::core::paths::state_dir_path;
++
++pub const BEGIN: &str = "# BEGIN jeeves";
++pub const END: &str = "# END jeeves";
++
++/// Where mise keeps its shim farm. Honors MISE_DATA_DIR and XDG_DATA_HOME,
++/// plus a JEEVES_MISE_SHIMS override for tests/odd layouts.
++pub fn shims_dir() -> PathBuf {
++    if let Some(ovr) = std::env::var_os("JEEVES_MISE_SHIMS") {
++        if !ovr.is_empty() {
++            return PathBuf::from(ovr);
++        }
++    }
++    let data = match std::env::var_os("MISE_DATA_DIR") {
++        Some(d) if !d.is_empty() => PathBuf::from(d),
++        _ => {
++            let xdg = std::env::var_os("XDG_DATA_HOME")
++                .map(PathBuf::from)
++                .unwrap_or_else(|| home().join(".local/share"));
++            xdg.join("mise")
++        }
++    };
++    data.join("shims")
++}
++
++/// PATH for the cron environment.
++///
++/// Every entry here must be a *stable directory*: one that survives tool
++/// upgrades untouched. Resolving each tool through `shutil.which` at
++/// install time instead bakes the mise shim's resolved *versioned* install
++/// dir (e.g. `.../installs/fd/latest/fd-v10.4.2-.../`) into the crontab,
++/// and the next `mise upgrade` deletes that directory out from under cron.
++/// That is how the git-state scan silently reported `fd not found on PATH`
++/// for days after fd moved 10.4.2 → 10.5.0 (and gh's versioned dir sat
++/// stale in the same entry), unnoticed until a manual read of the
++/// snapshot's error line.
++///
++/// The mise-native answer for a fixed `PATH` is the shims directory:
++/// `fd`, `gh`, and `python3` resolve through it to whatever version is
++/// current, forever, with no reinstall. ~/.local/bin carries the
++/// non-mise user binaries taskferry and gh-axi (and mise itself, the
++/// shims' symlink target); /usr/{local/,}bin and /bin are the fallback
++/// floor for git, bash, and the system python3. `fd` belongs on PATH as
++/// much as gh: scan-active.sh does all repo discovery through it, so a
++/// PATH without it reports every workspace as empty.
++pub fn cron_path() -> String {
++    let mut dirs: Vec<PathBuf> = Vec::new();
++    for d in [
++        home().join(".local/bin"),
++        shims_dir(),
++        PathBuf::from("/usr/local/bin"),
++        PathBuf::from("/usr/bin"),
++        PathBuf::from("/bin"),
++    ] {
++        if !dirs.contains(&d) {
++            dirs.push(d);
++        }
++    }
++    dirs.iter()
++        .map(|d| d.to_string_lossy().into_owned())
++        .collect::<Vec<_>>()
++        .join(":")
++}
++
++/// The cron entry line: run `collect` at minute 13 of every hour with the
++/// stable-dirs PATH, appending to the state dir's collect.log.
++pub fn entry_line(binary: &Path) -> String {
++    let log = state_dir_path().join("collect.log");
++    format!(
++        "13 * * * * PATH={} {} collect >> {} 2>&1",
++        cron_path(),
++        binary.display(),
++        log.display()
++    )
++}
++
++/// The full marker block: BEGIN, entry, END.
++pub fn block(binary: &Path) -> String {
++    format!("{BEGIN}\n{}\n{END}\n", entry_line(binary))
++}
++
++/// Strips an existing jeeves block (BEGIN..END inclusive) from `text`,
++/// preserving every other line. Pure string-level merge helper.
++pub fn strip_block(text: &str) -> String {
++    let mut out: Vec<&str> = Vec::new();
++    let mut dropping = false;
++    for line in text.lines() {
++        if line.trim() == BEGIN {
++            dropping = true;
++            continue;
++        }
++        if line.trim() == END {
++            dropping = false;
++            continue;
++        }
++        if !dropping {
++            out.push(line);
++        }
++    }
++    out.join("\n") + if out.is_empty() { "" } else { "\n" }
++}
++
++/// Idempotent merge: strip any existing jeeves block, then append the new
++/// block. A second install of the same block is a no-op (block replaced,
++/// never duplicated).
++pub fn merge(text: &str, binary: &Path) -> String {
++    let body = block(binary);
++    let stripped = strip_block(text);
++    if stripped.trim().is_empty() {
++        body
++    } else {
++        format!("{}\n{}", stripped.trim_end_matches('\n'), body)
++    }
++}
++
++pub fn has_jeeves(text: &str) -> bool {
++    text.contains(BEGIN)
++}
++
++/// Reads the live crontab via `crontab -l`. Err carries the failure reason.
++pub fn read_crontab() -> Result<String, String> {
++    match std::process::Command::new("crontab").arg("-l").output() {
++        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
++        Ok(out) => Err(format!(
++            "crontab -l failed (exit {}): {}",
++            out.status.code().unwrap_or(-1),
++            String::from_utf8_lossy(&out.stderr).trim()
++        )),
++        Err(e) => Err(format!("cannot run crontab -l: {e}")),
++    }
++}
++
++/// Pipes `text` back through `crontab -`.
++pub fn write_crontab(text: &str) -> Result<(), String> {
++    use std::io::Write;
++    let mut child = std::process::Command::new("crontab")
++        .arg("-")
++        .stdin(std::process::Stdio::piped())
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::piped())
++        .spawn()
++        .map_err(|e| format!("cannot run crontab -: {e}"))?;
++    child
++        .stdin
++        .take()
++        .unwrap()
++        .write_all(text.as_bytes())
++        .map_err(|e| format!("cannot pipe crontab: {e}"))?;
++    let out = child
++        .wait_with_output()
++        .map_err(|e| format!("crontab - failed: {e}"))?;
++    if out.status.success() {
++        Ok(())
++    } else {
++        Err(format!(
++            "crontab - failed (exit {}): {}",
++            out.status.code().unwrap_or(-1),
++            String::from_utf8_lossy(&out.stderr).trim()
++        ))
++    }
++}
++
++/// Runs `install-cron`. `--print` (the default) prints the block; `--write`
++/// reads the live crontab, merges the block in, and pipes the result back
++/// through `crontab -`. Returns the process exit code.
++pub fn run(args: &[String]) -> u8 {
++    let mut write = false;
++    for arg in args {
++        match arg.as_str() {
++            "--print" => {}
++            "--write" => write = true,
++            "--help" => {
++                print_usage();
++                return 0;
++            }
++            value if value.starts_with("--") => {
++                println!("error: unknown flag {value}");
++                return 2;
++            }
++            value => {
++                println!("error: unexpected argument {value}");
++                return 2;
++            }
++        }
++    }
++    let binary = match std::env::current_exe() {
++        Ok(p) => p,
++        Err(e) => {
++            eprintln!("cannot resolve the current executable: {e}");
++            return 1;
++        }
++    };
++    if !write {
++        print!("{}", block(&binary));
++        return 0;
++    }
++    let current = match read_crontab() {
++        Ok(text) => text,
++        Err(reason) => {
++            eprintln!("refusing to write: {reason}");
++            return 1;
++        }
++    };
++    let merged = merge(&current, &binary);
++    if let Err(e) = write_crontab(&merged) {
++        eprintln!("{e}");
++        return 1;
++    }
++    println!("jeeves cron installed (13 * * * *)");
++    0
++}
++
++fn print_usage() {
++    println!(
++        "usage: jeeves install-cron [--print | --write]
++
++Prints the jeeves cron block (default), or installs it into the live
++crontab when --write is passed. The block runs `collect` at minute 13
++of every hour with a stable-dirs PATH.
++
++examples:
++  jeeves install-cron            # print the block
++  jeeves install-cron --write    # merge into the live crontab"
++    );
++}
++
++fn home() -> PathBuf {
++    std::env::var_os("HOME")
++        .map(PathBuf::from)
++        .unwrap_or_default()
++}
+diff --git a/src/digest/mod.rs b/src/digest/mod.rs
+new file mode 100644
+index 0000000..51d0c63
+--- /dev/null
++++ b/src/digest/mod.rs
+@@ -0,0 +1 @@
++pub mod cron;
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..717b03c
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,7 @@
++//! Jeeves library crate: shared modules for the `jeeves` binary.
++
++pub mod core;
++pub mod digest;
++pub mod migrate;
++pub mod orient;
++pub mod worktrees;
+diff --git a/src/main.rs b/src/main.rs
+index 8762b0d..9094d17 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2,20 +2,22 @@
+ // call sites land in later phases. Allow dead_code until then (the clippy
+ // gate runs with -D warnings, so this must be explicit, not incidental).
+ #![allow(dead_code)]
+ 
+ use std::path::PathBuf;
+ use std::process::ExitCode;
+ 
+ use clap::{Parser, Subcommand};
+ 
+ mod core;
++mod digest;
++mod migrate;
+ mod orient;
+ mod worktrees;
+ 
+ #[derive(Parser)]
+ #[command(
+     name = "jeeves",
+     version,
+     about = "Jeeves - worktree and digest automation"
+ )]
+ struct Cli {
+@@ -84,20 +86,27 @@ fn main() -> ExitCode {
+         return ExitCode::from(orient::roots::run(&args));
+     }
+     if std::env::args().nth(1).as_deref() == Some("session-tail") {
+         let args: Vec<String> = std::env::args().skip(2).collect();
+         return ExitCode::from(orient::tail::run(&args));
+     }
+     if std::env::args().nth(1).as_deref() == Some("scan-active") {
+         let args: Vec<String> = std::env::args().skip(2).collect();
+         return ExitCode::from(orient::scan::run(&args));
+     }
++    if std::env::args().nth(1).as_deref() == Some("install-cron") {
++        let args: Vec<String> = std::env::args().skip(2).collect();
++        return ExitCode::from(digest::cron::run(&args));
++    }
++    if std::env::args().nth(1).as_deref() == Some("migrate") {
++        return ExitCode::from(migrate::run());
++    }
+     match Cli::parse().command {
+         None | Some(Command::Version) => {
+             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
+             ExitCode::SUCCESS
+         }
+         Some(Command::Clean { repo, branches }) => {
+             if branches.is_empty() {
+                 eprintln!("{}", worktrees::clean::USAGE);
+                 ExitCode::from(1)
+             } else {
+diff --git a/src/migrate.rs b/src/migrate.rs
+new file mode 100644
+index 0000000..4df135e
+--- /dev/null
++++ b/src/migrate.rs
+@@ -0,0 +1,160 @@
++//! `jeeves migrate` — prints a two-section diff-style plan for repointing
++//! this machine from the Python tree to the Rust binary.
++//!
++//! Reads the LIVE machine paths (no hardcoding: HOME/XDG). Never mutates
++//! anything; exits 0 always, even when a source is unreadable — it says so
++//! honestly instead of guessing.
++
++use std::path::{Path, PathBuf};
++
++use crate::digest::cron::{self, BEGIN, END};
++
++/// Settings file: `$JEEVES_SETTINGS_FILE` override (tests), else
++/// `$HOME/.claude/settings.json`.
++pub fn settings_file() -> PathBuf {
++    match std::env::var_os("JEEVES_SETTINGS_FILE") {
++        Some(v) if !v.is_empty() => PathBuf::from(v),
++        _ => home().join(".claude/settings.json"),
++    }
++}
++
++/// Section (a): the current crontab's jeeves block vs the new entry line.
++/// `crontab` is Err when the live crontab could not be read.
++pub fn cron_plan(crontab: Result<&str, &str>, exe: &Path) -> String {
++    let new_line = cron::entry_line(exe);
++    let mut out = String::new();
++    out.push_str("(a) crontab — hourly collect entry\n");
++    match crontab {
++        Err(reason) => {
++            out.push_str(&format!("  unreadable: {reason}\n"));
++            out.push_str(
++                "  the current entry cannot be diffed; run `crontab -l` manually and\n  compare against the new entry below.\n",
++            );
++        }
++        Ok(text) if !cron::has_jeeves(text) => {
++            out.push_str("  no jeeves block in the current crontab; nothing to replace.\n");
++        }
++        Ok(text) => match block_entry_line(text) {
++            Some(old) => {
++                out.push_str("  current entry:\n");
++                out.push_str(&format!("    {old}\n"));
++            }
++            None => {
++                out.push_str("  jeeves block present but its entry line could not be parsed.\n")
++            }
++        },
++    }
++    out.push_str("  new entry:\n");
++    out.push_str(&format!("    {new_line}\n"));
++    out
++}
++
++/// Section (b): the settings.json SessionStart hook entry pointing at
++/// auditing-worktrees/session-hook.sh, and its replacement. `settings` is
++/// Err when the file could not be read.
++pub fn settings_plan(settings: Result<&str, &str>, exe: &Path) -> String {
++    let new_cmd = format!("\"{}\" session-hook", exe.display());
++    let mut out = String::new();
++    out.push_str("(b) settings.json — SessionStart hook\n");
++    match settings {
++        Err(reason) => {
++            out.push_str(&format!("  unreadable: {reason}\n"));
++            out.push_str(
++                "  edit ~/.claude/settings.json manually: replace the command pointing\n  at auditing-worktrees/session-hook.sh with:\n",
++            );
++            out.push_str(&format!("    {new_cmd}\n"));
++        }
++        Ok(text) => match session_hook_command(text) {
++            Some(old) => {
++                out.push_str("  current command:\n");
++                out.push_str(&format!("    {old}\n"));
++                out.push_str("  new command:\n");
++                out.push_str(&format!("    {new_cmd}\n"));
++            }
++            None => out.push_str(
++                "  no SessionStart hook pointing at auditing-worktrees/session-hook.sh\n  found; nothing to replace.\n",
++            ),
++        },
++    }
++    out
++}
++
++/// Runs `migrate`: reads the live crontab and settings.json, prints the
++/// two-section plan plus the manual checklist. Never mutates; always exits 0.
++pub fn run() -> u8 {
++    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("jeeves"));
++    let crontab = cron::read_crontab();
++    let settings = match std::fs::read_to_string(settings_file()) {
++        Ok(text) => Ok(text),
++        Err(e) => Err(format!("cannot read {}: {e}", settings_file().display())),
++    };
++    print!(
++        "{}",
++        cron_plan(crontab.as_deref().map_err(String::as_str), &exe)
++    );
++    print!(
++        "{}",
++        settings_plan(settings.as_deref().map_err(String::as_str), &exe)
++    );
++    print!("{}", checklist());
++    0
++}
++
++/// The entry line inside a jeeves BEGIN/END block, if any.
++fn block_entry_line(text: &str) -> Option<String> {
++    let mut in_block = false;
++    for line in text.lines() {
++        if line.trim() == BEGIN {
++            in_block = true;
++            continue;
++        }
++        if line.trim() == END {
++            break;
++        }
++        if in_block && !line.trim().is_empty() {
++            return Some(line.to_string());
++        }
++    }
++    None
++}
++
++/// The command string of the SessionStart hook pointing at
++/// auditing-worktrees/session-hook.sh, if any.
++fn session_hook_command(text: &str) -> Option<String> {
++    let value: serde_json::Value = serde_json::from_str(text).ok()?;
++    let groups = value.get("hooks")?.get("SessionStart")?.as_array()?;
++    for group in groups {
++        let Some(hooks) = group.get("hooks").and_then(|h| h.as_array()) else {
++            continue;
++        };
++        for hook in hooks {
++            let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) else {
++                continue;
++            };
++            if cmd.contains("auditing-worktrees") && cmd.contains("session-hook.sh") {
++                return Some(cmd.to_string());
++            }
++        }
++    }
++    None
++}
++
++pub fn checklist() -> String {
++    let mut out = String::new();
++    out.push_str("remaining manual steps:\n");
++    out.push_str("  [ ] install the jeeves binary to ~/.local/bin/jeeves (stable PATH dir)\n");
++    out.push_str(
++        "  [ ] apply the crontab change: `crontab -e` (or `jeeves install-cron --write`)\n",
++    );
++    out.push_str("  [ ] apply the settings.json change above\n");
++    out.push_str("  [ ] verify: `crontab -l` shows the new entry; a new session runs the hook\n");
++    out.push_str("  [ ] follow-up PRs: fold the skill docs into jeeves, then delete\n");
++    out.push_str("      orient/orient-quick/auditing-worktrees once cron+hook run green\n");
++    out
++}
++
++fn home() -> PathBuf {
++    std::env::var_os("HOME")
++        .map(PathBuf::from)
++        .unwrap_or_default()
++}
+diff --git a/tests/cron_migrate.rs b/tests/cron_migrate.rs
+new file mode 100644
+index 0000000..49c74a3
+--- /dev/null
++++ b/tests/cron_migrate.rs
+@@ -0,0 +1,267 @@
++//! Golden and behavioral tests for `jeeves install-cron` and `jeeves migrate`.
++//!
++//! The entry-line golden pins the byte shape of the jeeves BEGIN/END block
++//! with a stub binary path and a controlled environment (HOME, XDG_DATA_HOME,
++//! JEEVES_MISE_SHIMS, JEEVES_STATE_DIR), so the PATH builder's stable-dirs
++//! ordering and the markers are asserted exactly. Idempotency exercises the
++//! pure string-level merge function directly. The migrate test parses a
++//! fixture settings.json via the JEEVES_SETTINGS_FILE override.
++
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use jeeves::core::paths::state_dir_path;
++use jeeves::digest::cron::{self, BEGIN, END};
++use jeeves::migrate;
++
++static COUNTER: AtomicU64 = AtomicU64::new(0);
++
++fn scratch_dir() -> PathBuf {
++    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
++    let d = std::env::temp_dir().join(format!("jeeves-cron-{}-{n}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&d);
++    std::fs::create_dir_all(&d).unwrap();
++    d
++}
++
++/// Serializes tests that mutate process env vars (shared mutable state).
++fn env_lock() -> std::sync::MutexGuard<'static, ()> {
++    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
++    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++fn set_env(guard: &std::sync::MutexGuard<'static, ()>, key: &str, value: &str) {
++    let _ = guard;
++    unsafe { std::env::set_var(key, value) };
++}
++
++fn remove_env(guard: &std::sync::MutexGuard<'static, ()>, key: &str) {
++    let _ = guard;
++    unsafe { std::env::remove_var(key) };
++}
++
++#[test]
++fn entry_line_golden() {
++    let _g = env_lock();
++    let home = scratch_dir();
++    let state = home.join("state");
++    let shims = home.join("shims");
++    set_env(&_g, "HOME", home.to_str().unwrap());
++    set_env(&_g, "JEEVES_MISE_SHIMS", shims.to_str().unwrap());
++    set_env(&_g, "JEEVES_STATE_DIR", state.to_str().unwrap());
++    remove_env(&_g, "MISE_DATA_DIR");
++    remove_env(&_g, "XDG_DATA_HOME");
++
++    let binary = Path::new("/opt/jeeves/bin/jeeves");
++    let block = cron::block(binary);
++
++    let expected = format!(
++        "{BEGIN}\n13 * * * * PATH={}/.local/bin:{}/shims:/usr/local/bin:/usr/bin:/bin /opt/jeeves/bin/jeeves collect >> {}/collect.log 2>&1\n{END}\n",
++        home.display(),
++        home.display(),
++        state.display()
++    );
++    assert_eq!(block, expected);
++    assert_eq!(block.matches(BEGIN).count(), 1);
++    assert_eq!(block.matches(END).count(), 1);
++    assert!(block.ends_with(&format!("{END}\n")));
++}
++
++#[test]
++fn cron_path_keeps_stable_dirs_ordering() {
++    let _g = env_lock();
++    let home = scratch_dir();
++    set_env(&_g, "HOME", home.to_str().unwrap());
++    set_env(
++        &_g,
++        "JEEVES_MISE_SHIMS",
++        home.join("shims").to_str().unwrap(),
++    );
++    remove_env(&_g, "MISE_DATA_DIR");
++    remove_env(&_g, "XDG_DATA_HOME");
++
++    let path = cron::cron_path();
++    let dirs: Vec<&str> = path.split(':').collect();
++    assert_eq!(
++        dirs,
++        vec![
++            home.join(".local/bin").to_str().unwrap(),
++            home.join("shims").to_str().unwrap(),
++            "/usr/local/bin",
++            "/usr/bin",
++            "/bin"
++        ]
++    );
++    assert!(!path.contains("/installs/"));
++}
++
++#[test]
++fn merge_replaces_block_not_duplicates() {
++    let _g = env_lock();
++    let home = scratch_dir();
++    set_env(&_g, "HOME", home.to_str().unwrap());
++    set_env(
++        &_g,
++        "JEEVES_MISE_SHIMS",
++        home.join("shims").to_str().unwrap(),
++    );
++    set_env(
++        &_g,
++        "JEEVES_STATE_DIR",
++        home.join("state").to_str().unwrap(),
++    );
++    remove_env(&_g, "MISE_DATA_DIR");
++    remove_env(&_g, "XDG_DATA_HOME");
++    let binary = Path::new("/opt/jeeves/bin/jeeves");
++    let existing = "0 * * * * /usr/bin/other-job\n";
++    let once = cron::merge(existing, binary);
++    let twice = cron::merge(&once, binary);
++    assert_eq!(once, twice);
++    assert!(once.contains("other-job"));
++    assert_eq!(once.matches(BEGIN).count(), 1);
++    assert_eq!(once.matches(END).count(), 1);
++    assert!(once.contains("13 * * * *"));
++}
++
++#[test]
++fn merge_into_empty_is_just_the_block() {
++    let _g = env_lock();
++    let home = scratch_dir();
++    set_env(&_g, "HOME", home.to_str().unwrap());
++    set_env(
++        &_g,
++        "JEEVES_MISE_SHIMS",
++        home.join("shims").to_str().unwrap(),
++    );
++    set_env(
++        &_g,
++        "JEEVES_STATE_DIR",
++        home.join("state").to_str().unwrap(),
++    );
++    remove_env(&_g, "MISE_DATA_DIR");
++    remove_env(&_g, "XDG_DATA_HOME");
++    let binary = Path::new("/opt/jeeves/bin/jeeves");
++    assert_eq!(cron::merge("", binary), cron::block(binary));
++    assert_eq!(cron::merge("\n\n", binary), cron::block(binary));
++}
++
++#[test]
++fn strip_block_keeps_surrounding_lines() {
++    let binary = Path::new("/opt/jeeves/bin/jeeves");
++    let text = "0 * * * * a\n# BEGIN jeeves\n13 * * * * old\n# END jeeves\n30 * * * * b\n";
++    let stripped = cron::strip_block(text);
++    assert!(!stripped.contains("jeeves"));
++    assert!(stripped.contains("0 * * * * a"));
++    assert!(stripped.contains("30 * * * * b"));
++    let merged = cron::merge(text, binary);
++    assert_eq!(merged.matches(BEGIN).count(), 1);
++    assert!(merged.contains("0 * * * * a"));
++    assert!(merged.contains("30 * * * * b"));
++}
++
++#[test]
++fn migrate_plan_on_fixture_settings() {
++    let _g = env_lock();
++    let home = scratch_dir();
++    let state = home.join("state");
++    set_env(&_g, "HOME", home.to_str().unwrap());
++    set_env(&_g, "JEEVES_STATE_DIR", state.to_str().unwrap());
++    set_env(
++        &_g,
++        "JEEVES_MISE_SHIMS",
++        home.join("shims").to_str().unwrap(),
++    );
++    remove_env(&_g, "MISE_DATA_DIR");
++    remove_env(&_g, "XDG_DATA_HOME");
++
++    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/settings.json");
++    set_env(&_g, "JEEVES_SETTINGS_FILE", fixture.to_str().unwrap());
++
++    let exe = Path::new("/opt/jeeves/bin/jeeves");
++    let crontab = "0 * * * * /usr/bin/other-job\n# BEGIN jeeves\n13 * * * * PATH=/old/bin /old/collect.py >> /old/collect.log 2>&1\n# END jeeves\n";
++    let settings = std::fs::read_to_string(&fixture).unwrap();
++
++    let plan = format!(
++        "{}{}{}",
++        migrate::cron_plan(Ok(crontab), exe),
++        migrate::settings_plan(Ok(&settings), exe),
++        migrate::checklist()
++    );
++
++    assert!(plan.contains("(a) crontab"));
++    assert!(plan.contains("current entry:"));
++    assert!(plan.contains("/old/collect.py"));
++    assert!(plan.contains("new entry:"));
++    assert!(plan.contains("13 * * * *"));
++    assert!(plan.contains("/opt/jeeves/bin/jeeves collect >>"));
++    assert!(plan.contains(&format!("{}/collect.log", state.display())));
++
++    assert!(plan.contains("(b) settings.json"));
++    assert!(plan.contains("current command:"));
++    assert!(plan.contains("auditing-worktrees/bin/session-hook.sh"));
++    assert!(plan.contains("new command:"));
++    assert!(plan.contains("\"/opt/jeeves/bin/jeeves\" session-hook"));
++
++    assert!(plan.contains("remaining manual steps:"));
++    assert!(plan.contains("crontab -e"));
++    assert!(plan.contains("~/.local/bin/jeeves"));
++}
++
++#[test]
++fn migrate_plan_says_unreadable_honestly() {
++    let _g = env_lock();
++    let home = scratch_dir();
++    set_env(&_g, "HOME", home.to_str().unwrap());
++    set_env(
++        &_g,
++        "JEEVES_STATE_DIR",
++        home.join("state").to_str().unwrap(),
++    );
++    set_env(
++        &_g,
++        "JEEVES_MISE_SHIMS",
++        home.join("shims").to_str().unwrap(),
++    );
++    remove_env(&_g, "MISE_DATA_DIR");
++    remove_env(&_g, "XDG_DATA_HOME");
++    set_env(
++        &_g,
++        "JEEVES_SETTINGS_FILE",
++        home.join("missing.json").to_str().unwrap(),
++    );
++
++    let exe = Path::new("/opt/jeeves/bin/jeeves");
++    let plan = format!(
++        "{}{}",
++        migrate::cron_plan(Err("crontab -l failed (exit 1): no crontab for user"), exe),
++        migrate::settings_plan(Err("cannot read /nope/settings.json: No such file"), exe)
++    );
++    assert!(plan.contains("unreadable: crontab -l failed"));
++    assert!(plan.contains("unreadable: cannot read /nope/settings.json"));
++    assert!(plan.contains("new entry:"));
++    assert!(plan.contains("13 * * * *"));
++}
++
++#[test]
++fn state_dir_path_is_used_for_log_not_created() {
++    let _g = env_lock();
++    let home = scratch_dir();
++    let state = home.join("state");
++    set_env(&_g, "HOME", home.to_str().unwrap());
++    set_env(&_g, "JEEVES_STATE_DIR", state.to_str().unwrap());
++    set_env(
++        &_g,
++        "JEEVES_MISE_SHIMS",
++        home.join("shims").to_str().unwrap(),
++    );
++    remove_env(&_g, "MISE_DATA_DIR");
++    remove_env(&_g, "XDG_DATA_HOME");
++
++    let line = cron::entry_line(Path::new("/opt/jeeves/bin/jeeves"));
++    assert!(line.contains(&format!("{}/collect.log", state.display())));
++    assert_eq!(state_dir_path(), state);
++    assert!(
++        !state.exists(),
++        "printing the entry must not create the state dir"
++    );
++}
+diff --git a/tests/fixtures/settings.json b/tests/fixtures/settings.json
+new file mode 100644
+index 0000000..6bad84b
+--- /dev/null
++++ b/tests/fixtures/settings.json
+@@ -0,0 +1,26 @@
++{
++  "hooks": {
++    "SessionStart": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "\"$HOME/.claude/skills/auditing-worktrees/bin/session-hook.sh\"",
++            "timeout": 20,
++            "statusMessage": "Checking for worktree drift..."
++          }
++        ]
++      },
++      {
++        "matcher": "*",
++        "hooks": [
++          {
++            "type": "command",
++            "command": "'/home/jeremy/.local/bin/moshi-hook' claude-hook",
++            "async": true
++          }
++        ]
++      }
++    ]
++  }
++}
