@@ -52,6 +52,11 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("archive") {
         return run_archive();
     }
+    // `jeeves session-hook` reads a JSON payload from stdin and must remain a
+    // silent, always-successful command when the hook cannot report anything.
+    if std::env::args().nth(1).as_deref() == Some("session-hook") {
+        return run_session_hook();
+    }
     match Cli::parse().command {
         None | Some(Command::Version) => {
             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
@@ -89,6 +94,11 @@ fn run_audit() -> ExitCode {
 fn run_archive() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(2).collect();
     ExitCode::from(worktrees::archive::run(&args))
+}
+
+fn run_session_hook() -> ExitCode {
+    worktrees::hook::run();
+    ExitCode::SUCCESS
 }
 
 fn run_coverage() -> ExitCode {
