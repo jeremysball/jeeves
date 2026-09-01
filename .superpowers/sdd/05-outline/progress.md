@@ -27,3 +27,7 @@ Task 3: fix round 2/5 (F6 ADDRESSED: prunable + UNKNOWN passthrough both sides b
 Task 3: parked - F2 usage wording (Ruling: program name in usage prose legitimately changes with the rename; binding constraint is exit-code family + refusal strings, both met. Costs nothing if wrong.)
 Task 3: complete (commits 06f7e4c..559a369 + docs, review clean after round 2, 1 parked)
 Task 4: 4-i (git-state/roots/session-tail) done+committed with parity proofs; 4-ii (sessions/checkin-lint) in flight. Combined review after both.
+Task 4: review round 1: 8 Important findings (roots env precedence + traversal parity + literal /workspace; git-state cd class; sessions symlink key; session-tail jq/max contracts; lint summary rule).
+Task 4: RULING on finding 7 - plan-error: brief said "counts LINES not problems"; ref/lint-checkin.py:62 increments per PROBLEM. Reference is authority; Rust must match problem-counting. Brief text superseded.
+Task 4: RULING on finding 8 - default candidate list /workspace + $HOME-derived dirs mirrors the reference default; literals for HOME components banned (derive via home_dir), the /workspace DEFAULT literal stays (it is the documented product default, byte-parity with ref help text).
+Task 4: fix round 1 dispatched.
