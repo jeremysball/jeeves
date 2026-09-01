@@ -37,3 +37,6 @@ Task 5: gate caught orient_golden::max-0 flake. ROOT CAUSE (measured): ref pipel
 Task 5: review round 1: 2 findings (Important fd-preflight missing - controller reproduced silent 0-of-0 vs ref exit 2; Minor --flag only checked at args[0]). Root cause: execution-error (brief listed fd-missing path; part-1 brief pointed at wrong line range).
 Task 5: fix round 1/5 (2 addressed, 0 open; verified host-side repro now rc 2)
 Task 5: complete (commits f723253..HEAD, review clean after round 1)
+Task 6: review round 0: Approved, spec pass (print-default/--write deviation ruled acceptable; PRD keeps hourly cron; migrate read-only confirmed live).
+Task 6: complete (review clean, no fix rounds)
+Task 7: 7-i ledger core done (vectors 10/10, full-casefold layered); 7-ii stores+mutations in flight; 7-iii evidence+ops CLI next.
