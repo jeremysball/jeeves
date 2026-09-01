@@ -31,3 +31,5 @@ Task 4: review round 1: 8 Important findings (roots env precedence + traversal p
 Task 4: RULING on finding 7 - plan-error: brief said "counts LINES not problems"; ref/lint-checkin.py:62 increments per PROBLEM. Reference is authority; Rust must match problem-counting. Brief text superseded.
 Task 4: RULING on finding 8 - default candidate list /workspace + $HOME-derived dirs mirrors the reference default; literals for HOME components banned (derive via home_dir), the /workspace DEFAULT literal stays (it is the documented product default, byte-parity with ref help text).
 Task 4: fix round 1 dispatched.
+Task 4: fix round 1/5 (7 addressed, 0 open; commits 384e1f1..4148455)
+Task 4: complete (commits 15b586c..4148455, review clean after round 1)
