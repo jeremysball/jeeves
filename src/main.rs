@@ -87,6 +87,10 @@ fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(2).collect();
         return ExitCode::from(orient::tail::run(&args));
     }
+    if std::env::args().nth(1).as_deref() == Some("scan-active") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return ExitCode::from(orient::scan::run(&args));
+    }
     match Cli::parse().command {
         None | Some(Command::Version) => {
             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
