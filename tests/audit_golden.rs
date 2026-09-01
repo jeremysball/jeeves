@@ -437,6 +437,17 @@ fn all_audit_buckets_match_in_one_repo() {
     git(&repo, &["checkout", "-q", "-b", "inflight"]);
     git(&repo, &["checkout", "-q", "main"]);
 
+    // Git returns 1 for unrelated histories, so the reference classifies this
+    // as unmerged with UNKNOWN coverage; only merge-base errors above 1 reach
+    // the unknown-merge bucket.
+    git(&repo, &["checkout", "-q", "--orphan", "unrelated"]);
+    commit_at(&repo, "unrelated.txt", "unrelated\n", "unrelated", old);
+    git(&repo, &["checkout", "-q", "main"]);
+
+    git(&repo, &["worktree", "add", "-q", "../wtd"]);
+    let dangling_worktree = dir.join("wtd");
+    std::fs::remove_dir_all(&dangling_worktree).unwrap();
+
     let knobs = Knobs {
         inflight_secs: "7200",
         archaeology_secs: "0",
@@ -449,7 +460,10 @@ fn all_audit_buckets_match_in_one_repo() {
     assert!(report.contains("  archaeology (older than 0m"));
     assert!(report.contains("  likely-content-merged"));
     assert!(report.contains("  hands-off"));
-    assert!(report.contains("  (1 in flight, active within 2h — hidden)"));
+    assert!(report.contains("  dangling worktree registrations (git worktree prune is safe):"));
+    assert!(report.contains("    unrelated  [idle ") && report.contains(" — unmerged, UNKNOWN"));
+    assert!(report.contains(&format!("    {}", dangling_worktree.display())));
+    assert!(report.contains("  (2 in flight, active within 2h — hidden)"));
 
     git(&repo, &["worktree", "unlock", &hands_path]);
     git(&repo, &["worktree", "remove", "--force", &hands_path]);
