@@ -1,0 +1,256 @@
+# Review package: dbe7a93..776efa8
+
+## Commits
+776efa8 fix(core): keep interior empty fields in log_units; add toon_table emitter
+
+## Files changed
+ src/core/git.rs  | 57 ++++++++++++++++++++++----------------
+ src/core/toon.rs | 84 +++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 116 insertions(+), 25 deletions(-)
+
+## Diff
+diff --git a/src/core/git.rs b/src/core/git.rs
+index 5c6933c..580b253 100644
+--- a/src/core/git.rs
++++ b/src/core/git.rs
+@@ -30,52 +30,40 @@ fn stdout(repo: &Path, args: &[&str]) -> Result<String, CliError> {
+     }
+     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+ }
+ 
+ /// `git log` rows, one Vec per commit record. Records are separated by the
+ /// `\x1f` unit separator in the caller-supplied format; the caller picks the
+ /// fields (e.g. `%h%x1f%s%x1f%cr` as in scan-active.sh:163-164). Empty output
+ /// or a failed log (repo without commits, unreadable repo, ...) yields an
+ /// empty Vec, mirroring the script's `git ... 2>/dev/null; [ -z "$subjects" ] && continue`.
+ ///
+-/// A record is a run of consecutive `\x1f`-separated fields; a trailing
+-/// separator (the format always ends with a field, so the line's final
+-/// newline is the only terminator) would produce an empty trailing field and
+-/// is dropped so `%h%x1f%s` + newline yields one record of two fields, not a
+-/// third empty one.
++/// A record is a line of `\x1f`-separated fields. The raw stdout is split on
++/// `\n` first (dropping only the trailing empty record produced by the final
++/// newline), then each record is split on `\x1f` keeping ALL fields, so an
++/// interior empty field (e.g. an empty subject in `%h%x1f%s%x1f%cr`) is
++/// preserved and records stay aligned.
+ pub fn log_units(repo: &Path, args: &[&str]) -> Vec<Vec<String>> {
+     let Ok(out) = stdout(repo, args) else {
+         return Vec::new();
+     };
+     if out.is_empty() {
+         return Vec::new();
+     }
+-    let mut records: Vec<Vec<String>> = Vec::new();
+-    let mut current: Vec<String> = Vec::new();
+-    for field in out.split('\x1f') {
+-        if field.is_empty() && !current.is_empty() {
+-            // Consecutive separators or trailing separator: only a newline
+-            // legitimately ends a record, and it is not part of the format.
+-            continue;
+-        }
+-        current.push(field.to_string());
+-        if field.ends_with('\n') {
+-            if let Some(last) = current.last_mut() {
+-                last.pop();
+-            }
+-            records.push(std::mem::take(&mut current));
+-        }
+-    }
+-    if !current.is_empty() {
+-        records.push(current);
++    let mut lines: Vec<&str> = out.split('\n').collect();
++    if lines.last() == Some(&"") {
++        lines.pop();
+     }
+-    records
++    lines
++        .iter()
++        .map(|line| line.split('\x1f').map(|f| f.to_string()).collect())
++        .collect()
+ }
+ 
+ /// `git rev-parse --absolute-git-dir` (ref/lib.sh:54-56). Errors -> refusal.
+ pub fn rev_parse_abs_git_dir(repo: &Path) -> Result<String, CliError> {
+     Ok(stdout(repo, &["rev-parse", "--absolute-git-dir"])?
+         .trim()
+         .to_string())
+ }
+ 
+ /// Singular merge-base of two refs, mirroring ref/lib.sh:149-156: counts
+@@ -184,20 +172,41 @@ mod tests {
+     fn log_units_parses_separators() {
+         let d = init_repo();
+         let rows = log_units(&d, &["log", "--format=%h%x1f%s%x1f%cr"]);
+         assert_eq!(rows.len(), 1);
+         assert_eq!(rows[0].len(), 3);
+         assert!(!rows[0][0].is_empty());
+         assert_eq!(rows[0][1], "first commit");
+         let _ = std::fs::remove_dir_all(&d);
+     }
+ 
++    #[test]
++    fn log_units_keeps_interior_empty_fields() {
++        let d = init_repo();
++        git(
++            &d,
++            &[
++                "commit",
++                "-q",
++                "--allow-empty",
++                "--allow-empty-message",
++                "-m",
++                "",
++            ],
++        );
++        let rows = log_units(&d, &["log", "--format=%h%x1f%s%x1f%cr"]);
++        assert_eq!(rows.len(), 2);
++        assert_eq!(rows[0].len(), 3);
++        assert_eq!(rows[0][1], "");
++        let _ = std::fs::remove_dir_all(&d);
++    }
++
+     #[test]
+     fn log_units_empty_for_no_commits() {
+         let d = scratch_repo();
+         git(&d, &["init", "-q", "-b", "main"]);
+         let rows = log_units(&d, &["log", "--format=%h%x1f%s"]);
+         assert!(rows.is_empty());
+         let _ = std::fs::remove_dir_all(&d);
+     }
+ 
+     #[test]
+diff --git a/src/core/toon.rs b/src/core/toon.rs
+index 1bffbe5..9c07a11 100644
+--- a/src/core/toon.rs
++++ b/src/core/toon.rs
+@@ -1,34 +1,64 @@
+ //! TOON string escaping, mirroring ref/scan-active.sh:97-100.
+ //!
+ //! Quote the field, escape embedded backslashes first (so the quotes we add
+ //! next are not themselves backslash-escaped by the doubling), then escape
+ //! embedded double quotes. Order matters and is pinned by the script:
+ //! `s="${1//\\/\\\\}"` then `"${s//\"/\\\"}"`.
+ 
++/// A table cell: `Str` is quoted via `toon_str`, `Bare` is emitted verbatim
++/// (integers, clean states, ...), mirroring scan-active.sh's mixed usage such
++/// as `echo "  $(toon_str "$repo"),$(toon_str "${R_BRANCH[$repo]}"),${R_TREE[$repo]},${R_ALERTS[$repo]}"`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Cell {
++    Str(String),
++    Bare(String),
++}
++
++/// Renders a TOON table in the exact shape scan-active.sh prints: a header
++/// line `name[N]{col1,col2}:` followed by one 2-space-indented row per record,
++/// cells joined with commas. `N` is the number of rows.
++pub fn toon_table(name: &str, header: &[&str], rows: &[Vec<Cell>]) -> String {
++    let mut out = String::new();
++    out.push_str(&format!("{name}[{}]{{{}}}:", rows.len(), header.join(",")));
++    for row in rows {
++        out.push('\n');
++        out.push_str("  ");
++        let cells: Vec<String> = row
++            .iter()
++            .map(|c| match c {
++                Cell::Str(s) => toon_str(s),
++                Cell::Bare(s) => s.clone(),
++            })
++            .collect();
++        out.push_str(&cells.join(","));
++    }
++    out
++}
++
+ /// Quotes `s` for TOON output: wraps in double quotes, doubles every existing
+ /// backslash, then backslash-escapes embedded double quotes.
+ pub fn toon_str(s: &str) -> String {
+     let mut escaped = String::with_capacity(s.len() + 2);
+     for c in s.chars() {
+         match c {
+             '\\' => escaped.push_str("\\\\"),
+             '"' => escaped.push_str("\\\""),
+             other => escaped.push(other),
+         }
+     }
+     format!("\"{escaped}\"")
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::toon_str;
++    use super::{toon_str, toon_table, Cell};
+ 
+     #[test]
+     fn empty_string() {
+         assert_eq!(toon_str(""), "\"\"");
+     }
+ 
+     #[test]
+     fn plain_string() {
+         assert_eq!(toon_str("hello"), "\"hello\"");
+     }
+@@ -74,11 +104,63 @@ mod tests {
+         for case in cases {
+             let got = toon_str(case);
+             assert!(got.starts_with('"'));
+             assert!(got.ends_with('"'));
+             assert_eq!(
+                 got.len(),
+                 case.len() + 2 + case.matches('"').count() + case.matches('\\').count()
+             );
+         }
+     }
++
++    #[test]
++    fn table_header_shape() {
++        let out = toon_table("repos", &["path", "branch", "tree", "alerts"], &[]);
++        assert_eq!(out, "repos[0]{path,branch,tree,alerts}:");
++    }
++
++    #[test]
++    fn table_mixed_quoted_and_bare_cells() {
++        // Mirrors scan-active.sh:439: `echo "  $(toon_str "$repo"),$(toon_str "${R_BRANCH[$repo]}"),${R_TREE[$repo]},${R_ALERTS[$repo]}"`
++        let rows = vec![vec![
++            Cell::Str("/workspace/my repo".to_string()),
++            Cell::Str("main".to_string()),
++            Cell::Bare("3".to_string()),
++            Cell::Bare("clean".to_string()),
++        ]];
++        let out = toon_table("repos", &["path", "branch", "tree", "alerts"], &rows);
++        assert_eq!(
++            out,
++            "repos[1]{path,branch,tree,alerts}:\n  \"/workspace/my repo\",\"main\",3,clean"
++        );
++    }
++
++    #[test]
++    fn table_escapes_quotes_and_backslashes_in_string_cells() {
++        let rows = vec![vec![
++            Cell::Str("say \"hi\"".to_string()),
++            Cell::Str(r"a\b".to_string()),
++        ]];
++        let out = toon_table("branches", &["name", "detail"], &rows);
++        assert_eq!(
++            out,
++            "branches[1]{name,detail}:\n  \"say \\\"hi\\\"\",\"a\\\\b\""
++        );
++    }
++
++    #[test]
++    fn table_multiple_rows_each_indented() {
++        let rows = vec![
++            vec![Cell::Str("one".to_string()), Cell::Bare("1".to_string())],
++            vec![Cell::Str("two".to_string()), Cell::Bare("2".to_string())],
++        ];
++        let out = toon_table("commits", &["sha", "n"], &rows);
++        assert_eq!(out, "commits[2]{sha,n}:\n  \"one\",1\n  \"two\",2");
++    }
++
++    #[test]
++    fn table_empty_string_cell_stays_quoted() {
++        let rows = vec![vec![Cell::Str(String::new()), Cell::Bare("0".to_string())]];
++        let out = toon_table("repos", &["path", "n"], &rows);
++        assert_eq!(out, "repos[1]{path,n}:\n  \"\",0");
++    }
+ }
