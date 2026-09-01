@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod core;
+mod worktrees;
 
 #[derive(Parser)]
 #[command(
@@ -27,8 +28,12 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    // Phase 1 ships exactly one command: version. Bare invocation and
-    // `-V/--version` (handled by clap before we get here) behave the same.
+    // `jeeves coverage` parses its own args: the verdict contract publishes
+    // exact error strings on stdout (mirroring ref/coverage-score:43-69),
+    // which clap's error rendering would not reproduce.
+    if std::env::args().nth(1).as_deref() == Some("coverage") {
+        return run_coverage();
+    }
     match Cli::parse().command {
         None | Some(Command::Version) => {
             println!("jeeves {}", env!("CARGO_PKG_VERSION"));
@@ -36,3 +41,66 @@ fn main() -> ExitCode {
         }
     }
 }
+
+fn run_coverage() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+
+    // --help as the first argument prints the usage text and exits 0
+    // (ref/coverage-score:43-46).
+    if args.first().map(String::as_str) == Some("--help") {
+        print!("{}", COVERAGE_USAGE);
+        return ExitCode::SUCCESS;
+    }
+
+    // Any flag anywhere is an unknown flag, checked before the count
+    // (ref/coverage-score:48-55).
+    for arg in &args {
+        if arg.starts_with('-') {
+            println!("error: unknown flag {arg}");
+            return ExitCode::from(2);
+        }
+    }
+
+    // Exactly three positionals (ref/coverage-score:56-59).
+    if args.len() != 3 {
+        println!("error: usage: coverage-score <repo> <base> <branch>");
+        return ExitCode::from(2);
+    }
+
+    // Resolve <repo> to an absolute path; a relative path is resolved against
+    // the caller's cwd. The cd's own error is a usage error reported on
+    // stdout (ref/coverage-score:65-69).
+    let repo = match std::fs::canonicalize(&args[0]) {
+        Ok(p) if p.is_dir() => p,
+        _ => {
+            println!("error: not a directory: {}", args[0]);
+            return ExitCode::from(2);
+        }
+    };
+
+    match worktrees::coverage::coverage_score(&repo, &args[1], &args[2]) {
+        Ok(verdict) => {
+            println!("{verdict}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(e.exit_code())
+        }
+    }
+}
+
+const COVERAGE_USAGE: &str = "\
+usage: coverage-score <repo> <base> <branch>
+
+Scores how much of <branch>'s work is already in <base>, printing one line:
+  SCORED <0-100>   - percent of the branch's text lines already in base.
+  UNSCORED <why>   - binary/mode-only row, O==0, or empty patch.
+  UNKNOWN <why>    - criss-cross history, merge conflict, merge-tree error.
+Exit 0 on every successful run (including UNSCORED/UNKNOWN verdicts);
+exit 2 on usage error.
+
+examples:
+  coverage-score \"$PWD\" main feature
+  coverage-score /path/to/repo origin/main topic-branch
+";

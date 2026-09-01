@@ -92,6 +92,11 @@ pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<Option<String>, CliEr
     Ok(Some(base.trim().to_string()))
 }
 
+/// `git rev-parse <ref>` (ref/lib.sh:205). Errors -> refusal.
+pub fn rev_parse(repo: &Path, r: &str) -> Result<String, CliError> {
+    Ok(stdout(repo, &["rev-parse", r])?.trim().to_string())
+}
+
 /// `(path, sha, branch)` for every worktree, parsed line-by-line from
 /// `git worktree list --porcelain` so paths containing spaces survive intact
 /// (mirrors ref/lib.sh:81-93). The branch is the full ref name (e.g.
