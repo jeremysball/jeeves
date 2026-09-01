@@ -26,3 +26,4 @@ Task 3: RULING on F2 — usage prose (not a refusal string) may carry the new pr
 Task 3: fix round 2/5 (F6 ADDRESSED: prunable + UNKNOWN passthrough both sides byte-equal; unknown-merge bucket shown unreachable for either implementation (is-ancestor rc 1 not >1) - parity preserved by construction).
 Task 3: parked - F2 usage wording (Ruling: program name in usage prose legitimately changes with the rename; binding constraint is exit-code family + refusal strings, both met. Costs nothing if wrong.)
 Task 3: complete (commits 06f7e4c..559a369 + docs, review clean after round 2, 1 parked)
+Task 4: 4-i (git-state/roots/session-tail) done+committed with parity proofs; 4-ii (sessions/checkin-lint) in flight. Combined review after both.
