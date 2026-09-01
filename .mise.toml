@@ -1,0 +1,18 @@
+[tools]
+rust = "1.91.1"
+
+[tasks.fmt-check]
+description = "Check Rust formatting"
+run = "cargo fmt --check"
+
+[tasks.lint]
+description = "Lint with clippy, warnings denied"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Run the Rust test suite"
+run = "cargo test"
+
+[tasks.check-rust]
+description = "Format, lint, and test"
+run = "mise run fmt-check && mise run lint && mise run test"

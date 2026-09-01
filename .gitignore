@@ -8,3 +8,4 @@ __pycache__/
 # The global ignore carves out **/.superpowers/*; plans and specs are tracked.
 !.superpowers/**
 .venv/
+/target/
